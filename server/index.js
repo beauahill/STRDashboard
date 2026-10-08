@@ -7,7 +7,7 @@ import { openDb, getSetting, setSetting } from './db.js';
 import { Beds24Client } from './beds24.js';
 import { syncBeds24, iso } from './sync.js';
 import { summary, calendar } from './stats.js';
-import { loadDemo } from './demo.js';
+import { loadDemo, clearDemo } from './demo.js';
 
 const PORT = Number(process.env.PORT || 3000);
 const PASSWORD = process.env.APP_PASSWORD || '';
@@ -105,14 +105,17 @@ async function api(req, res, url) {
       const { inviteCode } = await readJson(req);
       if (!inviteCode) return send(res, 400, { error: 'Invite code required' });
       await beds24.connect(inviteCode);
-      setSetting(db, 'demo', null);
+      clearDemo(db);
       return send(res, 200, await runSync());
     }
     case 'POST /api/disconnect': beds24.disconnect(); return send(res, 200, { ok: true });
     case 'POST /api/sync':
       if (!beds24.connected) return send(res, 400, { error: 'Not connected to Beds24' });
       return send(res, 200, await runSync());
-    case 'POST /api/demo': return send(res, 200, loadDemo(db));
+    case 'POST /api/demo':
+      if (beds24.connected) return send(res, 400, { error: 'Demo data can\'t be loaded while connected to Beds24.' });
+      return send(res, 200, loadDemo(db));
+    case 'POST /api/demo/clear': return send(res, 200, clearDemo(db));
     case 'GET /api/properties':
       return send(res, 200, db.prepare('SELECT * FROM properties ORDER BY name').all().map(p => ({
         ...p, rooms: db.prepare('SELECT * FROM rooms WHERE property_id=? ORDER BY name').all(p.id) })));
@@ -158,6 +161,8 @@ const server = createServer(async (req, res) => {
 });
 
 if (process.env.STR_DEMO && getSetting(db, 'demo') !== '1' && !beds24.connected) loadDemo(db);
+// Demo data must never sit alongside real bookings (it skews every metric).
+if (beds24.connected) clearDemo(db);
 
 // No password configured -> only reachable from this machine.
 const host = PASSWORD ? '0.0.0.0' : '127.0.0.1';

@@ -7,13 +7,33 @@ function rng(seed) { return () => (seed = (seed * 1664525 + 1013904223) % 429496
 const FIRST = ['Ava','Liam','Noah','Emma','Olivia','Mason','Sophia','Lucas','Mia','Ethan','Harper','Jack','Ella','Owen','Zoe'];
 const LAST = ['Smith','Johnson','Lee','Garcia','Brown','Davis','Miller','Wilson','Moore','Clark','Hall','Young','King','Scott'];
 
+const DEMO_PROPERTIES = [
+  { id: 1, name: 'Lakeside Cabin', city: 'Jackson, WY', currency: 'USD', roomTypes: [{ id: 11, name: 'Whole cabin', qty: 1 }] },
+  { id: 2, name: 'Downtown Lofts', city: 'Lander, WY', currency: 'USD',
+    roomTypes: [{ id: 21, name: 'Loft A', qty: 1 }, { id: 22, name: 'Loft B', qty: 1 }, { id: 23, name: 'Loft C', qty: 1 }] },
+  { id: 3, name: 'Ridge House', city: 'Cody, WY', currency: 'USD', roomTypes: [{ id: 31, name: 'Entire home', qty: 1 }] },
+];
+
+/** Remove demo properties and everything under them. Matches on id AND name so real Beds24 data is never touched. */
+export function clearDemo(db) {
+  const ids = DEMO_PROPERTIES
+    .filter(p => db.prepare('SELECT 1 FROM properties WHERE id = ? AND name = ?').get(p.id, p.name))
+    .map(p => p.id);
+  db.exec('BEGIN');
+  try {
+    for (const id of ids) {
+      db.prepare('DELETE FROM bookings WHERE property_id = ?').run(id);
+      db.prepare('DELETE FROM rooms WHERE property_id = ?').run(id);
+      db.prepare('DELETE FROM properties WHERE id = ?').run(id);
+    }
+    setSetting(db, 'demo', null);
+    db.exec('COMMIT');
+  } catch (e) { db.exec('ROLLBACK'); throw e; }
+  return { removedProperties: ids.length };
+}
+
 export function loadDemo(db, today = iso(Date.now())) {
-  upsertProperties(db, [
-    { id: 1, name: 'Lakeside Cabin', city: 'Jackson, WY', currency: 'USD', roomTypes: [{ id: 11, name: 'Whole cabin', qty: 1 }] },
-    { id: 2, name: 'Downtown Lofts', city: 'Lander, WY', currency: 'USD',
-      roomTypes: [{ id: 21, name: 'Loft A', qty: 1 }, { id: 22, name: 'Loft B', qty: 1 }, { id: 23, name: 'Loft C', qty: 1 }] },
-    { id: 3, name: 'Ridge House', city: 'Cody, WY', currency: 'USD', roomTypes: [{ id: 31, name: 'Entire home', qty: 1 }] },
-  ]);
+  upsertProperties(db, DEMO_PROPERTIES);
   const rand = rng(42);
   const channels = ['airbnb', 'airbnb', 'airbnb', 'booking', 'vrbo', 'vrbo', 'direct'];
   const rooms = [[1, 11, 240], [2, 21, 140], [2, 22, 150], [2, 23, 130], [3, 31, 310]];

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createServer } from 'node:http';
 import { mkdtempSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -85,4 +86,59 @@ test('shuts down cleanly on SIGTERM', async () => {
   await s.ready;
   s.child.kill('SIGTERM');
   assert.equal(await s.exited, 0);
+});
+
+function fakeBeds24() {
+  const srv = createServer((req, res) => {
+    const u = new URL(req.url, 'http://x');
+    const body = u.pathname.endsWith('/authentication/setup') ? { token: 't', refreshToken: 'r', expiresIn: 86400 }
+      : u.pathname.endsWith('/properties') ? { data: [{ id: 555001, name: 'Real Cabin', roomTypes: [{ id: 777001, name: 'Main', qty: 1 }] }], pages: {} }
+      : u.pathname.endsWith('/bookings') ? { data: [{ id: 88800001, propertyId: 555001, roomId: 777001, status: 'confirmed', channel: 'airbnb',
+          arrival: '2026-10-01', departure: '2026-10-04', firstName: 'Real', lastName: 'Guest', price: 600 }], pages: {} }
+      : null;
+    res.writeHead(body ? 200 : 404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(body || { error: 'nope' }));
+  });
+  return new Promise(ok => srv.listen(0, '127.0.0.1', () => ok(srv)));
+}
+
+test('connecting to Beds24 clears demo data and blocks reloading it', async t => {
+  const beds = await fakeBeds24();
+  t.after(() => beds.close());
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), BEDS24_BASE: `http://127.0.0.1:${beds.address().port}` });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (path, method = 'GET', body) => fetch(s.url(path), { method, headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+
+  assert.equal((await call('/api/demo', 'POST')).status, 200);
+  assert.equal((await call('/api/properties')).json.length, 3);
+
+  const c = await call('/api/connect', 'POST', { inviteCode: 'abc' });
+  assert.equal(c.status, 200, JSON.stringify(c.json));
+  const props = (await call('/api/properties')).json;
+  assert.deepEqual(props.map(p => p.name), ['Real Cabin']);
+  const bookings = (await call('/api/bookings')).json;
+  assert.deepEqual(bookings.map(b => b.guest_name), ['Real Guest']);
+  const st = (await call('/api/status')).json;
+  assert.equal(st.connected, true); assert.equal(st.demo, false);
+
+  assert.equal((await call('/api/demo', 'POST')).status, 400);
+});
+
+test('on startup, demo data left next to a Beds24 connection is removed', async t => {
+  const { openDb, setSetting } = await import('../server/db.js');
+  const { loadDemo } = await import('../server/demo.js');
+  const path = join(tmp(), 'db.sqlite');
+  const db = openDb(path);
+  loadDemo(db);
+  setSetting(db, 'beds24_refresh_token', 'r');
+  db.close();
+
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: path });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  assert.deepEqual(await (await fetch(s.url('/api/properties'), { headers: { cookie: sid } })).json(), []);
 });

@@ -102,10 +102,12 @@ async function settingsView() {
     <form class="stack" id="cf"><div class="sub">In Beds24: Settings → Apps &amp; Integrations → API → Invite codes. Create a code with read access to properties, inventory and bookings (including guest personal and financial details, or names and totals come back blank), then paste it here.</div>
       <input name="code" placeholder="Invite code" autocomplete="off"><button class="primary">Connect &amp; sync</button></form>
     ${status.connected ? '<button id="dc">Disconnect</button>' : ''}
-    <hr><button id="demo">Load demo data</button><div class="sub">Fills the app with sample properties and bookings so you can try it before connecting.</div>
+    ${status.demo ? '<hr><button id="cleardemo">Clear demo data</button>'
+      : status.connected ? '' : '<hr><button id="demo">Load demo data</button><div class="sub">Fills the app with sample properties and bookings so you can try it before connecting. Connecting to Beds24 removes it automatically.</div>'}
     ${status.auth ? '<hr><button id="lo">Sign out</button>' : ''}</div>`;
   $('#cf').onsubmit = async e => { e.preventDefault(); await act(() => api('/connect', { method: 'POST', body: { inviteCode: e.target.code.value } })); };
-  $('#demo').onclick = () => act(() => api('/demo', { method: 'POST' }));
+  if ($('#demo')) $('#demo').onclick = () => act(() => api('/demo', { method: 'POST' }));
+  if ($('#cleardemo')) $('#cleardemo').onclick = () => act(() => api('/demo/clear', { method: 'POST' }));
   if ($('#lo')) $('#lo').onclick = async () => { await api('/logout', { method: 'POST' }); showLogin(); };
   if ($('#dc')) $('#dc').onclick = () => act(() => api('/disconnect', { method: 'POST' }));
 }

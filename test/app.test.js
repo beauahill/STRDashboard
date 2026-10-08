@@ -4,6 +4,7 @@ import { openDb, getSetting } from '../server/db.js';
 import { Beds24Client } from '../server/beds24.js';
 import { syncBeds24, mapBooking, normalizeChannel } from '../server/sync.js';
 import { periodStats, summary } from '../server/stats.js';
+import { loadDemo, clearDemo } from '../server/demo.js';
 
 test('channel normalization', () => {
   assert.equal(normalizeChannel({ channel: 'airbnb' }), 'Airbnb');
@@ -70,4 +71,17 @@ test('expired token is refreshed', async () => {
   db.prepare("UPDATE settings SET value='0' WHERE key='beds24_token_exp'").run();
   await client.get('/properties');
   assert.ok(calls.some(c => c.includes('/authentication/token')));
+});
+
+test('clearDemo removes only demo rows', () => {
+  const db = openDb(':memory:');
+  loadDemo(db, '2026-10-08');
+  db.prepare("UPDATE properties SET name='My Real Place' WHERE id=2").run(); // same id, different name: untouched
+  db.prepare("INSERT INTO properties(id,name) VALUES(123456,'Real Cabin')").run();
+  db.prepare("INSERT INTO bookings(id,property_id,status,channel,arrival,departure,nights) VALUES(99999999,123456,'confirmed','Airbnb','2026-10-01','2026-10-03',2)").run();
+  clearDemo(db);
+  assert.deepEqual(db.prepare('SELECT id FROM properties ORDER BY id').all().map(r => r.id), [2, 123456]);
+  assert.deepEqual(db.prepare('SELECT DISTINCT property_id FROM bookings ORDER BY 1').all().map(r => r.property_id), [2, 123456]);
+  assert.deepEqual(db.prepare('SELECT DISTINCT property_id FROM rooms').all().map(r => r.property_id), [2]);
+  assert.equal(getSetting(db, 'demo'), null);
 });
