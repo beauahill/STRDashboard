@@ -25,13 +25,16 @@ The app exchanges the code for a refresh token, does a full sync (1 year back), 
 Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB_PATH` (`data/str.db`, or
 `$RAILWAY_VOLUME_MOUNT_PATH/str.db` on Railway). Failed logins are rate-limited (10 per IP per 15 minutes).
 
-## What's in v0.1 (read-only)
+## What's in it (read-only so far)
 
 - **Dashboard**: arrivals / departures / in-house / same-day turnovers, occupancy, revenue, ADR, RevPAR,
   12-month revenue chart (with forecast), revenue by channel, pending requests.
 - **Calendar**: 30-day multi-property timeline, colored by channel, blocks and requests marked.
 - **Bookings**: searchable/filterable list.
 - Per-property filter on every view.
+- **Guesty history import** (Settings): upload a Guesty Lite reservations CSV, preview it, then import.
+  Re-importing updates rather than duplicates, and once Beds24 has a stay, its copy replaces the Guesty one.
+  Guest addresses, IDs and door key codes in the file are never stored.
 
 ## Layout
 
