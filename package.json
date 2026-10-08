@@ -6,8 +6,8 @@
   "private": true,
   "engines": { "node": ">=22.13" },
   "scripts": {
-    "start": "node server/index.js",
-    "demo": "STR_DEMO=1 node server/index.js",
-    "test": "node --test test/app.test.js"
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "demo": "STR_DEMO=1 node --disable-warning=ExperimentalWarning server/index.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/app.test.js test/server.test.js"
   }
 }

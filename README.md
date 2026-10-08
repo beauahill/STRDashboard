@@ -5,18 +5,25 @@ A small, self-hosted dashboard for short-term rentals, fed by the [Beds24 API v2
 
 No dependencies and no build step: Node 22.13+ (built-in SQLite) and a vanilla JS frontend.
 
-## Run it
+## Deploy
+
+See **[DEPLOY.md](DEPLOY.md)** for Railway (recommended): one service, one volume, one `APP_PASSWORD` variable.
+
+## Run locally
 
 ```sh
 npm run demo                    # try it with sample data on http://localhost:3000
-APP_PASSWORD=secret npm start   # real use; password-protects the UI and API
+APP_PASSWORD=secret npm start   # password-protects the UI and API
 ```
 
 Then open **Settings → Connect**. In Beds24 go to *Settings → Apps & Integrations → API → Invite codes*, create a
-code with read access to properties and bookings, and paste it in. The app exchanges it for a refresh token,
-does a full sync (1 year back), then syncs incrementally every 15 minutes (or press **Sync**).
+code with read access to properties, inventory and bookings (including guest personal and financial details),
+and paste it in. Invite codes are single-use, so connect from the copy you'll actually keep using.
+The app exchanges the code for a refresh token, does a full sync (1 year back), then syncs incrementally every
+15 minutes (or press **Sync**).
 
-Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB_PATH` (`data/str.db`).
+Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB_PATH` (`data/str.db`, or
+`$RAILWAY_VOLUME_MOUNT_PATH/str.db` on Railway). Failed logins are rate-limited (10 per IP per 15 minutes).
 
 ## What's in v0.1 (read-only)
 

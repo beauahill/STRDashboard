@@ -12,20 +12,42 @@ import { loadDemo } from './demo.js';
 const PORT = Number(process.env.PORT || 3000);
 const PASSWORD = process.env.APP_PASSWORD || '';
 const PUBLIC = join(fileURLToPath(new URL('.', import.meta.url)), '..', 'public');
-const db = openDb(process.env.DB_PATH || 'data/str.db');
+
+// On Railway, refuse to start in a state that would be unreachable or lose data on redeploy.
+const ON_RAILWAY = !!process.env.RAILWAY_PROJECT_ID;
+const VOLUME = process.env.RAILWAY_VOLUME_MOUNT_PATH;
+if (ON_RAILWAY && !PASSWORD) fail('APP_PASSWORD is not set. Add it under the service\'s Variables tab.');
+if (ON_RAILWAY && !VOLUME && !process.env.DB_PATH) fail('No volume attached. Add a volume to this service mounted at /data.');
+function fail(msg) { console.error(`\nSTARTUP ERROR: ${msg}\n`); process.exit(1); }
+
+const db = openDb(process.env.DB_PATH || (VOLUME ? join(VOLUME, 'str.db') : 'data/str.db'));
 const beds24 = new Beds24Client(db);
 
 if (!getSetting(db, 'session_secret')) setSetting(db, 'session_secret', randomBytes(32).toString('hex'));
 const secret = getSetting(db, 'session_secret');
-const sign = v => createHmac('sha256', secret).update(v).digest('hex');
+// Sessions are bound to the current password, so changing APP_PASSWORD signs everyone out.
+const sign = v => createHmac('sha256', secret).update(`${v}:${PASSWORD}`).digest('hex');
 const makeSession = () => { const exp = Date.now() + 30 * 86400000; return `${exp}.${sign(String(exp))}`; };
+const safeEqual = (a, b) => { a = Buffer.from(a); b = Buffer.from(b); return a.length === b.length && timingSafeEqual(a, b); };
 function validSession(tok = '') {
   const [exp, mac] = tok.split('.');
   if (!exp || !mac || Number(exp) < Date.now()) return false;
-  const a = Buffer.from(mac), b = Buffer.from(sign(exp));
-  return a.length === b.length && timingSafeEqual(a, b);
+  return safeEqual(mac, sign(exp));
 }
 const cookie = req => Object.fromEntries((req.headers.cookie || '').split(';').map(c => c.trim().split('=')).filter(p => p[0]));
+const clientIp = req => req.headers['x-real-ip'] || (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress;
+
+// Brute-force guard: 10 failed logins per IP per 15 minutes.
+const failures = new Map();
+function loginBlocked(ip) {
+  const f = failures.get(ip);
+  if (f && f.until < Date.now()) failures.delete(ip);
+  return (failures.get(ip)?.count || 0) >= 10;
+}
+function recordFailure(ip) {
+  const f = failures.get(ip) || { count: 0, until: Date.now() + 15 * 60000 };
+  f.count++; failures.set(ip, f);
+}
 
 let syncing = false;
 async function runSync() {
@@ -54,11 +76,20 @@ async function api(req, res, url) {
   const route = `${req.method} ${url.pathname}`;
 
   if (route === 'POST /api/login') {
+    const ip = clientIp(req);
+    if (loginBlocked(ip)) return send(res, 429, { error: 'Too many attempts. Try again in 15 minutes.' });
     const { password } = await readJson(req);
-    const ok = PASSWORD && password && password.length === PASSWORD.length &&
-      timingSafeEqual(Buffer.from(password), Buffer.from(PASSWORD));
-    if (!ok) return send(res, 401, { error: 'Wrong password' });
-    res.setHeader('set-cookie', `sid=${makeSession()}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000`);
+    if (!PASSWORD || typeof password !== 'string' || !safeEqual(sign(password), sign(PASSWORD))) {
+      recordFailure(ip);
+      return send(res, 401, { error: 'Wrong password' });
+    }
+    failures.delete(ip);
+    const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+    res.setHeader('set-cookie', `sid=${makeSession()}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000${secure}`);
+    return send(res, 200, { ok: true });
+  }
+  if (route === 'POST /api/logout') {
+    res.setHeader('set-cookie', 'sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
     return send(res, 200, { ok: true });
   }
   if (PASSWORD && !validSession(cookie(req).sid)) return send(res, 401, { error: 'Login required' });
@@ -66,7 +97,7 @@ async function api(req, res, url) {
   switch (route) {
     case 'GET /api/status':
       return send(res, 200, {
-        connected: beds24.connected, demo: getSetting(db, 'demo') === '1', syncing,
+        connected: beds24.connected, auth: !!PASSWORD, demo: getSetting(db, 'demo') === '1', syncing,
         lastSync: getSetting(db, 'last_sync'), lastSyncError: getSetting(db, 'last_sync_error'),
         empty: db.prepare('SELECT COUNT(*) n FROM bookings').get().n === 0,
       });
@@ -109,7 +140,11 @@ async function api(req, res, url) {
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
+  res.setHeader('x-content-type-options', 'nosniff');
+  res.setHeader('x-frame-options', 'DENY');
+  res.setHeader('referrer-policy', 'same-origin');
   try {
+    if (url.pathname === '/healthz') return send(res, 200, { ok: true });
     if (url.pathname.startsWith('/api/')) return await api(req, res, url);
     const rel = normalize(url.pathname === '/' ? '/index.html' : url.pathname).replace(/^(\.\.[/\\])+/, '');
     const file = join(PUBLIC, rel);
@@ -132,3 +167,9 @@ server.listen(PORT, host, () => {
 });
 
 setInterval(() => runSync().catch(e => console.error('sync failed:', e.message)), 15 * 60000).unref();
+
+// Railway sends SIGTERM on redeploy; close cleanly so SQLite isn't mid-write.
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => {
+  server.close(() => { db.close(); process.exit(0); });
+  setTimeout(() => process.exit(0), 5000).unref();
+});
