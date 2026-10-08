@@ -7,22 +7,20 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const SERVER = new URL('../server/index.js', import.meta.url).pathname;
-let nextPort = 3900 + Math.floor(Math.random() * 500);
-
+// PORT=0 lets the OS pick a free port; the server logs the one it got.
 function start(env) {
-  const port = nextPort++;
   const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', SERVER], {
-    env: { PATH: process.env.PATH, PORT: String(port), ...env }, stdio: ['ignore', 'pipe', 'pipe'],
+    env: { PATH: process.env.PATH, PORT: '0', ...env }, stdio: ['ignore', 'pipe', 'pipe'],
   });
-  let out = '';
+  let out = '', port;
   child.stdout.on('data', d => out += d); child.stderr.on('data', d => out += d);
   const exited = new Promise(r => child.on('exit', code => r(code)));
   const ready = new Promise((ok, no) => {
-    child.stdout.on('data', () => out.includes('STR Dashboard on') && ok());
+    child.stdout.on('data', () => { const m = out.match(/STR Dashboard on http:\/\/[^:]+:(\d+)/); if (m) { port = m[1]; ok(); } });
     exited.then(code => no(new Error(`exited ${code}: ${out}`)));
   });
   ready.catch(() => {}); // tests that expect a startup failure never await this
-  return { port, child, ready, exited, output: () => out, url: p => `http://127.0.0.1:${port}${p}` };
+  return { child, ready, exited, output: () => out, url: p => `http://127.0.0.1:${port}${p}` };
 }
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'str-'));
@@ -141,4 +139,35 @@ test('on startup, demo data left next to a Beds24 connection is removed', async 
   await s.ready;
   const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
   assert.deepEqual(await (await fetch(s.url('/api/properties'), { headers: { cookie: sid } })).json(), []);
+});
+
+test('Guesty import endpoints: preview, import, bad file, remove', async t => {
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite') });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (path, body) => fetch(s.url(path), { method: 'POST', headers: { cookie: sid }, body: JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+  const csv = 'CHECK-IN,CHECK-OUT,CONFIRMATION CODE,LISTING,GUEST,STATUS,SOURCE,ACCOMMODATION FARE\n' +
+    '2025-06-01,2025-06-04,GY-1,Laramie House,Pat,Confirmed,Airbnb,450\n2025-07-01,2025-07-02,GY-2,Laramie House,Ina,Inquiry,Airbnb,\n';
+
+  const prev = await call('/api/import/guesty/preview', { csv });
+  assert.equal(prev.status, 200);
+  assert.equal(prev.json.summary.imported, 1);
+  assert.deepEqual(prev.json.rooms, []);
+  assert.ok(!JSON.stringify(prev.json).includes('Pat'), 'preview carries no guest details');
+
+  const bad = await call('/api/import/guesty/preview', { csv: 'a,b\n1,2' });
+  assert.equal(bad.status, 400);
+  assert.match(bad.json.error, /Guesty/);
+
+  const imp = await call('/api/import/guesty', { csv, mapping: { 'Laramie House': 'new' } });
+  assert.equal(imp.status, 200, JSON.stringify(imp.json));
+  const status = await (await fetch(s.url('/api/status'), { headers: { cookie: sid } })).json();
+  assert.equal(status.guestyImported, 1);
+  assert.equal(status.empty, false);
+
+  assert.deepEqual((await call('/api/import/guesty/remove', {})).json, { removed: 1 });
+  const big = await call('/api/import/guesty/preview', { csv: 'x'.repeat(31e6) });
+  assert.equal(big.status, 413);
 });
