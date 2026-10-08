@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STR Dashboard</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <strong class="brand">STR Dashboard</strong>
+  <nav>
+    <a href="#/" data-r="">Dashboard</a>
+    <a href="#/calendar" data-r="calendar">Calendar</a>
+    <a href="#/bookings" data-r="bookings">Bookings</a>
+    <a href="#/settings" data-r="settings">Settings</a>
+  </nav>
+  <select id="prop" title="Property filter"><option value="">All properties</option></select>
+  <button id="sync" title="Sync from Beds24">&#8635; Sync</button>
+</header>
+<div id="banner" hidden></div>
+<main id="view"></main>
+<script type="module" src="app.js"></script>
+</body>
+</html>

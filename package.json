@@ -1,0 +1,13 @@
+{
+  "name": "str-dashboard",
+  "version": "0.1.0",
+  "description": "Self-hosted short-term-rental dashboard backed by the Beds24 API",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node server/index.js",
+    "demo": "STR_DEMO=1 node server/index.js",
+    "test": "node --test test/app.test.js"
+  }
+}
