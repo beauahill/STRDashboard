@@ -8,6 +8,7 @@ import { Beds24Client } from './beds24.js';
 import { syncBeds24, iso } from './sync.js';
 import { summary, calendar } from './stats.js';
 import { loadDemo, clearDemo } from './demo.js';
+import { readGuestyExport, importGuesty, dedupeImported, removeGuestyImport } from './guesty.js';
 
 const PORT = Number(process.env.PORT || 3000);
 const PASSWORD = process.env.APP_PASSWORD || '';
@@ -53,7 +54,7 @@ let syncing = false;
 async function runSync() {
   if (syncing || !beds24.connected) return null;
   syncing = true;
-  try { return await syncBeds24(db, beds24); }
+  try { const r = await syncBeds24(db, beds24); dedupeImported(db); return r; }
   catch (e) { setSetting(db, 'last_sync_error', e.message); throw e; }
   finally { syncing = false; }
 }
@@ -62,10 +63,14 @@ const send = (res, code, body, type = 'application/json') => {
   res.writeHead(code, { 'content-type': type, 'cache-control': 'no-store' });
   res.end(type === 'application/json' ? JSON.stringify(body) : body);
 };
-const readJson = req => new Promise((ok, no) => {
-  let s = '';
-  req.on('data', c => { s += c; if (s.length > 1e6) req.destroy(); });
-  req.on('end', () => { try { ok(s ? JSON.parse(s) : {}); } catch (e) { no(e); } });
+// Oversized bodies are drained and discarded (not kept in memory) so the client still gets a clean 413.
+const readJson = (req, limit = 1e6) => new Promise((ok, no) => {
+  let s = '', tooBig = false;
+  req.on('data', c => { if (tooBig) return; s += c; if (s.length > limit) { tooBig = true; s = ''; } });
+  req.on('end', () => {
+    if (tooBig) return no(Object.assign(new Error('Upload too large'), { status: 413 }));
+    try { ok(s ? JSON.parse(s) : {}); } catch { no(Object.assign(new Error('Invalid JSON'), { status: 400 })); }
+  });
 });
 
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
@@ -100,6 +105,7 @@ async function api(req, res, url) {
         connected: beds24.connected, auth: !!PASSWORD, demo: getSetting(db, 'demo') === '1', syncing,
         lastSync: getSetting(db, 'last_sync'), lastSyncError: getSetting(db, 'last_sync_error'),
         empty: db.prepare('SELECT COUNT(*) n FROM bookings').get().n === 0,
+        guestyImported: db.prepare("SELECT COUNT(*) n FROM bookings WHERE source = 'guesty'").get().n,
       });
     case 'POST /api/connect': {
       const { inviteCode } = await readJson(req);
@@ -116,6 +122,18 @@ async function api(req, res, url) {
       if (beds24.connected) return send(res, 400, { error: 'Demo data can\'t be loaded while connected to Beds24.' });
       return send(res, 200, loadDemo(db));
     case 'POST /api/demo/clear': return send(res, 200, clearDemo(db));
+    case 'POST /api/import/guesty/preview': {
+      const { csv } = await readJson(req, 30e6);
+      const { summary } = readGuestyExport(csv || '');
+      return send(res, 200, { summary, rooms: db.prepare(
+        'SELECT r.id, r.name, p.name property_name FROM rooms r JOIN properties p ON p.id=r.property_id ORDER BY p.name, r.name').all() });
+    }
+    case 'POST /api/import/guesty': {
+      const { csv, mapping } = await readJson(req, 30e6);
+      const { bookings, summary } = readGuestyExport(csv || '');
+      return send(res, 200, { ...importGuesty(db, bookings, mapping), summary });
+    }
+    case 'POST /api/import/guesty/remove': return send(res, 200, removeGuestyImport(db));
     case 'GET /api/properties':
       return send(res, 200, db.prepare('SELECT * FROM properties ORDER BY name').all().map(p => ({
         ...p, rooms: db.prepare('SELECT * FROM rooms WHERE property_id=? ORDER BY name').all(p.id) })));
@@ -155,8 +173,8 @@ const server = createServer(async (req, res) => {
     send(res, 200, await readFile(file), MIME[extname(file)] || 'application/octet-stream');
   } catch (e) {
     if (e.code === 'ENOENT') return send(res, 404, 'Not found', 'text/plain');
-    console.error(e);
-    send(res, 500, { error: e.message });
+    if (!e.status) console.error(e);
+    send(res, e.status || 500, { error: e.message });
   }
 });
 
@@ -167,7 +185,7 @@ if (beds24.connected) clearDemo(db);
 // No password configured -> only reachable from this machine.
 const host = PASSWORD ? '0.0.0.0' : '127.0.0.1';
 server.listen(PORT, host, () => {
-  console.log(`STR Dashboard on http://${host === '0.0.0.0' ? 'localhost' : host}:${PORT}`);
+  console.log(`STR Dashboard on http://${host === '0.0.0.0' ? 'localhost' : host}:${server.address().port}`);
   if (!PASSWORD) console.log('APP_PASSWORD not set: listening on localhost only. Set it before exposing this to a network.');
 });
 

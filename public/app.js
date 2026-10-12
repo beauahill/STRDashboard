@@ -3,7 +3,8 @@ const view = $('#view');
 const money = n => '$' + Math.round(n).toLocaleString();
 const pct = n => (n * 100).toFixed(0) + '%';
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const fmtDate = s => new Date(s + 'T00:00:00Z').toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' });
+const fmtDate = s => new Date(s + 'T00:00:00Z').toLocaleDateString(undefined, {
+  month: 'short', day: 'numeric', timeZone: 'UTC', ...(s.slice(0, 4) !== String(new Date().getFullYear()) && { year: 'numeric' }) });
 const tag = t => `<span class="tag ${esc(t)}">${esc(t)}</span>`;
 let status = {};
 
@@ -87,7 +88,7 @@ async function bookingsView() {
     const rows = await api('/bookings?' + q({ q: $('#bq').value, status: $('#bs').value, channel: $('#bc').value }));
     $('#rows').innerHTML = rows.map(b => `<tr title="${esc(b.notes || '')}"><td>${esc(b.guest_name || '—')}<div class="sub">${esc(b.email || '')}</div></td>
       <td>${esc(b.property_name)}<div class="sub">${esc(b.room_name)}</div></td><td>${fmtDate(b.arrival)} → ${fmtDate(b.departure)}</td><td>${b.nights}</td>
-      <td>${b.adults + b.children}</td><td>${tag(b.channel)}</td><td>${tag(b.status)}</td><td>${money(b.price)}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">No bookings</td></tr>';
+      <td>${b.adults + b.children}</td><td>${tag(b.channel)}${b.source === 'guesty' ? ' <span class="sub" title="Imported from Guesty history">Guesty</span>' : ''}</td><td>${tag(b.status)}</td><td>${money(b.price)}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">No bookings</td></tr>';
   };
   let t; $('#bq').oninput = () => { clearTimeout(t); t = setTimeout(load, 250); };
   $('#bs').onchange = $('#bc').onchange = load;
@@ -104,12 +105,50 @@ async function settingsView() {
     ${status.connected ? '<button id="dc">Disconnect</button>' : ''}
     ${status.demo ? '<hr><button id="cleardemo">Clear demo data</button>'
       : status.connected ? '' : '<hr><button id="demo">Load demo data</button><div class="sub">Fills the app with sample properties and bookings so you can try it before connecting. Connecting to Beds24 removes it automatically.</div>'}
-    ${status.auth ? '<hr><button id="lo">Sign out</button>' : ''}</div>`;
+    ${status.auth ? '<hr><button id="lo">Sign out</button>' : ''}</div>
+    <div class="card stack" style="margin-top:14px"><h3>Import history from Guesty</h3>
+      <div class="sub">In Guesty: Reservation report → Columns (turn everything on) → download CSV (it arrives by email). Choose that file here; you'll see a preview before anything is saved.
+        Guest addresses, IDs and door key codes in the file are ignored.</div>
+      ${status.guestyImported ? `<div>${status.guestyImported} bookings imported from Guesty. <button id="rmg">Remove Guesty import</button></div>` : ''}
+      <input type="file" id="gfile" accept=".csv,text/csv"><div id="gprev"></div></div>`;
   $('#cf').onsubmit = async e => { e.preventDefault(); await act(() => api('/connect', { method: 'POST', body: { inviteCode: e.target.code.value } })); };
   if ($('#demo')) $('#demo').onclick = () => act(() => api('/demo', { method: 'POST' }));
   if ($('#cleardemo')) $('#cleardemo').onclick = () => act(() => api('/demo/clear', { method: 'POST' }));
   if ($('#lo')) $('#lo').onclick = async () => { await api('/logout', { method: 'POST' }); showLogin(); };
   if ($('#dc')) $('#dc').onclick = () => act(() => api('/disconnect', { method: 'POST' }));
+  if ($('#rmg')) $('#rmg').onclick = () => confirm('Remove all bookings imported from Guesty?') && act(() => api('/import/guesty/remove', { method: 'POST' }));
+  $('#gfile').onchange = async e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const csv = await file.text();
+    try { renderGuestyPreview(csv, await api('/import/guesty/preview', { method: 'POST', body: { csv } })); }
+    catch (err) { $('#gprev').innerHTML = `<div class="sub" style="color:#b91c1c">${esc(err.message)}</div>`; }
+  };
+}
+
+function renderGuestyPreview(csv, { summary: s, rooms }) {
+  const counts = o => Object.entries(o).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${esc(k)} (${n})`).join(', ') || 'none';
+  const listings = Object.keys(s.listings);
+  const select = name => `<select data-listing="${esc(name)}">${rooms.map(r =>
+      `<option value="${r.id}">${esc(r.property_name)} · ${esc(r.name)}</option>`).join('')}
+    <option value="new" ${rooms.length ? '' : 'selected'}>Keep as its own property</option></select>`;
+  $('#gprev').innerHTML = `<ul class="list">
+      <li><span>Rows in file</span><b>${s.total}</b></li>
+      <li><span>Stays to import</span><b>${s.imported}${s.first ? ` <span class="sub">(${fmtDate(s.first)} → ${fmtDate(s.last)})</span>` : ''}</b></li>
+      <li><span>Skipped</span><span class="sub">${counts(s.skipped)}</span></li>
+      <li><span>Channels</span><span class="sub">${counts(s.channels)}</span></li>
+      <li><span>Statuses in file</span><span class="sub">${counts(s.statuses)}</span></li>
+      ${s.nightsMismatch ? `<li><span>Night counts that didn't match dates</span><span class="sub">${s.nightsMismatch} (dates were used)</span></li>` : ''}
+    </ul>
+    ${listings.map(l => `<label class="sub">Guesty listing <b>${esc(l)}</b> (${s.listings[l]}) belongs to: ${select(l)}</label>`).join('')}
+    <button class="primary" id="gimp" ${s.imported ? '' : 'disabled'}>Import ${s.imported} stays</button>`;
+  $('#gimp').onclick = () => {
+    const mapping = Object.fromEntries([...document.querySelectorAll('[data-listing]')].map(x => [x.dataset.listing, x.value]));
+    act(async () => {
+      const r = await api('/import/guesty', { method: 'POST', body: { csv, mapping } });
+      alert(`Imported ${r.imported} stays from Guesty.` + (r.duplicates ? ` ${r.duplicates} were already in Beds24 and were skipped.` : ''));
+    });
+  };
 }
 
 async function act(fn) {

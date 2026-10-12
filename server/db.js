@@ -26,11 +26,22 @@ CREATE INDEX IF NOT EXISTS idx_bookings_dates ON bookings(arrival, departure);
 CREATE INDEX IF NOT EXISTS idx_bookings_room ON bookings(room_id);
 `;
 
+// Columns added after the first release; created on startup if an older database lacks them.
+const ADDED_COLUMNS = [
+  ['bookings', 'source', "TEXT NOT NULL DEFAULT 'beds24'"],  // beds24 | guesty
+  ['bookings', 'payout', 'REAL'],                             // what reached the host, when known
+];
+
 export function openDb(path = ':memory:') {
   if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec(SCHEMA);
+  for (const [table, col, def] of ADDED_COLUMNS) {
+    if (!db.prepare(`PRAGMA table_info(${table})`).all().some(c => c.name === col)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+    }
+  }
   return db;
 }
 

@@ -33,9 +33,11 @@ Service → **Settings → Networking → Generate Domain**. If it asks for a po
 You'll get something like `https://strdashboard-production.up.railway.app`. That's the app's address.
 (You can attach your own domain later on the same screen.)
 
-## 5. Check which branch it deploys
+## 5. Deploy from `main`
 
-Service → **Settings → Source → Branch**. Railway redeploys automatically on every push to that branch.
+Service → **Settings → Source → Branch** → choose **`main`**. Railway redeploys automatically on every
+change to `main`. New features are prepared on a separate branch and reach `main` (and your live app) only
+when you merge their pull request on GitHub, so nothing goes live until you choose.
 
 ## 6. Connect Beds24
 

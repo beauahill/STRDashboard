@@ -8,6 +8,6 @@
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning server/index.js",
     "demo": "STR_DEMO=1 node --disable-warning=ExperimentalWarning server/index.js",
-    "test": "node --disable-warning=ExperimentalWarning --test test/app.test.js test/server.test.js"
+    "test": "node --disable-warning=ExperimentalWarning --test test/app.test.js test/guesty.test.js test/server.test.js"
   }
 }
