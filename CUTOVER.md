@@ -74,10 +74,10 @@ Do one channel at a time, and check each before moving on.
       Beds24 by hand (or via iCal) **before** the calendar goes live, or those dates could be sold twice.
 
 **Turno**
-- [ ] In Turno, replace the property's Guesty calendar with the **Beds24 iCal link** (in Beds24, under the
-      property's settings). Turno creates a cleaning at each check-out.
-- [ ] iCal can't tell bookings from blocked dates, so blocks may create stray cleanings. Check Turno's
-      schedule for the next month and delete any that aren't real.
+- [ ] In Turno, replace the property's Guesty calendar link with the dashboard's **Cleaning → Turno link**.
+      Turno creates a cleaning at each checkout. Unlike Beds24's own calendar link, this one lists real stays
+      only, so blocked dates don't create stray cleanings.
+- [ ] Check Turno's schedule for the next month matches the dashboard's Cleaning page.
 
 **Door codes**
 - [ ] Turn off Guesty's lock automation / check-in message, so guests don't get two different codes.

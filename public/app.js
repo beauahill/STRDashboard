@@ -775,13 +775,43 @@ async function pricingView() {
   });
 }
 
+// ---------- Cleaning: turnovers and the Turno feed ----------
+async function cleaningView() {
+  const C = await api('/cleaning?' + q({ days: 45 }));
+  const hrs = h => h == null ? '' : h >= 48 ? `${Math.floor(h / 24)} days` : `${Math.round(h * 10) / 10} hours`;
+  const time = t => { const [h, m] = t.split(':').map(Number); return `${h % 12 || 12}${m ? ':' + String(m).padStart(2, '0') : ''} ${h < 12 ? 'AM' : 'PM'}`; };
+  view.innerHTML = `<div class="card" style="overflow-x:auto"><h3>Upcoming turnovers (next 45 days)</h3>
+    ${C.turnovers.length ? `<table><tr><th>Checkout</th><th>Leaving</th><th>Next guests</th><th>Time to clean</th>${C.feeds.length > 1 ? '<th>Room</th>' : ''}</tr>
+    ${C.turnovers.map(t => `<tr class="${t.sameDay ? 'sameday' : ''}">
+      <td><b>${new Date(t.checkout.departure + 'T00:00:00Z').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' })}</b><div class="sub">by ${time(t.checkoutTime)}</div></td>
+      <td>${esc(t.checkout.guest_name || 'Guest')} ${tag(t.checkout.channel)}</td>
+      <td>${t.next ? `${esc(t.next.guest_name || 'Guest')} · ${(() => { const g = (t.next.adults || 0) + (t.next.children || 0); return g ? `${g} guest${g === 1 ? '' : 's'}` : 'guests ?'; })()}<div class="sub">arrive ${fmtDate(t.next.arrival)} from ${time(t.checkinTime)}</div>` : '<span class="sub">No booking yet</span>'}</td>
+      <td>${t.sameDay ? `<span class="tag request">Same day</span> ${hrs(t.windowHours)}` : t.next ? hrs(t.windowHours) : '<span class="sub">open</span>'}</td>
+      ${C.feeds.length > 1 ? `<td class="sub">${esc(t.room.name)}</td>` : ''}</tr>`).join('')}</table>` : '<div class="empty">No checkouts in the next 45 days.</div>'}</div>
+  <div class="card stack" style="margin-top:14px;max-width:none"><h3>Turno</h3>
+    <div>Turno creates a cleaning project at every checkout from a calendar link. Use this link instead of the Beds24 or Guesty one:
+      it lists <b>real stays only</b> (blocked dates never create cleanings) and includes each stay's guest count. No guest names or contact details.</div>
+    ${C.feeds.map(f => `<div class="toolbar" style="margin:0"><b>${esc(f.property_name)} · ${esc(f.name)}</b>
+      <input readonly value="${esc(f.url)}" style="flex:1;min-width:220px" onclick="this.select()"><button data-copy="${esc(f.url)}">Copy</button></div>`).join('') || '<div class="empty">No rooms yet.</div>'}
+    <ol class="sub" style="line-height:1.7;padding-left:18px;margin:0">
+      <li>In Turno, open your property → <b>Calendar sync</b> (iCal) and remove the Guesty/Beds24 calendar link.</li>
+      <li>Add the link above. Turno checks it regularly and creates a cleaning on each checkout day.</li>
+      <li>Check Turno's schedule for the next few weeks matches the list above.</li></ol>
+    <div class="sub">Keep the link private; anyone with it can see your booked dates. <a href="#" id="cregen">Make a new link</a> (the old one stops working; update Turno).</div>
+    <div class="sub">Turno doesn't let other apps read cleaning status, so assignments and completion stay in the Turno app.</div></div>`;
+  view.querySelectorAll('[data-copy]').forEach(b => b.onclick = async () => {
+    try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = 'Copied'; } catch { b.previousElementSibling.select(); }
+  });
+  $('#cregen').onclick = e => { e.preventDefault(); if (confirm('Make a new Turno link? The current link stops working until you update it in Turno.')) act(() => api('/cleaning/regenerate', { method: 'POST' })); };
+}
+
 async function act(fn) {
   const btn = $('#sync'); btn.disabled = true; banner('Working…');
   try { await fn(); banner(''); await boot(true); } catch (e) { if (e.message !== 'login') banner(e.message, true); }
   btn.disabled = false;
 }
 
-const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, bookings: bookingsView, rates: ratesView, pricing: pricingView, locks: locksView, settings: settingsView };
+const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, bookings: bookingsView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
 async function render() {
   const r = location.hash.replace(/^#\/?/, '');
   clearInterval(pageTimer); pageTimer = null;

@@ -425,3 +425,28 @@ test('Inbox: messages sync, unread badge, open marks read, reply sends, polling 
   assert.equal((await call('/api/replies', { title: 'Wi-Fi', body: 'Network: LaramieGuest' })).status, 200);
   assert.equal((await call('/api/replies')).json.length, 5);
 });
+
+test('Turno feed URL works without login, only with the right secret, and stops after regenerating', async t => {
+  const { openDb } = await import('../server/db.js');
+  const { upsertProperties, upsertBookings } = await import('../server/sync.js');
+  const path = join(tmp(), 'db.sqlite');
+  const db = openDb(path);
+  upsertProperties(db, [{ id: 500, name: 'Laramie Retreat', roomTypes: [{ id: 600, name: 'Whole house', qty: 1 }] }]);
+  const day = n => new Date(Date.now() + n * 86400e3).toISOString().slice(0, 10);
+  upsertBookings(db, [{ id: 1, propertyId: 500, roomId: 600, status: 'confirmed', arrival: day(2), departure: day(5), numAdult: 2 }]);
+  db.close();
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: path });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const cl = await (await fetch(s.url('/api/cleaning'), { headers: { cookie: sid } })).json();
+  const feedPath = new URL(cl.feeds[0].url).pathname;
+  const ok = await fetch(s.url(feedPath));
+  assert.equal(ok.status, 200);
+  assert.match(ok.headers.get('content-type'), /text\/calendar/);
+  assert.match(await ok.text(), /SUMMARY:Reserved \(2 guests\)/);
+  assert.equal((await fetch(s.url(feedPath.replace(/\/cal\/[^/]+/, '/cal/wrongwrongwrongwrongwrong')))).status, 404);
+  assert.equal((await fetch(s.url('/api/cleaning'))).status, 401, 'the cleaning page itself still needs login');
+  await fetch(s.url('/api/cleaning/regenerate'), { method: 'POST', headers: { cookie: sid } });
+  assert.equal((await fetch(s.url(feedPath))).status, 404, 'old link stops working');
+});

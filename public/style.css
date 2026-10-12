@@ -131,3 +131,5 @@ a.kpi-link { text-decoration:none; color:inherit; border-color:#fca5a5; }
 .pctgrid label { display:flex; flex-direction:column; font-size:11px; color:var(--mut); }
 .pctgrid input { width:100%; }
 details.card > summary { cursor:pointer; }
+
+tr.sameday td { background:#fef3c744; }

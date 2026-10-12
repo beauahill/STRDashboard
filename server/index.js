@@ -11,6 +11,7 @@ import { loadDemo, clearDemo } from './demo.js';
 import { readGuestyExport, importGuesty, dedupeImported, removeGuestyImport } from './guesty.js';
 import { syncCalendar, readDays, planChanges, applyChanges, recentChanges } from './rates.js';
 import { SeamClient } from './seam.js';
+import { feedToken, icsForRoom, turnovers } from './cleaning.js';
 import {
   pricingSettings, savePricingSettings, seedEvents, listEvents, saveEvent, deleteEvent, recommend, pendingChanges,
   applyNightly, autoPrice, suggestFromHistory,
@@ -236,6 +237,15 @@ async function api(req, res, url) {
       if (rec.needsBase) return send(res, 400, { error: 'Set a base price first.' });
       return send(res, 200, await applyNightly(db, beds24, Number(roomId), pendingChanges(rec, { includeMinStay: !!includeMinStay }), { today }));
     }
+    case 'GET /api/cleaning': {
+      const origin = `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers['x-forwarded-host'] || req.headers.host}`;
+      const token = feedToken(db);
+      const rooms = db.prepare('SELECT r.id, r.name, p.name property_name FROM rooms r JOIN properties p ON p.id = r.property_id WHERE r.id > 0 ORDER BY p.name, r.name').all();
+      const roomIds = prop ? db.prepare('SELECT id FROM rooms WHERE property_id = ?').all(prop).map(r => r.id) : null;
+      return send(res, 200, { turnovers: turnovers(db, { days: Math.min(Number(q.days) || 30, 120), roomIds }),
+        feeds: rooms.map(r => ({ ...r, url: `${origin}/cal/${token}/${r.id}.ics` })) });
+    }
+    case 'POST /api/cleaning/regenerate': feedToken(db, true); return send(res, 200, { ok: true });
     case 'GET /api/inbox':
       return send(res, 200, { conversations: conversations(db, { filter: q.filter, q: q.q || '' }), unread: unreadCount(db),
         error: getSetting(db, 'messages_error'), connected: beds24.connected });
@@ -389,6 +399,14 @@ const server = createServer(async (req, res) => {
   res.setHeader('referrer-policy', 'same-origin');
   try {
     if (url.pathname === '/healthz') return send(res, 200, { ok: true });
+    // Cleaning calendar for Turno: no login (Turno can't sign in), protected by the secret in the URL.
+    const feed = url.pathname.match(/^\/cal\/([\w-]{20,})\/(\d+)\.ics$/);
+    if (feed) {
+      const ics = safeEqual(feed[1], feedToken(db)) ? icsForRoom(db, Number(feed[2])) : null;
+      if (!ics) return send(res, 404, 'Not found', 'text/plain');
+      res.writeHead(200, { 'content-type': 'text/calendar; charset=utf-8', 'cache-control': 'no-store' });
+      return res.end(ics);
+    }
     if (url.pathname.startsWith('/api/')) return await api(req, res, url);
     const rel = normalize(url.pathname === '/' ? '/index.html' : url.pathname).replace(/^(\.\.[/\\])+/, '');
     const file = join(PUBLIC, rel);

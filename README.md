@@ -53,6 +53,10 @@ Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB
   and ceiling. Click any night for the breakdown. "Suggest from my history" derives the base and seasonal
   adjustments from past stays. Apply 30/90/365 days to Beds24 (unbooked nights only, verified and logged),
   or switch on daily auto-pricing (capped change per day, off by default).
+- **Cleaning**: upcoming turnovers with the time available to clean (same-day turnovers highlighted) and next
+  guests' head count, plus a private per-room calendar link for **Turno** (Turno has no public API; it
+  subscribes to iCal). The feed contains real stays only, so blocks never create cleanings, and no guest
+  names or contact details. The link can be regenerated.
 - **Locks** (Yale via [Seam](https://www.seam.co)): every confirmed Beds24 stay gets a door code on each lock
   of its property (last 4 digits of the guest's phone; last 5/6 if that clashes, random if no phone), active
   from check-in to checkout time in the property's time zone. Codes follow date changes and cancellations,
@@ -68,14 +72,14 @@ Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB
 
 `server/beds24.js` API client + token handling · `server/sync.js` mapping and sync ·
 `server/rates.js` prices, minimum stays and blocks · `server/doors.js` + `server/seam.js` door codes ·
-`server/messages.js` inbox and saved replies · `server/pricing.js` pricing tool ·
+`server/messages.js` inbox and saved replies · `server/pricing.js` pricing tool · `server/cleaning.js` Turno feed and turnovers ·
 `server/guesty.js` Guesty import ·
 `server/stats.js` metrics · `server/demo.js` sample data · `public/` UI · `test/` (`npm test`).
 
 ## Known gaps / next steps
 
 - No creating or editing bookings from the app yet (Beds24 `POST /bookings`).
-- Turno cleaning feed and view, automated messages, listing editor, AI assistant and analytics, owner statements.
+- Automated messages, listing editor, AI assistant and analytics, owner statements.
 - Beds24 request/response fields are checked against Beds24's published OpenAPI spec, but the app hasn't yet run
   against a Beds24 account with live channel connections.
 - Beds24 API credits are rate limited; the incremental sync keeps usage low.
