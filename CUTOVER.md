@@ -32,6 +32,14 @@ Nothing here touches your live listings yet.
       Airbnb and Booking.com don't display formatting. Booking.com doesn't allow links in messages.
 - [ ] **Booking confirmation template** (Settings → Guest Management → Confirmation Messages). VRBO doesn't
       send confirmations itself, so Beds24 has to.
+- [ ] **Door codes (dashboard → Locks)**: add your Seam API key, click **Connect Yale account**, set both
+      locks to open your property, and check the check-in/checkout times. Leave **automatic guest codes
+      off** for now; Guesty is still making codes.
+- [ ] **Door code in the check-in message**: in your Beds24 check-in Auto Action, put `[GUESTCUSTOMQ10]`
+      where the code goes (the Locks page shows the exact variable if you change the field number). Send it
+      no earlier than 14 days before arrival (the Locks page setting), so the code exists by then. Optional:
+      add custom question 10 as an *internal* question named "Door code" (Settings → Properties → Booking
+      Questions) so the field is labelled in Beds24.
 - [ ] **Booking page for direct bookings**: set up Beds24's booking page and connect a payment provider
       (e.g. Stripe) for deposits and payments. Make a test booking, then cancel it.
 
@@ -69,6 +77,17 @@ Do one channel at a time, and check each before moving on.
       property's settings). Turno creates a cleaning at each check-out.
 - [ ] iCal can't tell bookings from blocked dates, so blocks may create stray cleanings. Check Turno's
       schedule for the next month and delete any that aren't real.
+
+**Door codes**
+- [ ] Turn off Guesty's lock automation / check-in message, so guests don't get two different codes.
+- [ ] On the Locks page, turn on **automatic guest codes**. Every upcoming guest within 14 days gets a code
+      on both locks (last 4 digits of their phone), saved to their Beds24 booking.
+- [ ] ⚠️ **Guests who already received a Guesty code**: leave those Guesty codes on the locks (they show
+      under "Other codes"), so those guests can still get in. Their new code may differ, because the app
+      won't reuse a code that's already on a lock. Delete the Guesty codes after those guests check out.
+- [ ] Check the Dashboard: every arrival in the next few days shows 🔑 with its code and no ⚠.
+- [ ] Send yourself a test of the check-in Auto Action from a booking's page in Beds24 and confirm the code
+      appears in the message.
 
 **Direct bookings**
 - [ ] Point your direct booking link (or domain) at the Beds24 booking page.

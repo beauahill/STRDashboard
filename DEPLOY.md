@@ -43,14 +43,20 @@ when you merge their pull request on GitHub, so nothing goes live until you choo
 
 1. Open your Railway address and sign in with `APP_PASSWORD`.
 2. In Beds24: **Settings → Apps & Integrations → API → generate an invite code**. Give it access to
-   **properties and bookings, including guest personal details and financial details** (otherwise guest
-   names and booking totals come back blank), and **write access to inventory** so you can change prices,
-   minimum stays and blocked dates from the app's Rates page.
+   **properties**, **bookings with write access, including guest personal details and financial details**
+   (otherwise guest names and totals come back blank, and door codes can't be saved on bookings), and
+   **write access to inventory** (to change prices, minimum stays and blocked dates on the Rates page).
 3. In the app: **Settings → paste the invite code → Connect & sync**.
 
 The invite code is single-use: the app exchanges it for a long-lived key stored on the volume. To change
 permissions later (e.g. add write access), generate a fresh code and paste it in Settings; it replaces
 the old one. Settings shows the permissions currently granted.
+
+## 7. Door locks (optional)
+
+On the app's **Locks** page: paste a Seam API key (from your workspace at seam.co), click **Connect Yale
+account** to sign in to Yale Access through Seam, then choose which property each lock opens. See the
+"Door codes" items in `CUTOVER.md` for turning on automatic guest codes.
 
 ## Troubleshooting
 
