@@ -59,6 +59,19 @@ On the app's **Locks** page: paste a Seam API key (from your workspace at seam.c
 account** to sign in to Yale Access through Seam, then choose which property each lock opens. See the
 "Door codes" items in `CUTOVER.md` for turning on automatic guest codes.
 
+## 8. AI assistant (optional)
+
+1. At [console.anthropic.com](https://console.anthropic.com): add a payment method or credits under
+   **Billing**, then **API keys → Create key**. Copy it (it starts with `sk-ant-`).
+2. In the app: **Settings → AI assistant → paste the key → Save key**. The app checks it with Anthropic
+   before saving. (Alternatively, add it as an `ANTHROPIC_API_KEY` variable in Railway; a key pasted in
+   Settings takes priority.)
+3. Set a **monthly spending limit** (default $25) and fill in the **house notes** for each property:
+   parking, pets, check-in policies, local tips, and the name to sign off with. Guest reply drafts use them.
+
+Usage is billed to your Anthropic account, typically one to a few cents per request. Settings shows this
+month's estimate. The key stays on the server; the browser only ever sees its last four characters.
+
 ## Troubleshooting
 
 - **Deploy failed**: open **Deploy Logs**; any `STARTUP ERROR:` line says exactly what's missing.

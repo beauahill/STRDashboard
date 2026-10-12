@@ -3,7 +3,8 @@
 A small, self-hosted dashboard for short-term rentals, fed by the [Beds24 API v2](https://wiki.beds24.com/index.php/API_V2.0)
 (which in turn syncs Airbnb, VRBO and Booking.com). Built to replace Guesty for day-to-day visibility.
 
-No dependencies and no build step: Node 22.13+ (built-in SQLite) and a vanilla JS frontend.
+No build step and one dependency (Anthropic's official SDK, for the optional AI assistant): Node 22.13+
+(built-in SQLite) and a vanilla JS frontend. Run `npm install` once before starting it locally.
 
 ## Deploy
 
@@ -12,6 +13,7 @@ See **[DEPLOY.md](DEPLOY.md)** for Railway (recommended): one service, one volum
 ## Run locally
 
 ```sh
+npm install
 npm run demo                    # try it with sample data on http://localhost:3000
 APP_PASSWORD=secret npm start   # password-protects the UI and API
 ```
@@ -23,7 +25,8 @@ The app exchanges the code for a refresh token, does a full sync (1 year back), 
 15 minutes (or press **Sync**).
 
 Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB_PATH` (`data/str.db`, or
-`$RAILWAY_VOLUME_MOUNT_PATH/str.db` on Railway). Failed logins are rate-limited (10 per IP per 15 minutes).
+`$RAILWAY_VOLUME_MOUNT_PATH/str.db` on Railway), `ANTHROPIC_API_KEY` (optional; the key can also be pasted in
+Settings). Failed logins are rate-limited (10 per IP per 15 minutes).
 
 ## What's in it
 
@@ -48,6 +51,28 @@ Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB
   once per booking. Upcoming sends with preview and skip, history, and per-property custom fill-ins
   (Wi-Fi, address, ...). Runs every 5 minutes; problems show on the Dashboard.
 - **Bookings**: searchable/filterable list.
+- **Analytics**: year to date, last 12 months and next 90 days against the same dates last year; revenue,
+  occupancy or ADR by month next to the same month last year; pace (on the books now versus what was booked
+  by this date last year, and how last year finished); channel mix with ADR, lead time and length of stay;
+  how far ahead guests book; length of stay; occupancy by night of the week; cancellations. Includes the
+  Guesty history import. Filter by property and by period (last 12 months, this year, last year, all time).
+- **AI assistant** (optional, uses your own Anthropic API key; model `claude-opus-5-5`):
+  - *Inbox*: **Draft reply** writes a reply in the guest's language from the conversation, stay details,
+    your saved replies, the listing text and your house notes. Access details (door code, Wi-Fi, directions)
+    are only given to it for confirmed stays. The draft goes in the reply box; you edit and send it, and
+    Send asks first if a [bracketed] fill-in is left.
+  - *Analytics*: **Ask about your numbers** in plain English ("How did October compare with last year?").
+    Claude looks the figures up with read-only tools over the local database, never estimates them, and
+    keeps the conversation for follow-ups.
+  - *Listing*: **Improve / Write with AI** on every text field, with an optional instruction; keeps to the
+    character limit (50 for the Airbnb headline). "Use this" puts it in the field, which is still previewed
+    before saving.
+  - *Pricing*: **Review next 90 days**, **Explain** a selected night, or ask a question. It sees your rules,
+    events, pace and each night's factors. Advice only; nothing is applied.
+  - Settings: key (checked before saving, never sent to the browser), monthly spending limit (default $25)
+    with this month's estimated cost, and per-property house notes. Refusals and errors show as clear
+    messages; requests use Anthropic's server-side fallback so a declined request is retried on another
+    model.
 - Per-property filter on every view.
 - **Listing**: edit the property's listing text (headline, description, neighbourhood, directions, house rules,
   policies), details (name, type, address, check-in/out times, contact) and each room's capacity, size, fees
@@ -85,13 +110,16 @@ Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB
 `server/beds24.js` API client + token handling · `server/sync.js` mapping and sync ·
 `server/rates.js` prices, minimum stays and blocks · `server/doors.js` + `server/seam.js` door codes ·
 `server/messages.js` inbox and saved replies · `server/pricing.js` pricing tool · `server/cleaning.js` Turno feed and turnovers · `server/automations.js` automated messages · `server/listing.js` listing editor ·
+`server/analytics.js` analytics · `server/ai.js` AI assistant ·
 `server/guesty.js` Guesty import ·
 `server/stats.js` metrics · `server/demo.js` sample data · `public/` UI · `test/` (`npm test`).
 
 ## Known gaps / next steps
 
 - No creating or editing bookings from the app yet (Beds24 `POST /bookings`).
-- AI assistant and analytics, owner statements.
+- Owner statements / profit and loss (expenses aren't tracked yet).
+- The AI assistant has only been run against a stand-in for Anthropic's API in tests; try it on a few real
+  drafts before relying on it.
 - Beds24 request/response fields are checked against Beds24's published OpenAPI spec, but the app hasn't yet run
   against a Beds24 account with live channel connections.
 - Beds24 API credits are rate limited; the incremental sync keeps usage low.

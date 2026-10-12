@@ -187,6 +187,7 @@ async function bookingsView() {
 
 async function settingsView() {
   status = await api('/status');
+  const AI = await api('/ai');
   view.innerHTML = `<div class="card stack"><h3>Beds24 connection</h3>
     <div>${status.connected ? '✅ Connected' : 'Not connected'}${status.demo ? ' · <b>demo data loaded</b>' : ''}</div>
     <div class="sub">Last sync: ${status.lastSync ? new Date(status.lastSync).toLocaleString() : 'never'}${status.lastSyncError ? ' · error: ' + esc(status.lastSyncError) : ''}</div>
@@ -197,6 +198,18 @@ async function settingsView() {
     ${status.demo ? '<hr><button id="cleardemo">Clear demo data</button>'
       : status.connected ? '' : '<hr><button id="demo">Load demo data</button><div class="sub">Fills the app with sample properties and bookings so you can try it before connecting. Connecting to Beds24 removes it automatically.</div>'}
     ${status.auth ? '<hr><button id="lo">Sign out</button>' : ''}</div>
+    <div class="card stack" style="margin-top:14px"><h3>AI assistant</h3>
+      <div>${AI.configured ? `✅ Anthropic API key saved (${esc(AI.keyHint)})${AI.fromEnv ? ' from the ANTHROPIC_API_KEY variable' : ''}` : 'Not set up'}</div>
+      <div class="sub">Claude drafts guest replies (Inbox), writes listing text (Listing), reviews prices (Pricing) and answers questions about your numbers (Analytics).
+        Nothing is sent to a guest or saved to Beds24 until you press Send, Save or Apply. It uses your own key from console.anthropic.com → API keys, and usage is billed to that Anthropic account (typically one to a few cents per request).</div>
+      <form class="toolbar" id="aikey" style="margin:0"><input name="key" type="password" placeholder="sk-ant-…" autocomplete="off" style="flex:1;min-width:0">
+        <button class="primary">${AI.configured ? 'Replace key' : 'Save key'}</button>${AI.configured && !AI.fromEnv ? '<button type="button" id="airm">Remove</button>' : ''}</form>
+      ${AI.configured ? `<div class="sub">This month: ${AI.month.requests} request${AI.month.requests === 1 ? '' : 's'}, about $${AI.month.cost.toFixed(2)} (estimate; your Anthropic console has the exact bill). Model: ${esc(AI.model)}.</div>
+      <form class="stack" id="aiset" style="max-width:none">
+        <label class="sub">Monthly spending limit ($): requests stop once the month's estimate reaches it <input name="budget" type="number" min="0" max="10000" step="1" value="${AI.budget}" style="width:7em"></label>
+        ${AI.properties.map(p => `<label class="sub">House notes for <b>${esc(p.name)}</b>: facts the assistant may use in guest replies, such as parking, pets, quiet hours, early check-in or late checkout policy, local tips, and your name for signing off
+          <textarea name="note_${p.id}" rows="5" maxlength="10000" placeholder="Parking: two spots in the driveway. No pets. Early check-in possible if no one checks out that day; ask me first. Sign off as Sam.">${esc(p.notes)}</textarea></label>`).join('')}
+        <div><button class="primary">Save</button></div></form>` : ''}</div>
     <div class="card stack" style="margin-top:14px"><h3>Import history from Guesty</h3>
       <div class="sub">In Guesty: Reservation report → Columns (turn everything on) → download CSV (it arrives by email). Choose that file here; you'll see a preview before anything is saved.
         Guest addresses, IDs and door key codes in the file are ignored.</div>
@@ -207,6 +220,22 @@ async function settingsView() {
   if ($('#cleardemo')) $('#cleardemo').onclick = () => act(() => api('/demo/clear', { method: 'POST' }));
   if ($('#lo')) $('#lo').onclick = async () => { await api('/logout', { method: 'POST' }); showLogin(); };
   if ($('#dc')) $('#dc').onclick = () => act(() => api('/disconnect', { method: 'POST' }));
+  $('#aikey').onsubmit = async e => {
+    e.preventDefault();
+    const key = e.target.key.value.trim();
+    if (!key) return;
+    const btn = e.target.querySelector('.primary'); btn.disabled = true; btn.textContent = 'Checking…';
+    try { await api('/ai/key', { method: 'POST', body: { apiKey: key } }); await boot(true); banner('Anthropic API key saved. AI features are on.', 'ok'); }
+    catch (err) { if (err.message !== 'login') { banner(err.message, true); btn.disabled = false; btn.textContent = 'Save key'; } }
+  };
+  if ($('#airm')) $('#airm').onclick = () => confirm('Remove the Anthropic API key? AI features will switch off.') && act(() => api('/ai/key', { method: 'POST', body: { apiKey: '' } }));
+  if ($('#aiset')) $('#aiset').onsubmit = async e => {
+    e.preventDefault();
+    const f = e.target;
+    const notes = Object.fromEntries(AI.properties.map(p => [p.id, f.elements[`note_${p.id}`].value]));
+    try { await api('/ai/settings', { method: 'POST', body: { budget: f.budget.value, notes } }); banner('AI settings saved.', 'ok'); }
+    catch (err) { if (err.message !== 'login') banner(err.message, true); }
+  };
   if ($('#rmg')) $('#rmg').onclick = () => confirm('Remove all bookings imported from Guesty?') && act(() => api('/import/guesty/remove', { method: 'POST' }));
   $('#gfile').onchange = async e => {
     const file = e.target.files[0];
@@ -555,6 +584,8 @@ function renderThread(th) {
     ${th.canReply ? `<div class="composer">
       <div class="toolbar" style="margin:0 0 6px"><select id="ireply"><option value="">Insert saved reply…</option>${inbox.replies.map(r => `<option value="${r.id}">${esc(r.title)}</option>`).join('')}</select>
         <a href="#" id="imanage" class="sub">${inbox.manage ? 'Hide saved replies' : 'Edit saved replies'}</a></div>
+      ${status.ai ? `<div class="toolbar" style="margin:0 0 6px"><input id="iaihint" placeholder="Anything the draft should say? (optional)" style="flex:1;min-width:0" maxlength="2000">
+        <button type="button" id="iai">✨ Draft reply</button></div>` : ''}
       <textarea id="itext" rows="4" maxlength="5000" placeholder="Write a reply…">${esc(inbox.drafts[inbox.booking] || '')}</textarea>
       <div class="toolbar" style="margin:6px 0 0"><span class="sub" id="inote">${channelNote}</span>
         <span class="sub" id="icount" style="margin-left:auto"></span><button class="primary" id="isend">Send</button></div>
@@ -574,10 +605,24 @@ function renderThread(th) {
     e.target.value = '';
   };
   ta.onkeydown = e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('#isend').click(); };
+  // AI draft: replaces the reply box (with undo); nothing is sent until Send is pressed.
+  if ($('#iai')) $('#iai').onclick = async () => {
+    const btn = $('#iai'), booking = inbox.booking, before = ta.value;
+    btn.disabled = true; btn.textContent = 'Drafting…';
+    try {
+      const r = await api('/ai/draft', { method: 'POST', body: { bookingId: booking, instructions: $('#iaihint').value } });
+      if (inbox.booking !== booking || !$('#itext')) return;
+      $('#itext').value = r.text; $('#itext').dispatchEvent(new Event('input'));
+      $('#inote').innerHTML = `✨ AI draft${aiCost(r)}. Read it, and fill in anything in [brackets], before sending.${before.trim() ? ' <a href="#" id="iundo">Undo</a>' : ''}`;
+      if ($('#iundo')) $('#iundo').onclick = e => { e.preventDefault(); $('#itext').value = before; $('#itext').dispatchEvent(new Event('input')); $('#inote').textContent = ''; };
+    } catch (err) { if (err.message !== 'login' && $('#inote')) $('#inote').innerHTML = `<span class="bad">${esc(err.message)}</span>`; }
+    finally { if ($('#iai')) { $('#iai').disabled = false; $('#iai').textContent = '✨ Draft reply'; } }
+  };
   $('#isend').onclick = async () => {
     const text = ta.value.trim();
     if (!text) return;
     if (/\{\w+\}/.test(text) && !confirm('The message still has a {placeholder} in it. Send anyway?')) return;
+    if (/\[(confirm|check|add|insert)\b[^\]]*\]/i.test(text) && !confirm('The message still has a [bracketed] note to fill in. Send anyway?')) return;
     $('#isend').disabled = true; $('#isend').textContent = 'Sending…';
     try {
       const t2 = await api('/inbox/send', { method: 'POST', body: { bookingId: inbox.booking, message: text } });
@@ -619,7 +664,7 @@ function renderReplyManager(th) {
 }
 
 // ---------- Pricing tool ----------
-const pr = { month: null, room: null, selected: null, open: { settings: false, events: false } };
+const pr = { month: null, room: null, selected: null, open: { settings: false, events: false }, ai: { html: '', busy: false } };
 const DOWS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'], MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const pctStr = v => `${v > 0 ? '+' : ''}${Math.round(v * 10) / 10}%`;
 
@@ -677,6 +722,11 @@ async function pricingView() {
         <tr><td><b>Recommended</b></td><td style="text-align:right"><b>${money(sel.price)}</b></td></tr>
         <tr><td>In Beds24 now</td><td style="text-align:right">${sel.current != null ? money(sel.current) : '—'}</td></tr>
         <tr><td>Minimum stay</td><td style="text-align:right">${sel.minStay} night${sel.minStay === 1 ? '' : 's'}${sel.currentMinStay != null && sel.currentMinStay !== sel.minStay ? ` <span class="sub">(now ${sel.currentMinStay})</span>` : ''}</td></tr></table></div>` : ''}
+      ${P.needsBase ? '' : `<div class="card"><h3>✨ AI pricing review</h3>${status.ai ? `
+        <div class="toolbar" style="margin:0 0 6px"><button id="paireview" ${pr.ai.busy ? 'disabled' : ''}>Review next 90 days</button>${sel ? `<button id="painight" ${pr.ai.busy ? 'disabled' : ''}>Explain ${fmtDate(sel.date)}</button>` : ''}</div>
+        <form id="paiform" class="toolbar" style="margin:0"><input name="q" placeholder="Or ask, e.g. Is my weekend premium too low?" style="flex:1;min-width:0" maxlength="1000"><button ${pr.ai.busy ? 'disabled' : ''}>Ask</button></form>
+        <div id="paiout" class="aianswer">${pr.ai.html}</div><div class="sub">Advice only: nothing changes in Beds24 unless you apply it.</div>`
+        : aiSetup('Get a second opinion on these prices, or ask why a night is priced the way it is.')}</div>`}
       ${P.pending ? `<div class="card"><h3>Apply to Beds24</h3><table class="pv">
         ${pendRow('Next 30 days', P.pending.d30, 30)}${pendRow('Next 90 days', P.pending.d90, 90)}${pendRow('Next 12 months', P.pending.d365, 365)}</table>
         <label class="sub"><input type="checkbox" id="pmin" checked> Also set minimum stays (events and gap nights)</label>
@@ -724,10 +774,28 @@ async function pricingView() {
   const go = m => { pr.month = m; pricingView(); };
   $('#pprev').onclick = () => go(addMonths(pr.month, -1)); $('#pnext').onclick = () => go(addMonths(pr.month, 1));
   $('#ptoday').onclick = () => go(today.slice(0, 8) + '01');
-  if ($('#proom')) $('#proom').onchange = e => { pr.room = +e.target.value; pr.selected = null; pricingView(); };
+  if ($('#proom')) $('#proom').onchange = e => { pr.room = +e.target.value; pr.selected = null; pr.ai = { busy: false, html: '' }; pricingView(); };
   view.querySelectorAll('[data-pdate]').forEach(el => el.onclick = () => { pr.selected = pr.selected === el.dataset.pdate ? null : el.dataset.pdate; pricingView(); });
   $('#psettings').ontoggle = e => { pr.open.settings = e.target.open; };
   $('#pevents').ontoggle = e => { pr.open.events = e.target.open; };
+  // AI review: the answer is kept in pr.ai so clicking around the calendar doesn't lose it.
+  const aiAsk = async (body, label) => {
+    if (pr.ai.busy) return;
+    pr.ai = { busy: true, html: `<p class="sub">${esc(label)}: thinking…</p>` };
+    view.querySelectorAll('#paireview, #painight, #paiform button').forEach(b => b.disabled = true);
+    $('#paiout').innerHTML = pr.ai.html;
+    const room = pr.room;
+    let html;
+    try {
+      const r = await api('/ai/pricing', { method: 'POST', body: { roomId: room, ...body } });
+      html = `<p class="sub"><b>${esc(label)}</b>${aiCost(r)}</p>${md(r.text)}`;
+    } catch (err) { html = err.message === 'login' ? '' : `<span class="bad">${esc(err.message)}</span>`; }
+    pr.ai = { busy: false, html: pr.room === room ? html : '' };
+    if (location.hash === '#/pricing') pricingView();
+  };
+  if ($('#paireview')) $('#paireview').onclick = () => aiAsk({}, 'Review of the next 90 days');
+  if ($('#painight')) $('#painight').onclick = () => aiAsk({ date: sel.date }, `About ${fmtDate(sel.date)}`);
+  if ($('#paiform')) $('#paiform').onsubmit = e => { e.preventDefault(); const qn = e.target.q.value.trim(); if (qn) aiAsk({ question: qn, ...(sel && { date: sel.date }) }, qn); };
   view.querySelectorAll('[data-apply]').forEach(b => b.onclick = async () => {
     const days = +b.dataset.apply, p = P.pending[days === 30 ? 'd30' : days === 90 ? 'd90' : 'd365'];
     if (!confirm(`Send ${p.nights} night${p.nights === 1 ? '' : 's'} of recommended prices to Beds24?`)) return;
@@ -969,6 +1037,35 @@ async function listingView() {
         text: Object.fromEntries(F.roomText.map(f => [f.key, val(`rt${i}.${f.key}`)])) })) };
   };
   ls.collect = collect;
+  // AI writing help on each text field: suggest, then "Use this" puts it in the field (still previewed before saving).
+  form.querySelectorAll('[data-ai]').forEach(el => {
+    const wrap = document.createElement('div');
+    wrap.className = 'aiw';
+    wrap.innerHTML = L.ai ? `<button type="button" class="linkbtn">✨ ${el.value.trim() ? 'Improve' : 'Write'} with AI</button>
+      <div class="aipanel" hidden><div class="toolbar" style="margin:4px 0"><input placeholder="Optional: what should it say or change? e.g. shorter, mention the fenced yard" style="flex:1;min-width:0" maxlength="1000">
+        <button type="button" class="aigo">Suggest</button></div><div class="aiout"></div></div>` : '';
+    if (!L.ai) return;
+    el.closest('label').after(wrap);
+    const panel = wrap.querySelector('.aipanel'), out = wrap.querySelector('.aiout'), go = wrap.querySelector('.aigo');
+    wrap.querySelector('.linkbtn').onclick = () => { panel.hidden = !panel.hidden; if (!panel.hidden) wrap.querySelector('input').focus(); };
+    wrap.querySelector('input').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); go.click(); } };
+    go.onclick = async () => {
+      const [, kind, idx] = el.name.match(/^(pt|rt)(\d*)\./);
+      go.disabled = true; go.textContent = 'Writing…'; out.innerHTML = '';
+      try {
+        const r = await api('/ai/listing', { method: 'POST', body: { propertyId: x.id, section: kind === 'pt' ? 'propertyText' : 'roomText', field: el.dataset.ai,
+          roomId: kind === 'rt' ? x.rooms[+idx].id : null, listing: collect(), instruction: wrap.querySelector('input').value } });
+        out.innerHTML = `<div class="aisugg">${esc(r.text)}</div><div class="toolbar" style="margin:6px 0 0"><button type="button" class="primary aiuse">Use this</button>
+          <span class="sub ${r.length > r.limit ? 'warn' : ''}">${r.length}/${r.limit} characters${aiCost(r)}</span></div>`;
+        out.querySelector('.aiuse').onclick = () => {
+          el.value = r.text; el.dispatchEvent(new Event('input', { bubbles: true }));
+          out.innerHTML = '<span class="sub ok">Added. Press Preview changes, then Save, to send it to Beds24.</span>';
+        };
+      } catch (err) { if (err.message !== 'login') out.innerHTML = `<span class="bad">${esc(err.message)}</span>`; }
+      go.disabled = false; go.textContent = out.querySelector('.aisugg') ? 'Try again' : 'Suggest';
+    };
+  });
+  if (!L.ai) form.querySelector('.lfield')?.insertAdjacentHTML('beforebegin', aiSetup('✨ The AI assistant can write and improve this text.'));
   const short = v => { const t = v == null || v === '' ? '(empty)' : String(v); return esc(t.length > 140 ? t.slice(0, 140) + '…' : t); };
   $('#lpreview').onclick = async () => {
     try {
@@ -988,13 +1085,145 @@ async function listingView() {
   };
 }
 
+// ---------- AI helpers ----------
+// Minimal, safe markdown for AI answers: everything is escaped first, then **bold**, *italic*, `code`,
+// headings, bullet/numbered lists and pipe tables are allowed.
+function md(src) {
+  const inline = s => esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, '$1<i>$2</i>').replace(/`([^`]+)`/g, '<code>$1</code>');
+  const isRow = l => /^\s*\|.*\|\s*$/.test(l), isSep = l => /^\s*\|[\s:|-]+\|\s*$/.test(l), isItem = l => /^\s*([-*•]|\d+[.)])\s+/.test(l);
+  const lines = String(src || '').replace(/\r/g, '').split('\n');
+  let out = '', i = 0;
+  while (i < lines.length) {
+    const l = lines[i];
+    if (!l.trim()) { i++; continue; }
+    if (isRow(l)) {
+      const rows = []; while (i < lines.length && isRow(lines[i])) rows.push(lines[i++]);
+      const head = rows.length > 1 && isSep(rows[1]);
+      const cells = r => r.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+      out += `<div class="mdt"><table class="pv">${rows.filter(r => !isSep(r)).map((r, n) => `<tr>${cells(r).map(c => head && n === 0 ? `<th>${inline(c)}</th>` : `<td>${inline(c)}</td>`).join('')}</tr>`).join('')}</table></div>`;
+      continue;
+    }
+    if (isItem(l)) {
+      const ordered = /^\s*\d/.test(l), items = [];
+      while (i < lines.length && isItem(lines[i])) items.push(lines[i++].replace(/^\s*([-*•]|\d+[.)])\s+/, ''));
+      out += `<${ordered ? 'ol' : 'ul'}>${items.map(x => `<li>${inline(x)}</li>`).join('')}</${ordered ? 'ol' : 'ul'}>`;
+      continue;
+    }
+    const h = l.match(/^#{1,4}\s+(.*)/);
+    if (h) { out += `<p><b>${inline(h[1])}</b></p>`; i++; continue; }
+    const para = [lines[i++]];
+    while (i < lines.length && lines[i].trim() && !isRow(lines[i]) && !isItem(lines[i]) && !/^#{1,4}\s/.test(lines[i])) para.push(lines[i++]);
+    out += `<p>${para.map(inline).join('<br>')}</p>`;
+  }
+  return out;
+}
+const aiCost = r => r.cost != null ? ` · about $${r.cost < 0.01 ? '0.01' : r.cost.toFixed(2)}` : '';
+const aiSetup = what => `<div class="sub">${what} <a href="#/settings">Add an Anthropic API key in Settings</a> to turn it on.</div>`;
+
+// ---------- Analytics ----------
+const an = { range: '12m', metric: 'revenue', history: [], busy: false };
+const delta = (cur, ly, points = false) => {
+  if (ly == null) return '';
+  if (points) { const d = Math.round((cur - ly) * 100); return d ? `<span class="${d > 0 ? 'ok' : 'bad'}">${d > 0 ? '▲' : '▼'}${Math.abs(d)} pts</span>` : '<span class="sub">=</span>'; }
+  if (!ly) return cur ? '<span class="ok">new</span>' : '';
+  const d = Math.round((cur - ly) / ly * 100);
+  return d ? `<span class="${d > 0 ? 'ok' : 'bad'}">${d > 0 ? '▲' : '▼'}${Math.abs(d)}%</span>` : '<span class="sub">=</span>';
+};
+const ASK_EXAMPLES = ['How did last month compare with the same month last year?', 'Which channel earns the most per night?', 'How far ahead do guests book in summer?', 'Am I ahead or behind last year for the next three months?'];
+
+async function analyticsView() {
+  const A = await api('/analytics?' + q({ range: an.range }));
+  const H = A.headline, M = A.monthly;
+  const val = (m, k) => m ? (k === 'occupancy' ? m.occupancy : k === 'adr' ? m.adr : m.revenue) : 0;
+  const fmt = (v, k) => k === 'occupancy' ? pct(v) : money(v);
+  const max = Math.max(...M.flatMap(m => [val(m, an.metric), val(m.lastYear, an.metric)]), 1e-9);
+  const head = (h, extra = '') => `<div class="card"><h3>${esc(h.label)}</h3><div class="big">${money(h.current.revenue)} ${delta(h.current.revenue, h.lastYear?.revenue)}</div>
+    <div class="sub">${h.lastYear ? `Last year ${money(h.lastYear.revenue)}` : 'No bookings from last year to compare'}${extra}</div>
+    <div class="kv"><span>Occupancy <b>${pct(h.current.occupancy)}</b> ${delta(h.current.occupancy, h.lastYear?.occupancy, true)}</span>
+      <span>ADR <b>${money(h.current.adr)}</b> ${delta(h.current.adr, h.lastYear?.adr)}</span></div></div>`;
+  const hbars = (rows, valueOf, label) => { const top = Math.max(...rows.map(valueOf), 1); return `<div class="hbars">${rows.map(r =>
+    `<div class="hrow"><span>${esc(r.label)}</span><span class="track"><i style="width:${valueOf(r) / top * 100}%"></i></span><span class="sub">${label(r)}</span></div>`).join('')}</div>`; };
+  const W = A.window, C = A.cancellations;
+  const paceCell = p => p ? `${pct(p.occupancy)} <span class="sub">${money(p.revenue)}</span>` : '<span class="sub">no history</span>';
+  const sources = A.sources.map(s => `${s.source === 'guesty' ? 'Guesty import' : s.source === 'beds24' ? 'Beds24' : esc(s.source)}: ${s.n} bookings since ${fmtDate(s.first)}`).join(' · ');
+
+  view.innerHTML = `
+    <div class="card ask" id="ask"><h3>✨ Ask about your numbers</h3>${status.ai ? `
+      <div id="anlog">${an.history.length ? '' : `<div class="chips">${ASK_EXAMPLES.map(x => `<button type="button" class="chip-btn" data-ex="${esc(x)}">${esc(x)}</button>`).join('')}</div>`}</div>
+      <form id="anform" class="toolbar" style="margin:8px 0 0"><input name="q" placeholder="Ask anything about your bookings, revenue or pace" style="flex:1;min-width:0" autocomplete="off" ${an.busy ? 'disabled' : ''}>
+        <button class="primary" ${an.busy ? 'disabled' : ''}>Ask</button>${an.history.length ? '<button type="button" id="anclear">Clear</button>' : ''}</form>`
+      : aiSetup('Ask questions in plain English (e.g. "How did October compare with last year?") and get answers from your own booking data.')}</div>
+    <div class="grid">${head(H.ytd)}${head(H.trailing12)}${head(H.next90, ' (same dates)')}</div>
+    <div class="card"><div class="toolbar"><h3 style="margin:0">By month</h3>
+      <select id="anmetric">${[['revenue', 'Revenue'], ['occupancy', 'Occupancy'], ['adr', 'ADR']].map(([v, l]) => `<option value="${v}" ${an.metric === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      <span class="legend" style="margin:0"><span><span class="sw cy"></span>This year</span><span><span class="sw ly"></span>Same month last year</span><span class="sub">faded = on the books so far</span></span></div>
+      <div class="gbars">${M.map(m => `<div class="gbar ${m.future ? 'future' : ''} ${m.current ? 'cur' : ''}" title="${esc(`${MONTHS[+m.month.slice(5) - 1]} ${m.month.slice(0, 4)}: ${fmt(val(m, an.metric), an.metric)}${m.lastYear ? ` (last year ${fmt(val(m.lastYear, an.metric), an.metric)})` : ''}`)}">
+        <div class="pair"><i class="ly" style="height:${val(m.lastYear, an.metric) / max * 100}%"></i><i class="cy" style="height:${val(m, an.metric) / max * 100}%"></i></div>
+        <span>${MONTHS[+m.month.slice(5) - 1][0]}${m.month.endsWith('-01') ? `<br>’${m.month.slice(2, 4)}` : ''}</span></div>`).join('')}</div>
+      <details style="margin-top:10px"><summary class="sub">Month-by-month table</summary><div class="tscroll"><table class="pv">
+        <tr><th>Month</th><th>Nights</th><th>Occupancy</th><th>ADR</th><th>Revenue</th><th>Last year</th><th>Change</th></tr>
+        ${[...M].reverse().map(m => `<tr><td>${MONTHS[+m.month.slice(5) - 1]} ${m.month.slice(0, 4)}${m.future ? ' <span class="sub">(so far)</span>' : ''}</td><td>${m.nights}</td><td>${pct(m.occupancy)}</td><td>${money(m.adr)}</td>
+          <td>${money(m.revenue)}</td><td>${m.lastYear ? money(m.lastYear.revenue) : '<span class="sub">—</span>'}</td><td>${m.lastYear ? delta(m.revenue, m.lastYear.revenue) : ''}</td></tr>`).join('')}</table></div></details></div>
+    <div class="cols" style="margin-top:14px">
+      <div class="card"><h3>Pace: on the books vs last year</h3><div class="tscroll"><table class="pv"><tr><th>Month</th><th>Now</th><th>Last year, same day</th><th>Last year, final</th></tr>
+        ${A.pace.map(p => `<tr><td>${MONTHS[+p.month.slice(5) - 1]}${p.fromToday ? ' <span class="sub">(rest)</span>' : ''}</td><td>${paceCell(p.now)}</td><td>${paceCell(p.lastYearAtThisPoint)}</td><td>${paceCell(p.lastYearFinal)}</td></tr>`).join('')}</table></div>
+        <div class="sub">"Same day" counts what had been booked by this date last year, so it's a fair comparison for months still filling up.</div></div>
+      <div class="card"><div class="toolbar" style="margin-bottom:6px"><h3 style="margin:0">Stays arriving</h3>
+        <select id="anrange">${Object.entries(A.ranges).map(([v, l]) => `<option value="${v}" ${A.range === v ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
+        <span class="sub">${fmtDate(A.from)} – ${fmtDate(addDaysISO(A.to, -1))}</span></div>
+        <div class="kv"><span>Stays <b>${W.bookings}</b></span><span>Avg stay <b>${W.stay.average ?? '—'}</b> nights</span><span>Booked <b>${W.lead.median ?? '—'}</b> days ahead (median)</span><span>Party <b>${W.guests.average ?? '—'}</b> guests</span></div>
+        <div class="sub" style="margin-top:6px">The sections below use stays arriving in this range.</div></div>
+    </div>
+    <div class="card" style="margin-top:14px"><h3>Channels</h3><div class="tscroll"><table class="pv"><tr><th>Channel</th><th>Stays</th><th>Nights</th><th>Revenue</th><th>Share</th><th>ADR</th><th>Booked ahead</th><th>Avg stay</th></tr>
+      ${A.channels.map(c => `<tr><td>${tag(c.channel)}</td><td>${c.bookings}</td><td>${c.nights} <span class="sub">${pct(c.nightShare)}</span></td><td>${money(c.revenue)}</td><td>${pct(c.revenueShare)}</td><td>${money(c.adr)}</td>
+        <td>${c.avgLead != null ? c.avgLead + ' days' : '—'}</td><td>${c.avgStay ?? '—'} nights</td></tr>`).join('') || '<tr><td colspan="8" class="empty">No stays in this range</td></tr>'}</table></div></div>
+    <div class="cols" style="margin-top:14px">
+      <div class="card"><h3>How far ahead guests book</h3>${W.withBookingDate ? hbars(W.lead.buckets, r => r.bookings, r => `${r.bookings}${r.nights ? ' · ' + money(r.adr) + '/night' : ''}`) : '<div class="empty">No booking dates in this range</div>'}
+        ${W.withBookingDate < W.bookings ? `<div class="sub">${W.bookings - W.withBookingDate} stays have no booking date.</div>` : ''}</div>
+      <div class="card"><h3>Length of stay</h3>${W.bookings ? hbars(W.stay.buckets, r => r.bookings, r => `${r.bookings}${r.bookings ? ' · ' + money(r.adr) + '/night' : ''}`) : '<div class="empty">No stays in this range</div>'}</div>
+      <div class="card"><h3>Night of the week</h3><div class="bars wk">${A.weekdays.map(d => `<div class="bar" title="${d.day}: ${pct(d.occupancy)} booked, ADR ${money(d.adr)}"><i style="height:${d.occupancy * 100}%"></i>${d.day}<span class="sub">${pct(d.occupancy)}</span></div>`).join('')}</div>
+        <div class="sub">Occupancy of each night of the week (Friday = Friday night). Hover for ADR.</div></div>
+      <div class="card"><h3>Cancellations</h3><div class="big">${pct(C.rate)} <span class="sub">${C.cancelled} of ${C.bookings} bookings</span></div>
+        <div class="sub">${money(C.lostRevenue)} in cancelled bookings${C.medianNoticeDays != null ? ` · typically ${C.medianNoticeDays} days before arrival` : ''}</div>
+        ${C.byChannel.length ? `<ul class="list" style="margin-top:6px">${C.byChannel.map(c => `<li><span>${tag(c.channel)}</span><span>${pct(c.rate)} <span class="sub">${c.cancelled}/${c.bookings}</span></span></li>`).join('')}</ul>` : ''}</div>
+    </div>
+    <div class="sub" style="margin-top:10px">Revenue is each booking's total spread over its nights, as on the Dashboard. Data: ${sources || 'none yet'}.</div>`;
+
+  $('#anmetric').onchange = e => { an.metric = e.target.value; analyticsView(); };
+  $('#anrange').onchange = e => { an.range = e.target.value; analyticsView(); };
+  if (!status.ai) return;
+  const log = $('#anlog');
+  const renderLog = (pending) => {
+    if (!an.history.length && !pending) return;
+    log.innerHTML = an.history.map(h => h.role === 'user' ? `<div class="q">${esc(h.content)}</div>` : `<div class="a">${md(h.content)}${h.meta ? `<div class="sub">${esc(h.meta)}</div>` : ''}</div>`).join('')
+      + (pending ? `<div class="q">${esc(pending)}</div><div class="a sub">Looking at your data…</div>` : '');
+  };
+  renderLog();
+  const ask = async question => {
+    if (!question.trim() || an.busy) return;
+    an.busy = true; renderLog(question);
+    const form = $('#anform'); form.q.value = ''; form.q.disabled = true; form.querySelector('.primary').disabled = true;
+    try {
+      const r = await api('/ai/ask?' + q(), { method: 'POST', body: { question, history: an.history.map(({ role, content }) => ({ role, content })) } });
+      an.history.push({ role: 'user', content: question }, { role: 'assistant', content: r.text, meta: aiCost(r).replace(/^ · /, '') });
+    } catch (err) {
+      if (err.message === 'login') return;
+      an.history.push({ role: 'user', content: question }, { role: 'assistant', content: `**Couldn't answer:** ${err.message}` });
+    } finally { an.busy = false; }
+    if (location.hash === '#/analytics') { await analyticsView(); $('#anform')?.q.focus(); }
+  };
+  $('#anform').onsubmit = e => { e.preventDefault(); ask(e.target.q.value); };
+  log.querySelectorAll('[data-ex]').forEach(b => b.onclick = () => ask(b.dataset.ex));
+  if ($('#anclear')) $('#anclear').onclick = () => { an.history = []; analyticsView(); };
+}
+
 async function act(fn) {
   const btn = $('#sync'); btn.disabled = true; banner('Working…');
   try { await fn(); banner(''); await boot(true); } catch (e) { if (e.message !== 'login') banner(e.message, true); }
   btn.disabled = false;
 }
 
-const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, automations: automationsView, bookings: bookingsView, listing: listingView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
+const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, automations: automationsView, bookings: bookingsView, analytics: analyticsView, listing: listingView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
 async function render() {
   const r = location.hash.replace(/^#\/?/, '');
   clearInterval(pageTimer); pageTimer = null;

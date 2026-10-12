@@ -13,6 +13,8 @@ import { syncCalendar, readDays, planChanges, applyChanges, recentChanges } from
 import { SeamClient } from './seam.js';
 import { feedToken, icsForRoom, turnovers } from './cleaning.js';
 import { FIELDS as LISTING_FIELDS, fetchListing, diffListing, saveListing, listingLog } from './listing.js';
+import { analytics } from './analytics.js';
+import { aiStatus, saveKey, saveAiSettings, cacheListing, draftReply, writeListing, reviewPricing, askData } from './ai.js';
 import {
   seedAutomations, listAutomations, saveAutomation, setEnabled, deleteAutomation, describe, runAutomations, upcoming,
   skipSend, history, previewFor,
@@ -168,7 +170,7 @@ async function api(req, res, url) {
         lastSync: getSetting(db, 'last_sync'), lastSyncError: getSetting(db, 'last_sync_error'),
         empty: db.prepare('SELECT COUNT(*) n FROM bookings').get().n === 0,
         guestyImported: db.prepare("SELECT COUNT(*) n FROM bookings WHERE source = 'guesty'").get().n,
-        unreadMessages: unreadCount(db),
+        unreadMessages: unreadCount(db), ai: aiStatus(db).configured,
       });
     case 'POST /api/connect': {
       const { inviteCode } = await readJson(req);
@@ -284,7 +286,9 @@ async function api(req, res, url) {
       const pid = props.some(p => p.id === Number(q.property)) ? Number(q.property) : props[0]?.id;
       const base = { properties: props, fields: LISTING_FIELDS, connected: beds24.connected, canWrite: beds24.canWriteProperties };
       if (!pid || !beds24.connected) return send(res, 200, base);
-      return send(res, 200, { ...base, listing: await fetchListing(beds24, pid, q.lang || 'en'), log: listingLog(db, pid) });
+      const listing = await fetchListing(beds24, pid, q.lang || 'en');
+      cacheListing(db, listing);  // what the AI assistant knows about the property when drafting replies
+      return send(res, 200, { ...base, listing, log: listingLog(db, pid), ai: aiStatus(db).configured });
     }
     case 'POST /api/listing/preview': {
       const { propertyId, edited } = await readJson(req);
@@ -296,6 +300,27 @@ async function api(req, res, url) {
       if (beds24.canWriteProperties === false) return send(res, 403, { error: 'Your Beds24 invite code can\'t change listing content. Create one with write access to Properties and paste it in Settings.' });
       const { propertyId, edited } = await readJson(req, 2e6);
       return send(res, 200, await saveListing(db, beds24, Number(propertyId), edited || {}));
+    }
+    case 'GET /api/analytics':
+      return send(res, 200, analytics(db, localToday(doorSettings(db).tz), { propertyId: prop, range: q.range }));
+    case 'GET /api/ai': return send(res, 200, aiStatus(db));
+    case 'POST /api/ai/key': { const { apiKey } = await readJson(req); return send(res, 200, await saveKey(db, apiKey)); }
+    case 'POST /api/ai/settings': return send(res, 200, saveAiSettings(db, await readJson(req)));
+    case 'POST /api/ai/draft': {
+      const { bookingId, instructions } = await readJson(req);
+      return send(res, 200, await draftReply(db, Number(bookingId), { instructions: String(instructions || '') }));
+    }
+    case 'POST /api/ai/listing': {
+      const b = await readJson(req, 2e6);
+      return send(res, 200, await writeListing(db, { ...b, instruction: String(b.instruction || '') }));
+    }
+    case 'POST /api/ai/pricing': {
+      const { roomId, date, question } = await readJson(req);
+      return send(res, 200, await reviewPricing(db, Number(roomId), { date: /^\d{4}-\d{2}-\d{2}$/.test(date || '') ? date : null, question: String(question || '') }));
+    }
+    case 'POST /api/ai/ask': {
+      const { question, history } = await readJson(req);
+      return send(res, 200, await askData(db, question, { history, propertyId: prop }));
     }
     case 'GET /api/inbox':
       return send(res, 200, { conversations: conversations(db, { filter: q.filter, q: q.q || '' }), unread: unreadCount(db),

@@ -5,6 +5,7 @@ import { createServer } from 'node:http';
 import { mkdtempSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fakeAnthropic } from './fake-anthropic.js';
 
 const SERVER = new URL('../server/index.js', import.meta.url).pathname;
 // PORT=0 lets the OS pick a free port; the server logs the one it got.
@@ -536,3 +537,47 @@ for (const [label, scopes, canSave] of [['write access', ['all:properties', 'all
     }
   });
 }
+
+test('Analytics and AI assistant over HTTP: key stays on the server, answers come back', async t => {
+  const ai = await fakeAnthropic();
+  t.after(() => ai.close());
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), ANTHROPIC_BASE_URL: ai.url });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (path, method = 'GET', body) => fetch(s.url(path), { method, headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+  assert.equal((await call('/api/demo', 'POST')).status, 200);
+
+  const a = await call('/api/analytics?range=ytd');
+  assert.equal(a.status, 200);
+  assert.equal(a.json.range, 'ytd');
+  assert.ok(a.json.monthly.length > 6 && a.json.channels.length > 0);
+
+  assert.equal((await call('/api/status')).json.ai, false);
+  const notSet = await call('/api/ai/ask', 'POST', { question: 'How was September?' });
+  assert.equal(notSet.status, 400);
+  assert.match(notSet.json.error, /Add your Anthropic API key/);
+
+  const bad = await call('/api/ai/key', 'POST', { apiKey: 'sk-ant-bad-0000000000000000000000' });
+  assert.equal(bad.status, 400, 'a rejected key is a 400, not a 401 that would look like a logged-out session');
+  const key = 'sk-ant-api03-http-test-key-0000000000';
+  const saved = await call('/api/ai/key', 'POST', { apiKey: key });
+  assert.equal(saved.status, 200);
+  assert.equal(saved.json.keyHint, '…0000');
+  for (const path of ['/api/ai', '/api/status', '/api/settings']) {
+    const r = await fetch(s.url(path), { headers: { cookie: sid } }).then(r => r.text());
+    assert.ok(!r.includes(key), `${path} never contains the key`);
+  }
+  assert.equal((await call('/api/status')).json.ai, true);
+
+  const ask = await call('/api/ai/ask', 'POST', { question: 'How was January?', history: [] });
+  assert.equal(ask.status, 200, JSON.stringify(ask.json));
+  assert.match(ask.json.text, /From the data/);
+  const booking = (await call('/api/bookings?status=confirmed')).json[0];
+  const draft = await call('/api/ai/draft', 'POST', { bookingId: booking.id, instructions: 'keep it short' });
+  assert.equal(draft.status, 200, JSON.stringify(draft.json));
+  assert.ok(ai.requests.every(r => r.headers['x-api-key'] === key || r.headers['x-api-key']?.includes('bad')));
+  const usage = (await call('/api/ai')).json;
+  assert.equal(usage.month.requests, 2);
+});

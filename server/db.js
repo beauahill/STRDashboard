@@ -80,6 +80,11 @@ CREATE TABLE IF NOT EXISTS booking_snapshots (booking_id INTEGER PRIMARY KEY, ar
 CREATE TABLE IF NOT EXISTS listing_changes (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, property_id INTEGER NOT NULL, summary TEXT NOT NULL, ok INTEGER NOT NULL, error TEXT
 );
+-- Each AI assistant request, with its token use and estimated cost (US$).
+CREATE TABLE IF NOT EXISTS ai_usage (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, task TEXT NOT NULL, calls INTEGER, input_tokens INTEGER,
+  output_tokens INTEGER, cache_write_tokens INTEGER, cache_read_tokens INTEGER, cost REAL, error TEXT
+);
 -- Every change sent to Beds24 from this app, successful or not.
 CREATE TABLE IF NOT EXISTS change_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, room_id INTEGER NOT NULL,
