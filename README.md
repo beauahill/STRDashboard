@@ -33,6 +33,12 @@ Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB
   as bookings go). Stays are bars from check-in to checkout, coloured by channel; click one for guest count,
   total, nightly rate and door code. Shows nightly prices and blocked nights for a single room, and the
   month's booked nights, occupancy and revenue.
+- **Inbox**: guest messages from Airbnb, Booking.com and VRBO through Beds24, including pre-booking
+  inquiries. One conversation per booking (unread first; filters for unread, current/upcoming stays and
+  inquiries), chat-style thread with the stay details and door code, replies sent to the guest's channel
+  thread, attachments, and saved replies with fill-ins (`{guest_first_name}`, `{door_code}`,
+  `{check_in_time}`, …). Unread count in the menu and on the Dashboard. Checks for new messages every
+  minute while the inbox is open (at most twice a minute against Beds24), otherwise with each 15-minute sync.
 - **Bookings**: searchable/filterable list.
 - Per-property filter on every view.
 - **Rates**: two-month calendar of nightly price, minimum stay, blocked and booked nights. Select a range
@@ -55,13 +61,14 @@ Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB
 
 `server/beds24.js` API client + token handling · `server/sync.js` mapping and sync ·
 `server/rates.js` prices, minimum stays and blocks · `server/doors.js` + `server/seam.js` door codes ·
+`server/messages.js` inbox and saved replies ·
 `server/guesty.js` Guesty import ·
 `server/stats.js` metrics · `server/demo.js` sample data · `public/` UI · `test/` (`npm test`).
 
 ## Known gaps / next steps
 
 - No creating or editing bookings from the app yet (Beds24 `POST /bookings`).
-- Guest messaging, cleaning/turnover task assignment, owner statements, expenses/P&L.
+- Cleaning/turnover task view (Turno), owner statements, expenses/P&L, Laramie pricing tool.
 - Beds24 request/response fields are checked against Beds24's published OpenAPI spec, but the app hasn't yet run
   against a Beds24 account with live channel connections.
 - Beds24 API credits are rate limited; the incremental sync keeps usage low.

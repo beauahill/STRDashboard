@@ -93,6 +93,13 @@ Do one channel at a time, and check each before moving on.
 - [ ] Point your direct booking link (or domain) at the Beds24 booking page.
 - [ ] Add any existing direct bookings to Beds24 by hand.
 
+**Messages**
+- [ ] Open the dashboard's **Inbox** and check a recent Airbnb conversation shows up. If Airbnb messages
+      are missing, reconnect Airbnb in Beds24 and make sure the permission list includes messaging.
+- [ ] Send yourself a test reply on a booking (or reply to a real guest question) and confirm it appears in
+      the guest's Airbnb/VRBO/Booking.com thread.
+- [ ] Edit the saved replies (Inbox → a conversation → "Edit saved replies") to match your voice.
+
 **Wrap-up**
 - [ ] In the dashboard, press **Sync** and check every upcoming booking appears with the right channel,
       guest and total.

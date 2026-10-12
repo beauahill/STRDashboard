@@ -55,6 +55,7 @@ async function dashboard() {
       ${kpi('Next 30 days', pct(s.next30.occupancy), `${money(s.next30.revenue)} on the books`)}
       ${kpi('Last 30 days', pct(s.last30.occupancy), money(s.last30.revenue))}
       ${s.pending ? kpi('Pending requests', s.pending, 'Need a response') : ''}
+      ${status.unreadMessages ? `<a class="card kpi-link" href="#/inbox"><h3>Unread messages</h3><div class="big">${status.unreadMessages}</div><div class="sub">Open the inbox →</div></a>` : ''}
     </div>
     <div class="cols">
       ${listCard('Arriving today', s.arrivals)}${listCard('Departing today', s.departures)}
@@ -168,7 +169,7 @@ async function calendarView() {
 
 async function bookingsView() {
   view.innerHTML = `<div class="toolbar"><input id="bq" placeholder="Search guest, email, ref…" size="28">
-    <select id="bs"><option value="">Any status</option><option>confirmed</option><option>new</option><option>request</option><option>cancelled</option><option>block</option></select>
+    <select id="bs"><option value="">Any status</option><option>confirmed</option><option>new</option><option>request</option><option>inquiry</option><option>cancelled</option><option>block</option></select>
     <select id="bc"><option value="">Any channel</option><option>Airbnb</option><option>Booking.com</option><option>VRBO</option><option>Direct</option></select></div>
     <div class="card" style="overflow-x:auto"><table><thead><tr><th>Guest</th><th>Property / room</th><th>Dates</th><th>Nights</th><th>Guests</th><th>Channel</th><th>Status</th><th>Total</th></tr></thead><tbody id="rows"></tbody></table></div>`;
   const load = async () => {
@@ -463,15 +464,168 @@ async function locksView() {
   };
 }
 
+// ---------- Inbox: guest messages through Beds24 ----------
+const inbox = { booking: null, filter: 'all', q: '', drafts: {}, replies: null, manage: false };
+let pageTimer = null;
+const setUnread = n => { const b = $('#unread'); b.hidden = !n; b.textContent = n; status.unreadMessages = n; };
+const timeAgo = t => {
+  const s = (Date.now() - Date.parse(t)) / 1000;
+  return s < 3600 ? `${Math.max(1, Math.round(s / 60))}m` : s < 86400 ? `${Math.round(s / 3600)}h` : s < 604800 ? `${Math.round(s / 86400)}d` : new Date(t).toLocaleDateString();
+};
+const fill = (body, vars) => body.replace(/\{(\w+)\}/g, (m, k) => (vars[k] !== undefined && vars[k] !== '' ? String(vars[k]) : m));
+
+async function inboxView() {
+  view.innerHTML = `<div class="inbox ${inbox.booking ? 'has-thread' : ''}">
+    <div class="card convs"><div class="toolbar" style="margin-bottom:6px">
+      <select id="ifilter">${[['all', 'All'], ['unread', 'Unread'], ['upcoming', 'Current & upcoming'], ['inquiries', 'Inquiries']].map(([v, l]) => `<option value="${v}" ${inbox.filter === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      <input id="iq" placeholder="Search" value="${esc(inbox.q)}" style="flex:1;min-width:0"></div>
+      <div id="ilist"></div></div>
+    <div class="card tpane" id="ithread">${inbox.booking ? '' : '<div class="empty" style="padding:40px;text-align:center">Choose a conversation</div>'}</div></div>`;
+  $('#ifilter').onchange = e => { inbox.filter = e.target.value; loadList(); };
+  let t; $('#iq').oninput = e => { clearTimeout(t); t = setTimeout(() => { inbox.q = e.target.value; loadList(); }, 250); };
+  await loadList();
+  if (inbox.booking) await openThread(inbox.booking);
+  // Check for new messages every minute while the inbox is open and visible.
+  pageTimer = setInterval(async () => {
+    if (document.hidden) return;
+    try {
+      const before = status.unreadMessages;
+      const r = await api('/inbox/refresh', { method: 'POST' });
+      setUnread(r.unread);
+      await loadList();
+      if (inbox.booking && r.unread !== before) await loadThreadMessages(inbox.booking);
+    } catch { /* next tick will retry */ }
+  }, 60000);
+}
+
+async function loadList() {
+  const r = await api('/inbox?' + new URLSearchParams({ filter: inbox.filter, q: inbox.q }));
+  setUnread(r.unread);
+  const list = $('#ilist');
+  if (!list) return;
+  list.innerHTML = (r.error ? `<div class="warn sub">Couldn't fetch new messages: ${esc(r.error)}</div>` : '') + (r.conversations.length ? r.conversations.map(c => `
+    <button class="conv ${c.booking_id === inbox.booking ? 'on' : ''} ${c.unread ? 'unread' : ''}" data-conv="${c.booking_id}">
+      <span class="top"><b>${esc(c.guest_name || `Booking ${c.booking_id}`)}</b> ${c.channel ? tag(c.channel) : ''}${c.status === 'inquiry' ? ' <span class="tag request">inquiry</span>' : ''}<span class="sub when">${timeAgo(c.last_time)}</span></span>
+      <span class="sub">${c.arrival ? `${fmtDate(c.arrival)} → ${fmtDate(c.departure)}` : ''}${c.unread ? ` · <b class="ucount">${c.unread} new</b>` : ''}</span>
+      <span class="snip">${c.last_source === 'host' ? 'You: ' : ''}${esc((c.last_body || '').slice(0, 90))}</span></button>`).join('')
+    : `<div class="empty" style="padding:20px">${r.connected ? 'No messages yet. New guest messages from Airbnb, Booking.com and VRBO appear here.' : 'Connect Beds24 in Settings to see guest messages.'}</div>`);
+  list.querySelectorAll('[data-conv]').forEach(el => el.onclick = () => openThread(+el.dataset.conv));
+}
+
+async function openThread(id) {
+  inbox.booking = id;
+  document.querySelector('.inbox')?.classList.add('has-thread');
+  document.querySelectorAll('.conv').forEach(el => el.classList.toggle('on', +el.dataset.conv === id));
+  const th = await api('/inbox/thread?booking=' + id);
+  inbox.replies ||= await api('/replies');
+  renderThread(th);
+  if (th.messages.some(m => m.source === 'guest' && !m.read)) {
+    api('/inbox/read', { method: 'POST', body: { bookingId: id } }).then(loadList).catch(() => {});
+  }
+}
+
+async function loadThreadMessages(id) {
+  const th = await api('/inbox/thread?booking=' + id);
+  if (inbox.booking === id && $('#imsgs')) { $('#imsgs').innerHTML = messagesHtml(th); scrollThread(); }
+}
+
+const scrollThread = () => { const m = $('#imsgs'); if (m) m.scrollTop = m.scrollHeight; };
+const messagesHtml = th => th.messages.map(m => {
+  const who = { guest: th.booking?.guest_name?.split(' ')[0] || 'Guest', host: 'You', system: 'Channel notice', internalNote: 'Internal note' }[m.source] || m.source;
+  const att = m.attachment_name ? `<a class="att" href="/api/inbox/attachment?id=${m.id}" target="_blank" rel="noopener">📎 ${esc(m.attachment_name)}</a>` : '';
+  return `<div class="msg ${m.source}"><div class="bubble">${esc(m.body).replace(/\n/g, '<br>')}${att}</div>
+    <div class="meta">${esc(who)} · ${new Date(m.time).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</div></div>`;
+}).join('') || '<div class="empty" style="text-align:center;padding:20px">No messages in this conversation yet.</div>';
+
+function renderThread(th) {
+  const b = th.booking, pane = $('#ithread');
+  if (!pane) return;
+  const channelNote = !b ? '' : b.channel === 'Booking.com' ? 'Booking.com doesn\'t allow links in messages.'
+    : b.channel === 'Direct' ? 'Direct bookings: Beds24 may not notify the guest of this message. Email or text them if it\'s urgent.'
+    : `Sent to the guest's ${esc(b.channel)} message thread.`;
+  pane.innerHTML = `
+    <div class="thead"><button class="back" id="iback">‹</button>
+      <div><b>${esc(b?.guest_name || `Booking ${inbox.booking}`)}</b> ${b ? tag(b.channel) + ' ' + tag(b.status) : ''}
+      <div class="sub">${b ? `${fmtDate(b.arrival)} → ${fmtDate(b.departure)} · ${b.nights} night${b.nights === 1 ? '' : 's'}${(b.adults || 0) + (b.children || 0) ? ` · ${(b.adults || 0) + (b.children || 0)} guests` : ''}${b.property_name ? ' · ' + esc(b.property_name) : ''}` : ''}
+        ${th.door ? ` · 🔑 <b class="code">${esc(th.door.code)}</b>` : ''}</div></div>
+      <button id="ireload" title="Check for new messages" style="margin-left:auto">↻</button></div>
+    <div class="msgs" id="imsgs">${messagesHtml(th)}</div>
+    ${th.canReply ? `<div class="composer">
+      <div class="toolbar" style="margin:0 0 6px"><select id="ireply"><option value="">Insert saved reply…</option>${inbox.replies.map(r => `<option value="${r.id}">${esc(r.title)}</option>`).join('')}</select>
+        <a href="#" id="imanage" class="sub">${inbox.manage ? 'Hide saved replies' : 'Edit saved replies'}</a></div>
+      <textarea id="itext" rows="4" maxlength="5000" placeholder="Write a reply…">${esc(inbox.drafts[inbox.booking] || '')}</textarea>
+      <div class="toolbar" style="margin:6px 0 0"><span class="sub" id="inote">${channelNote}</span>
+        <span class="sub" id="icount" style="margin-left:auto"></span><button class="primary" id="isend">Send</button></div>
+      <div id="imgr"></div></div>`
+    : `<div class="sub" style="padding:10px">${b ? 'Replies can only be sent on Beds24 bookings (this one was imported from Guesty).' : 'This booking isn\'t in the app yet; press Sync.'}</div>`}`;
+  scrollThread();
+  $('#iback').onclick = () => { inbox.booking = null; document.querySelector('.inbox')?.classList.remove('has-thread'); };
+  $('#ireload').onclick = async () => { const t2 = await api('/inbox/reload', { method: 'POST', body: { bookingId: inbox.booking } }); $('#imsgs').innerHTML = messagesHtml(t2); scrollThread(); };
+  if (!th.canReply) return;
+  const ta = $('#itext');
+  const count = () => { $('#icount').textContent = ta.value.length > 4000 ? `${ta.value.length}/5000` : ''; inbox.drafts[inbox.booking] = ta.value; };
+  ta.oninput = count; count();
+  // Unfilled {placeholders} are left visible so they get noticed before sending.
+  $('#ireply').onchange = e => {
+    const r = inbox.replies.find(x => x.id === +e.target.value);
+    if (r) { ta.value = (ta.value.trim() ? ta.value.trimEnd() + '\n\n' : '') + fill(r.body, th.vars); count(); ta.focus(); }
+    e.target.value = '';
+  };
+  ta.onkeydown = e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('#isend').click(); };
+  $('#isend').onclick = async () => {
+    const text = ta.value.trim();
+    if (!text) return;
+    if (/\{\w+\}/.test(text) && !confirm('The message still has a {placeholder} in it. Send anyway?')) return;
+    $('#isend').disabled = true; $('#isend').textContent = 'Sending…';
+    try {
+      const t2 = await api('/inbox/send', { method: 'POST', body: { bookingId: inbox.booking, message: text } });
+      inbox.drafts[inbox.booking] = '';
+      renderThread(t2); loadList();
+    } catch (err) {
+      if (err.message === 'login') return;
+      $('#inote').innerHTML = `<span class="bad">${esc(err.message)}</span>`;
+      $('#isend').disabled = false; $('#isend').textContent = 'Try again';
+    }
+  };
+  $('#imanage').onclick = e => { e.preventDefault(); inbox.manage = !inbox.manage; renderThread(th); };
+  if (inbox.manage) renderReplyManager(th);
+}
+
+function renderReplyManager(th) {
+  const box = $('#imgr');
+  box.innerHTML = `<div class="replies"><h3>Saved replies</h3>
+    <div class="sub">Fill-ins: ${Object.keys(th.vars).map(k => `<code>{${k}}</code>`).join(' ')}</div>
+    ${inbox.replies.map(r => `<div class="reply"><b>${esc(r.title)}</b> <a href="#" data-redit="${r.id}">edit</a> · <a href="#" data-rdel="${r.id}">delete</a>
+      <div class="sub">${esc(r.body.slice(0, 140))}${r.body.length > 140 ? '…' : ''}</div></div>`).join('')}
+    <form id="rform" class="stack" style="max-width:none"><input type="hidden" name="id"><input name="title" placeholder="Name, e.g. Wi-Fi details">
+      <textarea name="body" rows="3" placeholder="Hi {guest_first_name}, …"></textarea><button class="primary">Save reply</button></form></div>`;
+  const f = $('#rform');
+  const reload = async () => { inbox.replies = await api('/replies'); renderThread(th); };
+  f.onsubmit = async e => {
+    e.preventDefault();
+    try { await api('/replies', { method: 'POST', body: { id: f.id.value ? +f.id.value : null, title: f.title.value, body: f.body.value } }); await reload(); }
+    catch (err) { if (err.message !== 'login') banner(err.message, true); }
+  };
+  box.querySelectorAll('[data-redit]').forEach(a => a.onclick = e => {
+    e.preventDefault(); const r = inbox.replies.find(x => x.id === +a.dataset.redit);
+    f.id.value = r.id; f.title.value = r.title; f.body.value = r.body; f.title.focus();
+  });
+  box.querySelectorAll('[data-rdel]').forEach(a => a.onclick = async e => {
+    e.preventDefault(); const r = inbox.replies.find(x => x.id === +a.dataset.rdel);
+    if (confirm(`Delete the saved reply "${r.title}"?`)) { await api('/replies/delete', { method: 'POST', body: { id: r.id } }); await reload(); }
+  });
+}
+
 async function act(fn) {
   const btn = $('#sync'); btn.disabled = true; banner('Working…');
   try { await fn(); banner(''); await boot(true); } catch (e) { if (e.message !== 'login') banner(e.message, true); }
   btn.disabled = false;
 }
 
-const routes = { '': dashboard, calendar: calendarView, bookings: bookingsView, rates: ratesView, locks: locksView, settings: settingsView };
+const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, bookings: bookingsView, rates: ratesView, locks: locksView, settings: settingsView };
 async function render() {
   const r = location.hash.replace(/^#\/?/, '');
+  clearInterval(pageTimer); pageTimer = null;
   document.querySelectorAll('nav a').forEach(a => a.classList.toggle('on', a.dataset.r === r));
   try {
     if (status.empty && r !== 'settings') return location.hash = '#/settings';
@@ -482,6 +636,7 @@ async function render() {
 async function boot(keepProp) {
   try {
     status = await api('/status');
+    setUnread(status.unreadMessages || 0);
     const cur = prop();
     const props = await api('/properties');
     $('#prop').innerHTML = '<option value="">All properties</option>' + props.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');

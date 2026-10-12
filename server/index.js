@@ -12,6 +12,10 @@ import { readGuestyExport, importGuesty, dedupeImported, removeGuestyImport } fr
 import { syncCalendar, readDays, planChanges, applyChanges, recentChanges } from './rates.js';
 import { SeamClient } from './seam.js';
 import {
+  syncMessages, unreadCount, conversations, thread, sendMessage, refreshThread, markRead, attachment,
+  savedReplies, saveReply, deleteReply,
+} from './messages.js';
+import {
   doorSettings, saveDoorSettings, refreshLocks, assignLock, reconcileDoorCodes, doorCodesFor, setBookingCode,
   lockOverview, changeOtherCode, deleteOtherCode, addCode, localToday,
 } from './doors.js';
@@ -69,6 +73,8 @@ async function runSync() {
     try { await syncCalendar(db, beds24); setSetting(db, 'calendar_error', null); }
     catch (e) { setSetting(db, 'calendar_error', e.message); }
     await runDoorCodes();
+    try { await syncMessages(db, beds24); setSetting(db, 'messages_error', null); }
+    catch (e) { setSetting(db, 'messages_error', e.message); }
     return r;
   }
   catch (e) { setSetting(db, 'last_sync_error', e.message); throw e; }
@@ -139,6 +145,7 @@ async function api(req, res, url) {
         lastSync: getSetting(db, 'last_sync'), lastSyncError: getSetting(db, 'last_sync_error'),
         empty: db.prepare('SELECT COUNT(*) n FROM bookings').get().n === 0,
         guestyImported: db.prepare("SELECT COUNT(*) n FROM bookings WHERE source = 'guesty'").get().n,
+        unreadMessages: unreadCount(db),
       });
     case 'POST /api/connect': {
       const { inviteCode } = await readJson(req);
@@ -179,6 +186,42 @@ async function api(req, res, url) {
       });
     }
     case 'POST /api/rates/preview': return send(res, 200, planChanges(db, await readJson(req)));
+    case 'GET /api/inbox':
+      return send(res, 200, { conversations: conversations(db, { filter: q.filter, q: q.q || '' }), unread: unreadCount(db),
+        error: getSetting(db, 'messages_error'), connected: beds24.connected });
+    case 'GET /api/inbox/thread': return send(res, 200, thread(db, Number(q.booking)));
+    case 'POST /api/inbox/refresh': {
+      // Polled every minute while the inbox is open; never hit Beds24 more than twice a minute.
+      const last = Number(getSetting(db, 'messages_poll') || 0);
+      if (beds24.connected && Date.now() - last > 30000) {
+        setSetting(db, 'messages_poll', Date.now());
+        try { await syncMessages(db, beds24); setSetting(db, 'messages_error', null); }
+        catch (e) { setSetting(db, 'messages_error', e.message); }
+      }
+      return send(res, 200, { unread: unreadCount(db), error: getSetting(db, 'messages_error') });
+    }
+    case 'POST /api/inbox/send': {
+      if (!beds24.connected) return send(res, 400, { error: 'Connect Beds24 first.' });
+      const { bookingId, message } = await readJson(req);
+      return send(res, 200, await sendMessage(db, beds24, Number(bookingId), message));
+    }
+    case 'POST /api/inbox/read': {
+      const { bookingId } = await readJson(req);
+      return send(res, 200, beds24.connected ? await markRead(db, beds24, Number(bookingId)) : { changed: 0 });
+    }
+    case 'POST /api/inbox/reload': {
+      const { bookingId } = await readJson(req);
+      if (beds24.connected) await refreshThread(db, beds24, Number(bookingId));
+      return send(res, 200, thread(db, Number(bookingId)));
+    }
+    case 'GET /api/inbox/attachment': {
+      const a = await attachment(db, beds24, Number(q.id));
+      res.writeHead(200, { 'content-type': a.mime, 'content-disposition': `inline; filename="${a.name.replace(/[^\w.\- ]/g, '_')}"`, 'cache-control': 'private, max-age=3600' });
+      return res.end(a.data);
+    }
+    case 'GET /api/replies': return send(res, 200, savedReplies(db));
+    case 'POST /api/replies': return send(res, 200, { id: saveReply(db, await readJson(req)) });
+    case 'POST /api/replies/delete': { const { id } = await readJson(req); deleteReply(db, Number(id)); return send(res, 200, { ok: true }); }
     case 'GET /api/locks': {
       const key = getSetting(db, 'seam_api_key');
       const out = {
