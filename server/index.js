@@ -10,6 +10,11 @@ import { summary, calendar } from './stats.js';
 import { loadDemo, clearDemo } from './demo.js';
 import { readGuestyExport, importGuesty, dedupeImported, removeGuestyImport } from './guesty.js';
 import { syncCalendar, readDays, planChanges, applyChanges, recentChanges } from './rates.js';
+import { SeamClient } from './seam.js';
+import {
+  doorSettings, saveDoorSettings, refreshLocks, assignLock, reconcileDoorCodes, doorCodesFor, setBookingCode,
+  lockOverview, changeOtherCode, deleteOtherCode, addCode, localToday,
+} from './doors.js';
 
 const PORT = Number(process.env.PORT || 3000);
 const PASSWORD = process.env.APP_PASSWORD || '';
@@ -24,6 +29,7 @@ function fail(msg) { console.error(`\nSTARTUP ERROR: ${msg}\n`); process.exit(1)
 
 const db = openDb(process.env.DB_PATH || (VOLUME ? join(VOLUME, 'str.db') : 'data/str.db'));
 const beds24 = new Beds24Client(db);
+const seam = () => new SeamClient(getSetting(db, 'seam_api_key'));
 
 if (!getSetting(db, 'session_secret')) setSetting(db, 'session_secret', randomBytes(32).toString('hex'));
 const secret = getSetting(db, 'session_secret');
@@ -62,10 +68,28 @@ async function runSync() {
     // Prices are a separate permission in Beds24; a read-only or bookings-only code shouldn't fail the whole sync.
     try { await syncCalendar(db, beds24); setSetting(db, 'calendar_error', null); }
     catch (e) { setSetting(db, 'calendar_error', e.message); }
+    await runDoorCodes();
     return r;
   }
   catch (e) { setSetting(db, 'last_sync_error', e.message); throw e; }
   finally { syncing = false; }
+}
+
+// Door codes run after every sync and after lock changes. Failures are recorded, never thrown, so a
+// Seam outage can't stop bookings from syncing.
+async function runDoorCodes() {
+  try { const r = await reconcileDoorCodes(db, seam(), beds24); setSetting(db, 'door_error', null); return r; }
+  catch (e) { setSetting(db, 'door_error', e.message); return { error: e.message }; }
+}
+
+// Lock-code entries sent back from the Locks page must point at locks we know about.
+function checkEntries(entries) {
+  if (!Array.isArray(entries) || !entries.length) throw Object.assign(new Error('Nothing selected.'), { status: 400 });
+  const known = new Set(db.prepare('SELECT device_id FROM locks').all().map(l => l.device_id));
+  for (const e of entries) {
+    if (!known.has(e.deviceId) || typeof e.accessCodeId !== 'string') throw Object.assign(new Error('Unknown lock code.'), { status: 400 });
+  }
+  return entries.map(e => ({ deviceId: e.deviceId, accessCodeId: e.accessCodeId, managed: !!e.managed }));
 }
 
 const send = (res, code, body, type = 'application/json') => {
@@ -155,6 +179,67 @@ async function api(req, res, url) {
       });
     }
     case 'POST /api/rates/preview': return send(res, 200, planChanges(db, await readJson(req)));
+    case 'GET /api/locks': {
+      const key = getSetting(db, 'seam_api_key');
+      const out = {
+        configured: !!key, keyHint: key ? `…${key.slice(-4)}` : null, settings: doorSettings(db),
+        rooms: db.prepare('SELECT r.id, r.name, p.name property_name FROM rooms r JOIN properties p ON p.id = r.property_id WHERE r.id > 0 ORDER BY p.name, r.name').all(),
+        lastRun: getSetting(db, 'door_last_run'), error: getSetting(db, 'door_error'),
+        problems: JSON.parse(getSetting(db, 'door_last_problems') || '[]'),
+        locks: db.prepare('SELECT * FROM locks ORDER BY name').all(), otherCodes: [], guestCodes: [],
+      };
+      const upcoming = db.prepare(`SELECT b.id, b.guest_name, b.arrival, b.departure, b.channel, b.phone FROM bookings b
+        JOIN door_codes d ON d.booking_id = b.id ORDER BY b.arrival`).all();
+      const codes = doorCodesFor(db, upcoming.map(b => b.id));
+      out.guestCodes = upcoming.map(b => ({ ...b, phone: undefined, door: codes[b.id] }));
+      if (key) {
+        try { Object.assign(out, await lockOverview(db, seam())); }
+        catch (e) { out.seamError = e.message; }
+      }
+      return send(res, 200, out);
+    }
+    case 'POST /api/locks/key': {
+      const { apiKey } = await readJson(req);
+      if (apiKey && !/^seam_\S{10,}$/.test(apiKey.trim())) return send(res, 400, { error: 'That doesn\'t look like a Seam API key (they start with "seam_").' });
+      setSetting(db, 'seam_api_key', apiKey ? apiKey.trim() : null);
+      if (!apiKey) { db.exec('DELETE FROM locks'); return send(res, 200, { removed: true }); }
+      return send(res, 200, { locks: await refreshLocks(db, seam()) });
+    }
+    case 'POST /api/locks/connect': {
+      const wv = await seam().connectWebview();
+      return send(res, 200, { url: wv.url });
+    }
+    case 'POST /api/locks/refresh': {
+      const locks = await refreshLocks(db, seam());
+      return send(res, 200, { locks, doors: await runDoorCodes() });
+    }
+    case 'POST /api/locks/assign': {
+      const { deviceId, roomId } = await readJson(req);
+      assignLock(db, deviceId, roomId == null || roomId === '' ? null : Number(roomId));
+      return send(res, 200, { ok: true, doors: await runDoorCodes() });
+    }
+    case 'POST /api/locks/settings':
+      return send(res, 200, { settings: saveDoorSettings(db, await readJson(req)), doors: await runDoorCodes() });
+    case 'POST /api/locks/booking-code': {
+      const { bookingId, code } = await readJson(req);
+      setBookingCode(db, Number(bookingId), String(code || '').trim(), (await lockOverview(db, seam())).otherCodes);
+      return send(res, 200, { ok: true, doors: await runDoorCodes() });
+    }
+    case 'POST /api/locks/code/change': {
+      const { entries, code, name } = await readJson(req);
+      await changeOtherCode(seam(), checkEntries(entries), { code: String(code || '').trim(), name: name?.trim() });
+      return send(res, 200, { ok: true });
+    }
+    case 'POST /api/locks/code/delete': {
+      const { entries } = await readJson(req);
+      await deleteOtherCode(seam(), checkEntries(entries));
+      return send(res, 200, { ok: true });
+    }
+    case 'POST /api/locks/code/add': {
+      const b = await readJson(req);
+      await addCode(db, seam(), { ...b, code: String(b.code || '').trim() });
+      return send(res, 200, { ok: true });
+    }
     case 'POST /api/rates/apply': {
       if (!beds24.connected) return send(res, 400, { error: 'Connect Beds24 first.' });
       if (beds24.canWriteInventory === false) {
@@ -165,7 +250,21 @@ async function api(req, res, url) {
     case 'GET /api/properties':
       return send(res, 200, db.prepare('SELECT * FROM properties ORDER BY name').all().map(p => ({
         ...p, rooms: db.prepare('SELECT * FROM rooms WHERE property_id=? ORDER BY name').all(p.id) })));
-    case 'GET /api/summary': return send(res, 200, summary(db, iso(Date.now()), prop));
+    case 'GET /api/summary': {
+      const sum = summary(db, iso(Date.now()), prop);
+      const ds = doorSettings(db);
+      if (ds.auto) {
+        const soon = [...sum.arrivals, ...sum.inHouse, ...sum.upcoming];
+        sum.doors = doorCodesFor(db, soon.map(b => b.id));
+        // A guest arriving soon (within 3 days, and inside the code window) at a property with locks, without
+        // a working code on every lock, needs attention now.
+        const limit = iso(Date.parse(localToday(ds.tz)) + Math.min(3, ds.lookahead) * 86400000);
+        const lockRooms = new Set(db.prepare('SELECT DISTINCT room_id FROM locks WHERE room_id IS NOT NULL').all().map(r => r.room_id));
+        sum.doorAlerts = [...sum.arrivals, ...sum.upcoming].filter(b => b.source === 'beds24' && lockRooms.has(b.room_id) && b.arrival <= limit && !sum.doors[b.id]?.ok)
+          .map(b => ({ id: b.id, guest: b.guest_name, arrival: b.arrival, problem: sum.doors[b.id]?.perLock.find(l => !['set', 'scheduled'].includes(l.state))?.label || 'No door code yet' }));
+      }
+      return send(res, 200, sum);
+    }
     case 'GET /api/calendar':
       return send(res, 200, calendar(db, q.start || iso(Date.now()), Math.min(Number(q.days) || 30, 120), prop));
     case 'GET /api/bookings': {

@@ -30,15 +30,25 @@ function showLogin() {
   };
 }
 
-const personRow = b => `<li><span>${esc(b.guest_name || 'Guest')} ${tag(b.channel)}<br><span class="sub">${esc(b.property_name)} · ${esc(b.room_name)}</span></span><span class="sub">${fmtDate(b.arrival)} → ${fmtDate(b.departure)}</span></li>`;
+let doorInfo = {};
+const doorBadge = b => {
+  const d = doorInfo[b.id];
+  if (!d) return '';
+  const bad = d.perLock.filter(l => !['set', 'scheduled'].includes(l.state));
+  return ` <span class="code ${d.ok ? '' : 'bad'}" title="${esc(d.perLock.map(l => `${l.lock}: ${l.label}`).join('\n'))}">🔑 ${esc(d.code)}${d.ok ? '' : ' ⚠'}</span>`;
+};
+const personRow = b => `<li><span>${esc(b.guest_name || 'Guest')} ${tag(b.channel)}${doorBadge(b)}<br><span class="sub">${esc(b.property_name)} · ${esc(b.room_name)}</span></span><span class="sub">${fmtDate(b.arrival)} → ${fmtDate(b.departure)}</span></li>`;
 const listCard = (title, rows) => `<div class="card"><h3>${title} (${rows.length})</h3>${rows.length ? `<ul class="list">${rows.map(personRow).join('')}</ul>` : '<div class="empty">None</div>'}</div>`;
 const kpi = (title, big, sub) => `<div class="card"><h3>${title}</h3><div class="big">${big}</div><div class="sub">${sub}</div></div>`;
 
 async function dashboard() {
   const s = await api('/summary?' + q());
+  doorInfo = s.doors || {};
   const max = Math.max(...s.months.map(m => m.revenue), 1);
   const ch = Object.entries(s.thisMonth.byChannel).sort((a, b) => b[1].revenue - a[1].revenue);
   view.innerHTML = `
+    ${s.doorAlerts?.length ? `<div class="notice bad-notice"><b>Door codes need attention</b> <a href="#/locks">Open Locks</a><ul>${s.doorAlerts.map(a =>
+      `<li>${esc(a.guest || 'Guest')} arriving ${fmtDate(a.arrival)}: ${esc(a.problem)}</li>`).join('')}</ul></div>` : ''}
     <div class="grid">
       ${kpi('Occupancy · this month', pct(s.thisMonth.occupancy), `${s.thisMonth.nights} of ${s.thisMonth.available} nights`)}
       ${kpi('Revenue · this month', money(s.thisMonth.revenue), `ADR ${money(s.thisMonth.adr)} · RevPAR ${money(s.thisMonth.revpar)}`)}
@@ -101,7 +111,7 @@ async function settingsView() {
   view.innerHTML = `<div class="card stack"><h3>Beds24 connection</h3>
     <div>${status.connected ? '✅ Connected' : 'Not connected'}${status.demo ? ' · <b>demo data loaded</b>' : ''}</div>
     <div class="sub">Last sync: ${status.lastSync ? new Date(status.lastSync).toLocaleString() : 'never'}${status.lastSyncError ? ' · error: ' + esc(status.lastSyncError) : ''}</div>
-    <form class="stack" id="cf"><div class="sub">In Beds24: Settings → Apps &amp; Integrations → API → Invite codes. Create a code with access to properties, bookings (including guest personal and financial details, or names and totals come back blank) and inventory, then paste it here. To change prices from the Rates page, give inventory <b>write</b> access. Pasting a new code replaces the old one.</div>
+    <form class="stack" id="cf"><div class="sub">In Beds24: Settings → Apps &amp; Integrations → API → Invite codes. Create a code with access to properties, bookings (including guest personal and financial details, or names and totals come back blank) and inventory, then paste it here. Give <b>write</b> access to inventory (to change prices on the Rates page) and to bookings (to save door codes on bookings). Pasting a new code replaces the old one.</div>
       ${status.scopes ? `<div class="sub">Current permissions: ${esc(status.scopes.join(', ') || 'none reported')}</div>` : ''}
       <input name="code" placeholder="Invite code" autocomplete="off"><button class="primary">Connect &amp; sync</button></form>
     ${status.connected ? '<button id="dc">Disconnect</button>' : ''}
@@ -267,13 +277,123 @@ function renderRatesPreview(out, body, p, canSave) {
   };
 }
 
+// ---------- Locks: Seam / Yale door codes ----------
+async function locksView() {
+  const L = await api('/locks');
+  if (!L.configured) {
+    view.innerHTML = `<div class="card stack" style="max-width:620px"><h3>Set up door codes</h3>
+      <ol class="sub" style="line-height:1.7;padding-left:18px">
+        <li>Create an account at <b>seam.co</b>. Start in a <b>sandbox</b> workspace to test with virtual Yale locks, then make a production workspace for your real locks.</li>
+        <li>In the Seam console, create an <b>API key</b> and paste it below.</li>
+        <li>Click <b>Connect Yale account</b> and sign in to Yale Access. Your Yale password goes to Seam, never to this app.</li>
+        <li>Choose which property each lock belongs to.</li></ol>
+      <form class="stack" id="kf"><input name="key" placeholder="seam_..." autocomplete="off"><button class="primary">Save API key</button></form></div>`;
+    $('#kf').onsubmit = e => { e.preventDefault(); act(() => api('/locks/key', { method: 'POST', body: { apiKey: e.target.key.value } })); };
+    return;
+  }
+  const st = L.settings;
+  const stateIcon = l => ({ set: '✓', scheduled: '⏱', pending: '…', error: '⚠', missing: '–' })[l.state];
+  const roomOpts = sel => `<option value="">Not used</option>` + L.rooms.map(r => `<option value="${r.id}" ${r.id === sel ? 'selected' : ''}>${esc(r.property_name)} · ${esc(r.name)}</option>`).join('');
+  const window_ = c => c.startsAt ? `${new Date(c.startsAt).toLocaleString()} → ${new Date(c.endsAt).toLocaleString()}` : 'Permanent';
+  view.innerHTML = `
+    ${L.seamError ? `<div class="notice">Couldn't reach Seam: ${esc(L.seamError)}</div>` : ''}
+    ${L.error ? `<div class="notice">Door code update failed: ${esc(L.error)}</div>` : ''}
+    <div class="cols">
+    <div class="card" style="overflow-x:auto"><h3>Locks</h3>
+      ${L.locks.length ? `<table><tr><th>Lock</th><th>Status</th><th>Battery</th><th>Opens</th></tr>${L.locks.map(l => `<tr>
+        <td>${esc(l.name)}</td><td>${l.online ? '<span class="ok">● Online</span>' : '<span class="bad">● Offline</span>'}</td>
+        <td>${l.battery != null ? Math.round(l.battery * 100) + '%' : '—'}</td>
+        <td><select data-lock="${esc(l.device_id)}">${roomOpts(l.room_id)}</select></td></tr>`).join('')}</table>`
+        : '<div class="empty">No locks yet. Connect your Yale account, then refresh.</div>'}
+      <div class="toolbar" style="margin-top:10px"><button id="lconnect">Connect Yale account</button><button id="lrefresh">Refresh locks</button>
+        <span class="sub">Seam key ${esc(L.keyHint)} · <a href="#" id="lkey">change</a></span></div></div>
+
+    <div class="card stack" style="max-width:none"><h3>Automatic guest codes</h3>
+      <label><input type="checkbox" id="dauto" ${st.auto ? 'checked' : ''}> <b>Create a code for every confirmed booking</b></label>
+      <div class="sub">Leave this off until switch day. Guesty still makes codes until then, and running both could clash.</div>
+      <form id="dform" class="stack" style="max-width:none">
+        <div class="toolbar" style="margin:0">
+          <label class="sub">Check-in<br><input type="time" name="checkin" value="${st.checkin}"></label>
+          <label class="sub">Checkout<br><input type="time" name="checkout" value="${st.checkout}"></label>
+          <label class="sub">Time zone<br><input name="tz" value="${esc(st.tz)}" size="16"></label>
+          <label class="sub">Create codes<br><input type="number" name="lookahead" min="1" max="60" value="${st.lookahead}" style="width:5em"> days ahead</label></div>
+        <label class="sub">Save the code on the Beds24 booking in custom question
+          <input type="number" name="beds24Field" min="0" max="10" value="${st.beds24Field}" style="width:4em"> (0 = don't)</label>
+        ${st.beds24Field ? `<div class="sub">In your Beds24 check-in Auto Action, write <code>[GUESTCUSTOMQ${st.beds24Field}]</code> where the door code should appear.
+          Set the Auto Action to send no earlier than ${st.lookahead} days before arrival, so the code exists by then.</div>` : ''}
+        <button class="primary">Save settings</button></form>
+      <div class="sub">Each guest gets the last 4 digits of their phone number (or the last 5 or 6 if that clashes with another code; a random code if there's no phone), on every lock of their property, from check-in to checkout time.
+        ${L.lastRun ? `Last checked ${new Date(L.lastRun).toLocaleString()}.` : ''}</div>
+      ${L.problems.length ? `<div class="warn">${L.problems.slice(0, 5).map(p => `⚠ ${esc(p.lock ? p.lock + ': ' : '')}${esc(p.message)}`).join('<br>')}</div>` : ''}
+    </div></div>
+
+    <div class="card" style="margin-top:14px;overflow-x:auto"><h3>Guest codes</h3>
+      ${L.guestCodes.length ? `<table><tr><th>Guest</th><th>Stay</th><th>Code</th><th>Locks</th><th>Beds24</th><th></th></tr>${L.guestCodes.map(g => `<tr>
+        <td>${esc(g.guest_name || 'Guest')} ${tag(g.channel)}</td><td>${fmtDate(g.arrival)} → ${fmtDate(g.departure)}</td>
+        <td><b class="code">${esc(g.door.code)}</b></td>
+        <td>${g.door.perLock.map(l => `<span class="chip ${l.state}" title="${esc(l.label)}">${stateIcon(l)} ${esc(l.lock)}</span>`).join(' ') || '<span class="sub">–</span>'}</td>
+        <td>${g.door.beds24.ok ? '<span class="ok">✓ saved</span>' : g.door.beds24.message ? `<span class="bad" title="${esc(g.door.beds24.message)}">⚠ not saved</span>` : '<span class="sub">–</span>'}</td>
+        <td><button data-gcode="${g.id}" data-cur="${esc(g.door.code)}">Change</button></td></tr>`).join('')}</table>`
+        : `<div class="empty">${st.auto ? 'No upcoming stays need a code yet.' : 'Automatic guest codes are off.'}</div>`}
+      <div class="sub">✓ on the lock · ⏱ goes on the lock at check-in · … being set · ⚠ problem (hover for details)</div></div>
+
+    <div class="card stack" style="margin-top:14px;max-width:none;overflow-x:auto"><h3>Other codes on the locks</h3>
+      <div class="sub">Cleaner, owner and other codes, including ones set in the Yale Access app. Changes apply to every lock the code is on.</div>
+      ${L.otherCodes.length ? `<table><tr><th>Name</th><th>Code</th><th>Locks</th><th>When</th><th></th></tr>${L.otherCodes.map((c, i) => `<tr>
+        <td>${esc(c.name)}</td><td><b class="code">${esc(c.code || '••••')}</b></td>
+        <td>${c.locks.map(l => `<span class="chip ${l.errors.length ? 'error' : ''}" title="${esc(l.errors.join('; '))}">${esc(l.lock)}${l.managed ? '' : ' <span class="sub">(Yale app)</span>'}</span>`).join(' ')}</td>
+        <td class="sub">${window_(c)}</td>
+        <td><button data-ochange="${i}">Change</button> <button data-odel="${i}">Delete</button></td></tr>`).join('')}</table>` : '<div class="empty">No other codes.</div>'}
+      <form id="aform" class="toolbar" style="margin:6px 0 0">
+        <input name="name" placeholder="Name, e.g. Cleaner" size="16"><input name="code" placeholder="Code (4–8 digits)" size="14" inputmode="numeric">
+        ${L.locks.map(l => `<label class="sub"><input type="checkbox" name="dev" value="${esc(l.device_id)}" checked> ${esc(l.name)}</label>`).join('')}
+        <label class="sub">From <input type="datetime-local" name="startsAt"></label><label class="sub">To <input type="datetime-local" name="endsAt"></label>
+        <button class="primary">Add code</button><span class="sub">Leave From/To empty for a permanent code.</span></form></div>`;
+
+  $('#lconnect').onclick = async () => {
+    try { const { url } = await api('/locks/connect', { method: 'POST' }); window.open(url, '_blank', 'noopener'); banner('Sign in to Yale in the new tab, then click "Refresh locks".'); }
+    catch (e) { if (e.message !== 'login') banner(e.message, true); }
+  };
+  $('#lrefresh').onclick = () => act(() => api('/locks/refresh', { method: 'POST' }));
+  $('#lkey').onclick = e => { e.preventDefault(); const k = prompt('New Seam API key (leave empty to disconnect Seam):'); if (k !== null) act(() => api('/locks/key', { method: 'POST', body: { apiKey: k } })); };
+  view.querySelectorAll('[data-lock]').forEach(sel => sel.onchange = () => act(() => api('/locks/assign', { method: 'POST', body: { deviceId: sel.dataset.lock, roomId: sel.value } })));
+  $('#dauto').onchange = e => {
+    if (e.target.checked && !confirm('Turn on automatic guest codes? Every confirmed booking will get a code on your locks.')) { e.target.checked = false; return; }
+    act(() => api('/locks/settings', { method: 'POST', body: { auto: e.target.checked } }));
+  };
+  $('#dform').onsubmit = e => {
+    e.preventDefault();
+    const f = e.target;
+    act(() => api('/locks/settings', { method: 'POST', body: { checkin: f.checkin.value, checkout: f.checkout.value, tz: f.tz.value.trim(), lookahead: Number(f.lookahead.value), beds24Field: Number(f.beds24Field.value) } }));
+  };
+  view.querySelectorAll('[data-gcode]').forEach(b => b.onclick = () => {
+    const code = prompt('New door code for this guest (4–8 digits). It replaces the current code on every lock and in Beds24. If the check-in message already went out, tell the guest.', b.dataset.cur);
+    if (code) act(() => api('/locks/booking-code', { method: 'POST', body: { bookingId: Number(b.dataset.gcode), code } }));
+  });
+  view.querySelectorAll('[data-ochange]').forEach(b => b.onclick = () => {
+    const c = L.otherCodes[b.dataset.ochange];
+    const code = prompt(`New code for "${c.name}" on ${c.locks.map(l => l.lock).join(' and ')}:`, c.code || '');
+    if (code) act(() => api('/locks/code/change', { method: 'POST', body: { entries: c.locks, code } }));
+  });
+  view.querySelectorAll('[data-odel]').forEach(b => b.onclick = () => {
+    const c = L.otherCodes[b.dataset.odel];
+    if (confirm(`Delete "${c.name}" (${c.code || 'code'}) from ${c.locks.map(l => l.lock).join(' and ')}?`)) act(() => api('/locks/code/delete', { method: 'POST', body: { entries: c.locks } }));
+  });
+  $('#aform').onsubmit = e => {
+    e.preventDefault();
+    const f = e.target;
+    act(() => api('/locks/code/add', { method: 'POST', body: { name: f.name.value, code: f.code.value,
+      deviceIds: [...f.querySelectorAll('[name=dev]:checked')].map(x => x.value), startsAt: f.startsAt.value || null, endsAt: f.endsAt.value || null } }));
+  };
+}
+
 async function act(fn) {
   const btn = $('#sync'); btn.disabled = true; banner('Working…');
   try { await fn(); banner(''); await boot(true); } catch (e) { if (e.message !== 'login') banner(e.message, true); }
   btn.disabled = false;
 }
 
-const routes = { '': dashboard, calendar: calendarView, bookings: bookingsView, rates: ratesView, settings: settingsView };
+const routes = { '': dashboard, calendar: calendarView, bookings: bookingsView, rates: ratesView, locks: locksView, settings: settingsView };
 async function render() {
   const r = location.hash.replace(/^#\/?/, '');
   document.querySelectorAll('nav a').forEach(a => a.classList.toggle('on', a.dataset.r === r));

@@ -37,6 +37,13 @@ Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB
   change, then save to Beds24. Every save is re-read from Beds24 to confirm it stuck, and logged under
   "Recent changes". Edits Beds24's **Price 1** daily rate. Needs an invite code with **write** access to
   Inventory; with a read-only code the page shows prices but can't save.
+- **Locks** (Yale via [Seam](https://www.seam.co)): every confirmed Beds24 stay gets a door code on each lock
+  of its property (last 4 digits of the guest's phone; last 5/6 if that clashes, random if no phone), active
+  from check-in to checkout time in the property's time zone. Codes follow date changes and cancellations,
+  are saved to a Beds24 booking custom field (`[GUESTCUSTOMQ10]` in Auto Action messages), and show on the
+  Dashboard with a warning for any arrival without a working code. The page also lists, changes, deletes
+  and adds cleaner/owner codes on all locks at once, including codes set in the Yale Access app. Automatic
+  guest codes are off until switched on.
 - **Guesty history import** (Settings): upload a Guesty Lite reservations CSV, preview it, then import.
   Re-importing updates rather than duplicates, and once Beds24 has a stay, its copy replaces the Guesty one.
   Guest addresses, IDs and door key codes in the file are never stored.
@@ -44,7 +51,8 @@ Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB
 ## Layout
 
 `server/beds24.js` API client + token handling · `server/sync.js` mapping and sync ·
-`server/rates.js` prices, minimum stays and blocks · `server/guesty.js` Guesty import ·
+`server/rates.js` prices, minimum stays and blocks · `server/doors.js` + `server/seam.js` door codes ·
+`server/guesty.js` Guesty import ·
 `server/stats.js` metrics · `server/demo.js` sample data · `public/` UI · `test/` (`npm test`).
 
 ## Known gaps / next steps

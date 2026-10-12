@@ -30,6 +30,22 @@ CREATE TABLE IF NOT EXISTS calendar_days (
   price REAL, min_stay INTEGER, num_avail INTEGER, override TEXT,
   PRIMARY KEY (room_id, date)
 );
+-- Smart locks known to Seam, and which room each one opens.
+CREATE TABLE IF NOT EXISTS locks (
+  device_id TEXT PRIMARY KEY, name TEXT NOT NULL, room_id INTEGER,
+  online INTEGER, battery REAL, can_program INTEGER, updated_at TEXT
+);
+-- One door code per booking (the same code on every lock of that room).
+CREATE TABLE IF NOT EXISTS door_codes (
+  booking_id INTEGER PRIMARY KEY, code TEXT NOT NULL, starts_at TEXT, ends_at TEXT,
+  beds24_written TEXT, beds24_error TEXT, created_at TEXT, updated_at TEXT
+);
+-- The Seam access code for that booking on each lock, with its last known state.
+CREATE TABLE IF NOT EXISTS door_code_devices (
+  booking_id INTEGER NOT NULL, device_id TEXT NOT NULL, access_code_id TEXT,
+  status TEXT, scheduled INTEGER, errors TEXT, warnings TEXT, error TEXT, updated_at TEXT,
+  PRIMARY KEY (booking_id, device_id)
+);
 -- Every change sent to Beds24 from this app, successful or not.
 CREATE TABLE IF NOT EXISTS change_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, room_id INTEGER NOT NULL,

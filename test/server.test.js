@@ -258,3 +258,96 @@ test('Rates: a read-only invite code can view but not save', async t => {
   assert.match(res.json.error, /write access to Inventory/);
   assert.equal(posts.length, 0);
 });
+
+/** Fake Seam HTTP API: two Yale locks with a cleaner code set in the Yale app. */
+function fakeSeamServer() {
+  const managed = new Map(), calls = [];
+  const unmanaged = [
+    { access_code_id: 'u-front', device_id: 'front', name: 'Cleaner', code: '0198', is_managed: false, status: 'set' },
+    { access_code_id: 'u-back', device_id: 'back', name: 'Cleaner', code: '0198', is_managed: false, status: 'set' },
+  ];
+  let n = 0;
+  const srv = createServer(async (req, res) => {
+    let raw = ''; for await (const c of req) raw += c;
+    const body = raw ? JSON.parse(raw) : {};
+    calls.push({ path: req.url, auth: req.headers.authorization, body });
+    const send = (status, b) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(b)); };
+    if (req.headers.authorization !== 'Bearer seam_testkey_1234567') return send(401, { error: { type: 'unauthorized', message: 'bad key' } });
+    switch (req.url) {
+      case '/devices/list': return send(200, { devices: [
+        { device_id: 'front', display_name: 'Front Door', device_type: 'yale_lock', can_program_online_access_codes: true, properties: { online: true, battery_level: 0.9 } },
+        { device_id: 'back', display_name: 'Back Door', device_type: 'yale_lock', can_program_online_access_codes: true, properties: { online: false, battery_level: 0.2 } }] });
+      case '/access_codes/list': return send(200, { access_codes: [...managed.values()].filter(c => c.device_id === body.device_id) });
+      case '/access_codes/unmanaged/list': return send(200, { access_codes: unmanaged.filter(c => c.device_id === body.device_id) });
+      case '/access_codes/create': { const c = { access_code_id: `ac${++n}`, status: 'unset', errors: [], warnings: [], is_managed: true, ...body }; managed.set(c.access_code_id, c); return send(200, { access_code: c }); }
+      case '/access_codes/update': Object.assign(managed.get(body.access_code_id), body); return send(200, {});
+      case '/access_codes/delete': managed.delete(body.access_code_id); return send(200, {});
+      case '/access_codes/unmanaged/convert_to_managed': {
+        const i = unmanaged.findIndex(c => c.access_code_id === body.access_code_id);
+        managed.set(body.access_code_id, { ...unmanaged.splice(i, 1)[0], is_managed: true, errors: [] }); return send(200, {});
+      }
+      case '/connect_webviews/create': return send(200, { connect_webview: { connect_webview_id: 'cw1', url: 'https://connect.getseam.com/cw/abc', status: 'pending' } });
+    }
+    send(404, { error: { message: 'unknown route' } });
+  });
+  return new Promise(ok => srv.listen(0, '127.0.0.1', () => ok({ srv, calls, managed })));
+}
+
+test('Locks: connect Seam, assign locks, automatic guest codes, change a Yale-app code', async t => {
+  const seam = await fakeSeamServer();
+  t.after(() => seam.srv.close());
+  const { openDb } = await import('../server/db.js');
+  const { upsertProperties, upsertBookings } = await import('../server/sync.js');
+  const path = join(tmp(), 'db.sqlite');
+  const db = openDb(path);
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Denver' }).format(new Date());
+  const d = n => new Date(Date.parse(today) + n * 86400000).toISOString().slice(0, 10);
+  upsertProperties(db, [{ id: 500, name: 'Laramie Retreat', roomTypes: [{ id: 600, name: 'Whole house', qty: 1 }] }]);
+  upsertBookings(db, [{ id: 42, propertyId: 500, roomId: 600, status: 'confirmed', channel: 'airbnb', arrival: d(1), departure: d(4), firstName: 'Pat', phone: '+1 307 555 4242', price: 500 }]);
+  db.close();
+
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: path, SEAM_BASE: `http://127.0.0.1:${seam.srv.address().port}` });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+
+  assert.equal((await call('/api/locks')).json.configured, false);
+  assert.equal((await call('/api/locks/key', { apiKey: 'not-a-key' })).status, 400);
+  assert.deepEqual((await call('/api/locks/key', { apiKey: 'seam_testkey_1234567' })).json, { locks: 2 });
+  assert.ok(seam.calls.every(c => c.auth === 'Bearer seam_testkey_1234567'));
+
+  let L = (await call('/api/locks')).json;
+  assert.equal(L.keyHint, '…4567');
+  assert.ok(!JSON.stringify(L).includes('seam_testkey'), 'the API key is never sent back to the browser');
+  assert.deepEqual(L.locks.map(l => [l.name, l.online]), [['Back Door', 0], ['Front Door', 1]]);
+  assert.equal(L.otherCodes[0].name, 'Cleaner');
+
+  for (const id of ['front', 'back']) assert.equal((await call('/api/locks/assign', { deviceId: id, roomId: 600 })).status, 200);
+  assert.equal(seam.managed.size, 0, 'nothing is created while automatic codes are off');
+  const on = await call('/api/locks/settings', { auto: true });
+  assert.equal(on.json.doors.created, 2);
+  assert.ok([...seam.managed.values()].every(c => c.code === '4242'));
+
+  const sum = (await call('/api/summary')).json;
+  assert.equal(sum.doors[42].code, '4242');
+  assert.deepEqual(sum.doorAlerts, []);
+
+  L = (await call('/api/locks')).json;
+  assert.equal(L.guestCodes[0].door.code, '4242');
+  assert.equal(L.guestCodes[0].phone, undefined, 'phone numbers are not sent to the Locks page');
+  const cleaner = L.otherCodes.find(c => c.name === 'Cleaner');
+  assert.equal((await call('/api/locks/code/change', { entries: cleaner.locks, code: '5150' })).status, 200);
+  assert.ok(['u-front', 'u-back'].every(id => seam.managed.get(id).code === '5150'));
+  assert.equal((await call('/api/locks/code/change', { entries: [{ deviceId: 'elsewhere', accessCodeId: 'x' }], code: '1111' })).status, 400);
+
+  const clash = await call('/api/locks/booking-code', { bookingId: 42, code: '5150' });
+  assert.equal(clash.status, 400);
+  assert.match(clash.json.error, /already used by "Cleaner"/);
+  assert.equal((await call('/api/locks/booking-code', { bookingId: 42, code: '777888' })).status, 200);
+  assert.ok([...seam.managed.values()].filter(c => c.name?.startsWith('Pat')).every(c => c.code === '777888'));
+
+  assert.equal((await call('/api/locks/connect', {})).json.url, 'https://connect.getseam.com/cw/abc');
+  assert.equal((await call('/api/locks/settings', { checkin: 'noon' })).status, 400);
+});
