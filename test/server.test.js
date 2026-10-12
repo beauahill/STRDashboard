@@ -351,3 +351,77 @@ test('Locks: connect Seam, assign locks, automatic guest codes, change a Yale-ap
   assert.equal((await call('/api/locks/connect', {})).json.url, 'https://connect.getseam.com/cw/abc');
   assert.equal((await call('/api/locks/settings', { checkin: 'noon' })).status, 400);
 });
+
+/** Fake Beds24 with a message log (GET/POST/PATCH /bookings/messages). */
+function fakeBeds24Messages() {
+  const msgs = [{ id: 1, bookingId: 10, source: 'guest', message: 'Is there parking?', time: new Date(Date.now() - 3600e3).toISOString(), read: false }];
+  const calls = [];
+  const srv = createServer(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    let raw = ''; for await (const c of req) raw += c;
+    const send = (status, b) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(b)); };
+    if (u.pathname.endsWith('/bookings/messages')) calls.push({ method: req.method, query: Object.fromEntries(u.searchParams), body: raw && JSON.parse(raw) });
+    if (u.pathname.endsWith('/authentication/setup')) return send(200, { token: 't', refreshToken: 'r', expiresIn: 86400 });
+    if (u.pathname.endsWith('/authentication/details')) return send(200, { token: { scopes: ['all:bookings'] } });
+    if (u.pathname.endsWith('/properties')) return send(200, { data: [{ id: 500, name: 'Laramie Retreat', roomTypes: [{ id: 600, name: 'Whole house', qty: 1 }] }], pages: {} });
+    if (u.pathname.endsWith('/bookings/messages')) {
+      if (req.method === 'GET') {
+        const ids = u.searchParams.getAll('bookingId').map(Number);
+        return send(200, { data: msgs.filter(m => !ids.length || ids.includes(m.bookingId)), pages: {} });
+      }
+      if (req.method === 'POST') {
+        for (const m of JSON.parse(raw)) msgs.push({ id: msgs.length + 1, bookingId: m.bookingId, source: 'host', message: m.message, time: new Date().toISOString(), read: true });
+        return send(201, [{ success: true }]);
+      }
+      if (req.method === 'PATCH') { for (const m of msgs) if (u.searchParams.getAll('bookingId').map(Number).includes(m.bookingId)) m.read = true; return send(200, {}); }
+    }
+    if (u.pathname.endsWith('/bookings')) return send(200, { data: [{ id: 10, propertyId: 500, roomId: 600, status: 'confirmed', channel: 'airbnb',
+      arrival: new Date(Date.now() + 3 * 86400e3).toISOString().slice(0, 10), departure: new Date(Date.now() + 6 * 86400e3).toISOString().slice(0, 10), firstName: 'Jordan' }], pages: {} });
+    if (u.pathname.endsWith('/inventory/rooms/calendar')) return send(200, { data: [], pages: {} });
+    send(404, { error: 'nope' });
+  });
+  return new Promise(ok => srv.listen(0, '127.0.0.1', () => ok({ srv, calls, msgs })));
+}
+
+test('Inbox: messages sync, unread badge, open marks read, reply sends, polling is rate-limited', async t => {
+  const beds = await fakeBeds24Messages();
+  t.after(() => beds.srv.close());
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), BEDS24_BASE: `http://127.0.0.1:${beds.srv.address().port}` });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+  assert.equal((await call('/api/connect', { inviteCode: 'abc' })).status, 200);
+
+  assert.equal((await call('/api/status')).json.unreadMessages, 1);
+  const inbox = (await call('/api/inbox')).json;
+  assert.equal(inbox.conversations[0].guest_name, 'Jordan');
+  assert.equal(inbox.conversations[0].unread, 1);
+
+  const th = (await call('/api/inbox/thread?booking=10')).json;
+  assert.equal(th.messages[0].body, 'Is there parking?');
+  assert.equal(th.canReply, true);
+
+  assert.deepEqual((await call('/api/inbox/read', { bookingId: 10 })).json, { changed: 1 });
+  assert.deepEqual(beds.calls.find(c => c.method === 'PATCH'), { method: 'PATCH', query: { bookingId: '10' }, body: { read: true } });
+  assert.equal((await call('/api/status')).json.unreadMessages, 0);
+
+  const sent = await call('/api/inbox/send', { bookingId: 10, message: 'Yes, two spots.' });
+  assert.equal(sent.status, 200, JSON.stringify(sent.json));
+  assert.deepEqual(beds.calls.find(c => c.method === 'POST').body, [{ bookingId: 10, message: 'Yes, two spots.' }]);
+  assert.equal(sent.json.messages.at(-1).body, 'Yes, two spots.');
+  assert.equal((await call('/api/inbox/send', { bookingId: 10, message: '' })).status, 400);
+
+  beds.msgs.push({ id: 99, bookingId: 10, source: 'guest', message: 'Thanks!', time: new Date().toISOString(), read: false });
+  const gets = () => beds.calls.filter(c => c.method === 'GET' && c.query.maxAge).length;
+  const before = gets();
+  assert.equal((await call('/api/inbox/refresh', {})).json.unread, 1);
+  await call('/api/inbox/refresh', {});
+  assert.equal(gets() - before, 1, 'a second refresh within 30 seconds does not call Beds24 again');
+
+  const replies = (await call('/api/replies')).json;
+  assert.equal(replies.length, 4);
+  assert.equal((await call('/api/replies', { title: 'Wi-Fi', body: 'Network: LaramieGuest' })).status, 200);
+  assert.equal((await call('/api/replies')).json.length, 5);
+});

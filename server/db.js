@@ -46,6 +46,15 @@ CREATE TABLE IF NOT EXISTS door_code_devices (
   status TEXT, scheduled INTEGER, errors TEXT, warnings TEXT, error TEXT, updated_at TEXT,
   PRIMARY KEY (booking_id, device_id)
 );
+-- Guest messages (copy of Beds24's message log; attachments are fetched on demand).
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY, booking_id INTEGER NOT NULL,
+  source TEXT NOT NULL,            -- guest | host | system | internalNote
+  body TEXT, time TEXT NOT NULL, read INTEGER DEFAULT 0,
+  attachment_name TEXT, attachment_mime TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_messages_booking ON messages(booking_id, time);
+CREATE TABLE IF NOT EXISTS saved_replies (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, body TEXT NOT NULL);
 -- Every change sent to Beds24 from this app, successful or not.
 CREATE TABLE IF NOT EXISTS change_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, room_id INTEGER NOT NULL,

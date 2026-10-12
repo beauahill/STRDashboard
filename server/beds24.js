@@ -81,6 +81,7 @@ export class Beds24Client {
 
   get(path, query = {}) { return this.#request('GET', path, { query }); }
   post(path, body) { return this.#request('POST', path, { body }); }
+  patch(path, query, body) { return this.#request('PATCH', path, { query, body }); }
 
   /** Follow Beds24 pagination, returning every row from `data`. */
   async getAll(path, query = {}) {

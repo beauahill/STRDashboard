@@ -85,3 +85,24 @@ test('clearDemo removes only demo rows', () => {
   assert.deepEqual(db.prepare('SELECT DISTINCT property_id FROM rooms').all().map(r => r.property_id), [2]);
   assert.equal(getSetting(db, 'demo'), null);
 });
+
+test('calendar returns bookings and nightly prices only for the rooms in view', async () => {
+  const { calendar } = await import('../server/stats.js');
+  const { upsertProperties: up, upsertBookings: ub } = await import('../server/sync.js');
+  const db = openDb(':memory:');
+  up(db, [{ id: 1, name: 'A', roomTypes: [{ id: 10, name: 'A1' }] }, { id: 2, name: 'B', roomTypes: [{ id: 20, name: 'B1' }] }]);
+  ub(db, [
+    { id: 1, propertyId: 1, roomId: 10, status: 'confirmed', arrival: '2026-11-03', departure: '2026-11-06', numAdult: 2, numChild: 1, price: 300 },
+    { id: 2, propertyId: 2, roomId: 20, status: 'confirmed', arrival: '2026-11-04', departure: '2026-11-05', price: 100 },
+    { id: 3, propertyId: 1, roomId: 10, status: 'cancelled', arrival: '2026-11-10', departure: '2026-11-12', price: 100 },
+    { id: 4, propertyId: 1, roomId: 10, status: 'confirmed', arrival: '2026-12-20', departure: '2026-12-22', price: 100 },
+  ]);
+  db.prepare("INSERT INTO calendar_days(room_id,date,price,override) VALUES(10,'2026-11-07',199,'none'),(10,'2026-11-08',199,'blackout'),(10,'2027-01-01',1,'none')").run();
+  const all = calendar(db, '2026-11-01', 35);
+  assert.deepEqual(all.bookings.map(b => b.id), [1, 2], 'cancelled and out-of-range stays are left out');
+  assert.equal(all.bookings[0].adults, 2); assert.equal(all.bookings[0].children, 1);
+  assert.deepEqual(all.nights.map(n => [n.date, n.price, n.blocked]), [['2026-11-07', 199, 0], ['2026-11-08', 199, 1]]);
+  const onlyB = calendar(db, '2026-11-01', 35, 2);
+  assert.deepEqual(onlyB.bookings.map(b => b.id), [2]);
+  assert.deepEqual(onlyB.nights, []);
+});

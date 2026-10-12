@@ -72,7 +72,8 @@ export async function syncBeds24(db, client) {
   const query = last
     ? { modifiedFrom: new Date(Date.parse(last) - 5 * 60000).toISOString().slice(0, 19) } // Beds24 wants YYYY-MM-DDTHH:MM:SS
     : { departureFrom: addDays(iso(Date.now()), -365) };
-  const bookings = await client.getAll('/bookings', { ...query, status: ['confirmed', 'new', 'request', 'cancelled', 'black'] });
+  // Inquiries (questions before booking) are included so their messages appear in the inbox.
+  const bookings = await client.getAll('/bookings', { ...query, status: ['confirmed', 'new', 'request', 'cancelled', 'black', 'inquiry'] });
   upsertBookings(db, bookings);
 
   const now = new Date().toISOString();
