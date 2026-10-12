@@ -24,8 +24,9 @@ Nothing here touches your live listings yet.
       VRBO's connection checks this content and lists anything missing as "Fix Content Errors".
 - [ ] **Prices and minimum stays for the next 12 months.** This is the most important step: if prices
       aren't set when you connect, Beds24 sends its base rate and **overwrites your current Airbnb/VRBO
-      prices**. Match what's live on Airbnb today.
-- [ ] **Blocked dates** from your screenshots.
+      prices**. Match what's live on Airbnb today. The dashboard's **Rates** page is the quickest way:
+      select a range, tick Fri/Sat for weekend prices, preview, save. Then check a few nights in Beds24.
+- [ ] **Blocked dates** from your screenshots (Rates page → select the nights → "block").
 - [ ] **Auto Actions** (Settings → Guest Management → Auto Actions): recreate each Guesty auto-message with
       the same timing (on booking, X days before check-in, etc.). Write them as **plain text**, because
       Airbnb and Booking.com don't display formatting. Booking.com doesn't allow links in messages.

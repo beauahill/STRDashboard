@@ -24,6 +24,18 @@ CREATE TABLE IF NOT EXISTS bookings (
 );
 CREATE INDEX IF NOT EXISTS idx_bookings_dates ON bookings(arrival, departure);
 CREATE INDEX IF NOT EXISTS idx_bookings_room ON bookings(room_id);
+-- Local copy of the Beds24 calendar (per room, per night) so the Rates page loads instantly.
+CREATE TABLE IF NOT EXISTS calendar_days (
+  room_id INTEGER NOT NULL, date TEXT NOT NULL,
+  price REAL, min_stay INTEGER, num_avail INTEGER, override TEXT,
+  PRIMARY KEY (room_id, date)
+);
+-- Every change sent to Beds24 from this app, successful or not.
+CREATE TABLE IF NOT EXISTS change_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, room_id INTEGER NOT NULL,
+  date_from TEXT NOT NULL, date_to TEXT NOT NULL, nights INTEGER NOT NULL,
+  summary TEXT NOT NULL, ok INTEGER NOT NULL, error TEXT
+);
 `;
 
 // Columns added after the first release; created on startup if an older database lacks them.

@@ -9,6 +9,7 @@ import { syncBeds24, iso } from './sync.js';
 import { summary, calendar } from './stats.js';
 import { loadDemo, clearDemo } from './demo.js';
 import { readGuestyExport, importGuesty, dedupeImported, removeGuestyImport } from './guesty.js';
+import { syncCalendar, readDays, planChanges, applyChanges, recentChanges } from './rates.js';
 
 const PORT = Number(process.env.PORT || 3000);
 const PASSWORD = process.env.APP_PASSWORD || '';
@@ -54,7 +55,15 @@ let syncing = false;
 async function runSync() {
   if (syncing || !beds24.connected) return null;
   syncing = true;
-  try { const r = await syncBeds24(db, beds24); dedupeImported(db); return r; }
+  try {
+    const r = await syncBeds24(db, beds24);
+    dedupeImported(db);
+    if (beds24.scopes === null) await beds24.refreshScopes().catch(() => {});
+    // Prices are a separate permission in Beds24; a read-only or bookings-only code shouldn't fail the whole sync.
+    try { await syncCalendar(db, beds24); setSetting(db, 'calendar_error', null); }
+    catch (e) { setSetting(db, 'calendar_error', e.message); }
+    return r;
+  }
   catch (e) { setSetting(db, 'last_sync_error', e.message); throw e; }
   finally { syncing = false; }
 }
@@ -102,7 +111,7 @@ async function api(req, res, url) {
   switch (route) {
     case 'GET /api/status':
       return send(res, 200, {
-        connected: beds24.connected, auth: !!PASSWORD, demo: getSetting(db, 'demo') === '1', syncing,
+        connected: beds24.connected, scopes: beds24.scopes, auth: !!PASSWORD, demo: getSetting(db, 'demo') === '1', syncing,
         lastSync: getSetting(db, 'last_sync'), lastSyncError: getSetting(db, 'last_sync_error'),
         empty: db.prepare('SELECT COUNT(*) n FROM bookings').get().n === 0,
         guestyImported: db.prepare("SELECT COUNT(*) n FROM bookings WHERE source = 'guesty'").get().n,
@@ -134,6 +143,25 @@ async function api(req, res, url) {
       return send(res, 200, { ...importGuesty(db, bookings, mapping), summary });
     }
     case 'POST /api/import/guesty/remove': return send(res, 200, removeGuestyImport(db));
+    case 'GET /api/rates': {
+      const rooms = db.prepare(`SELECT r.id, r.name, p.name property_name FROM rooms r JOIN properties p ON p.id = r.property_id
+        WHERE r.id > 0 ${prop ? 'AND r.property_id = ?' : ''} ORDER BY p.name, r.name`).all(...(prop ? [prop] : []));
+      const room = rooms.find(r => r.id === Number(q.room)) || rooms[0] || null;
+      return send(res, 200, {
+        rooms, room, connected: beds24.connected, canWrite: beds24.canWriteInventory,
+        calendarError: getSetting(db, 'calendar_error'), lastSync: getSetting(db, 'last_sync'),
+        days: room ? readDays(db, room.id, q.start || iso(Date.now()), Math.min(Number(q.days) || 62, 120)) : [],
+        changes: recentChanges(db),
+      });
+    }
+    case 'POST /api/rates/preview': return send(res, 200, planChanges(db, await readJson(req)));
+    case 'POST /api/rates/apply': {
+      if (!beds24.connected) return send(res, 400, { error: 'Connect Beds24 first.' });
+      if (beds24.canWriteInventory === false) {
+        return send(res, 403, { error: 'Your Beds24 invite code can\'t change prices. Create a new one with write access to Inventory and paste it in Settings.' });
+      }
+      return send(res, 200, await applyChanges(db, beds24, await readJson(req)));
+    }
     case 'GET /api/properties':
       return send(res, 200, db.prepare('SELECT * FROM properties ORDER BY name').all().map(p => ({
         ...p, rooms: db.prepare('SELECT * FROM rooms WHERE property_id=? ORDER BY name').all(p.id) })));

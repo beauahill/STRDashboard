@@ -18,7 +18,8 @@ async function api(path, opts = {}) {
 const prop = () => $('#prop').value;
 const q = (extra = {}) => new URLSearchParams({ ...(prop() && { property: prop() }), ...extra }).toString();
 
-function banner(msg, err) { const b = $('#banner'); b.hidden = !msg; b.textContent = msg || ''; b.className = err ? 'err' : ''; }
+// kind: true/'err' = problem, 'ok' = success, otherwise a neutral notice.
+function banner(msg, kind) { const b = $('#banner'); b.hidden = !msg; b.textContent = msg || ''; b.className = kind === true || kind === 'err' ? 'err' : kind === 'ok' ? 'ok' : ''; }
 
 function showLogin() {
   view.innerHTML = `<form class="card stack login"><h3>Sign in</h3><input type="password" name="password" placeholder="Password" autofocus><button class="primary">Sign in</button><div class="sub" id="lerr"></div></form>`;
@@ -100,7 +101,8 @@ async function settingsView() {
   view.innerHTML = `<div class="card stack"><h3>Beds24 connection</h3>
     <div>${status.connected ? '✅ Connected' : 'Not connected'}${status.demo ? ' · <b>demo data loaded</b>' : ''}</div>
     <div class="sub">Last sync: ${status.lastSync ? new Date(status.lastSync).toLocaleString() : 'never'}${status.lastSyncError ? ' · error: ' + esc(status.lastSyncError) : ''}</div>
-    <form class="stack" id="cf"><div class="sub">In Beds24: Settings → Apps &amp; Integrations → API → Invite codes. Create a code with read access to properties, inventory and bookings (including guest personal and financial details, or names and totals come back blank), then paste it here.</div>
+    <form class="stack" id="cf"><div class="sub">In Beds24: Settings → Apps &amp; Integrations → API → Invite codes. Create a code with access to properties, bookings (including guest personal and financial details, or names and totals come back blank) and inventory, then paste it here. To change prices from the Rates page, give inventory <b>write</b> access. Pasting a new code replaces the old one.</div>
+      ${status.scopes ? `<div class="sub">Current permissions: ${esc(status.scopes.join(', ') || 'none reported')}</div>` : ''}
       <input name="code" placeholder="Invite code" autocomplete="off"><button class="primary">Connect &amp; sync</button></form>
     ${status.connected ? '<button id="dc">Disconnect</button>' : ''}
     ${status.demo ? '<hr><button id="cleardemo">Clear demo data</button>'
@@ -151,13 +153,127 @@ function renderGuestyPreview(csv, { summary: s, rooms }) {
   };
 }
 
+// ---------- Rates: view and change nightly price, minimum stay and blocked dates ----------
+const ratesState = { start: null, room: null, from: null, to: null };
+const todayISO = () => new Date().toISOString().slice(0, 10);
+const addMonths = (m, n) => { const d = new Date(m + 'T00:00:00Z'); d.setUTCMonth(d.getUTCMonth() + n); return d.toISOString().slice(0, 10); };
+
+async function ratesView() {
+  const today = todayISO();
+  ratesState.start ||= today.slice(0, 8) + '01';
+  const r = await api('/rates?' + q({ start: ratesState.start, days: 62, ...(ratesState.room && { room: ratesState.room }) }));
+  if (!r.room) {
+    view.innerHTML = `<div class="card empty">${r.connected ? 'No rooms found in Beds24 yet. Set up your property and room in Beds24, then press Sync.' : 'Connect Beds24 in Settings to see and change your prices.'}</div>`;
+    return;
+  }
+  ratesState.room = r.room.id;
+  const months = [ratesState.start, addMonths(ratesState.start, 1)];
+  const byDate = Object.fromEntries(r.days.map(d => [d.date, d]));
+  const inSel = d => ratesState.from && d >= ratesState.from && d <= (ratesState.to || ratesState.from);
+  const monthHtml = m => {
+    const first = new Date(m + 'T00:00:00Z'), y = first.getUTCFullYear(), mo = first.getUTCMonth();
+    const len = new Date(Date.UTC(y, mo + 1, 0)).getUTCDate();
+    let cells = Array.from({ length: first.getUTCDay() }, () => '<div class="day pad"></div>').join('');
+    for (let i = 1; i <= len; i++) {
+      const date = `${m.slice(0, 8)}${String(i).padStart(2, '0')}`, d = byDate[date] || {};
+      const cls = ['day', date < today && 'past', d.blocked && 'blocked', d.booking && `booked ${d.booking.status === 'block' ? '' : d.booking.channel}`, inSel(date) && 'sel'].filter(Boolean).join(' ');
+      const who = d.booking ? (d.booking.status === 'block' ? 'Block' : (d.booking.guest || 'Booked').split(' ')[0]) : d.blocked ? 'Blocked' : '';
+      cells += `<div class="${cls}" data-date="${date}" title="${esc(d.booking ? `${d.booking.guest || 'Booking'} (${d.booking.channel})` : '')}">
+        <div class="n">${i}</div><div class="p">${d.price != null ? money(d.price) : '—'}</div>${d.minStay ? `<div class="m">${d.minStay}n min</div>` : ''}<div class="g">${esc(who)}</div></div>`;
+    }
+    return `<div class="month"><h4>${first.toLocaleDateString(undefined, { month: 'long', year: 'numeric', timeZone: 'UTC' })}</h4>
+      <div class="mgrid">${['S', 'M', 'T', 'W', 'T', 'F', 'S'].map(w => `<div class="wd">${w}</div>`).join('')}${cells}</div></div>`;
+  };
+  const notice = !r.connected ? 'Connect Beds24 in Settings to change prices.'
+    : r.canWrite === false ? 'Your Beds24 invite code can read prices but not change them. In Beds24 go to Settings → Apps &amp; Integrations → API, create a new invite code with <b>write access to Inventory</b>, and paste it in Settings here.'
+    : r.calendarError ? `Prices couldn't be loaded from Beds24: ${esc(r.calendarError)}` : '';
+  const f = ratesState.form || {};
+  view.innerHTML = `${notice ? `<div class="notice">${notice}</div>` : ''}
+    <div class="rates"><div class="card">
+      <div class="toolbar">
+        ${r.rooms.length > 1 ? `<select id="rroom">${r.rooms.map(x => `<option value="${x.id}" ${x.id === r.room.id ? 'selected' : ''}>${esc(x.property_name)} · ${esc(x.name)}</option>`).join('')}</select>` : `<b>${esc(r.room.property_name)}</b>`}
+        <button id="rprev">‹</button><button id="rtoday">Today</button><button id="rnext">›</button>
+        <span class="sub">Click a night, then another, to select a range.</span></div>
+      <div class="months">${months.map(monthHtml).join('')}</div></div>
+    <div class="card stack" style="max-width:none"><h3>Change selected nights</h3>
+      <form class="stack" id="rform" style="max-width:none">
+        <div class="toolbar" style="margin:0"><label class="sub">From<br><input type="date" name="from" value="${ratesState.from || ''}" min="${today}"></label>
+          <label class="sub">To<br><input type="date" name="to" value="${ratesState.to || ratesState.from || ''}" min="${today}"></label></div>
+        <div class="wdays">${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((w, i) =>
+          `<label>${w}<input type="checkbox" name="wd" value="${i}" ${!f.weekdays || f.weekdays.includes(i) ? 'checked' : ''}></label>`).join('')}</div>
+        <label class="sub">Nightly price ($)<br><input name="price" type="number" min="1" step="1" value="${f.price ?? ''}" placeholder="leave as is"></label>
+        <label class="sub">Minimum stay (nights)<br><input name="minStay" type="number" min="1" step="1" value="${f.minStay ?? ''}" placeholder="leave as is"></label>
+        <div class="sub">Availability:
+          <label><input type="radio" name="block" value="" ${!f.block ? 'checked' : ''}> leave as is</label>
+          <label><input type="radio" name="block" value="block" ${f.block === 'block' ? 'checked' : ''}> block</label>
+          <label><input type="radio" name="block" value="unblock" ${f.block === 'unblock' ? 'checked' : ''}> open</label></div>
+        <button class="primary">Preview changes</button></form>
+      <div id="rprev-out"></div></div></div>
+    <div class="card" style="margin-top:14px"><h3>Recent changes</h3>${r.changes.length ? `<ul class="list">${r.changes.map(c =>
+      `<li><span>${c.ok ? '<span class="ok">✓</span>' : '<span class="bad">✗</span>'} ${esc(c.summary)} <span class="sub">· ${fmtDate(c.date_from)} → ${fmtDate(c.date_to)} · ${c.nights} night${c.nights > 1 ? 's' : ''}${c.error ? ' · ' + esc(c.error) : ''}</span></span>
+       <span class="sub">${new Date(c.at).toLocaleString()}</span></li>`).join('')}</ul>` : '<div class="empty">No changes made from this app yet.</div>'}</div>`;
+
+  const shift = n => { ratesState.start = addMonths(ratesState.start, n); ratesView(); };
+  $('#rprev').onclick = () => shift(-1); $('#rnext').onclick = () => shift(1);
+  $('#rtoday').onclick = () => { ratesState.start = today.slice(0, 8) + '01'; ratesView(); };
+  if ($('#rroom')) $('#rroom').onchange = e => { ratesState.room = Number(e.target.value); ratesView(); };
+  const form = $('#rform');
+  const readForm = () => ({
+    roomId: ratesState.room, from: form.from.value, to: form.to.value || form.from.value,
+    weekdays: [...form.querySelectorAll('[name=wd]:checked')].map(x => Number(x.value)),
+    price: form.price.value, minStay: form.minStay.value, block: form.block.value,
+  });
+  view.querySelectorAll('.day[data-date]').forEach(el => el.onclick = () => {
+    const d = el.dataset.date;
+    if (d < today) return;
+    ratesState.form = readForm();
+    if (!ratesState.from || ratesState.to) { ratesState.from = d; ratesState.to = null; }
+    else if (d < ratesState.from) { ratesState.to = ratesState.from; ratesState.from = d; }
+    else ratesState.to = d;
+    ratesView();
+  });
+  form.onsubmit = async e => {
+    e.preventDefault();
+    const body = readForm();
+    ratesState.form = body; ratesState.from = body.from; ratesState.to = body.to;
+    const out = $('#rprev-out');
+    try { renderRatesPreview(out, body, await api('/rates/preview', { method: 'POST', body }), r.connected && r.canWrite !== false); }
+    catch (err) { if (err.message !== 'login') out.innerHTML = `<div class="bad">${esc(err.message)}</div>`; }
+  };
+}
+
+function renderRatesPreview(out, body, p, canSave) {
+  const val = (v, kind) => v == null ? '—' : kind === 'price' ? money(v) : kind === 'blocked' ? (v ? 'blocked' : 'open') : v;
+  const cell = (c, k) => c.before[k] === c.after[k] ? val(c.after[k], k) : `${val(c.before[k], k)} → <b>${val(c.after[k], k)}</b>`;
+  out.innerHTML = `<p><b>${p.changes.length}</b> of ${p.selected} selected night${p.selected > 1 ? 's' : ''} will change: ${esc(p.summary)}</p>
+    ${p.warnings.map(w => `<p class="warn">⚠ ${esc(w)}</p>`).join('')}
+    ${p.changes.length ? `<div style="max-height:260px;overflow:auto"><table class="pv"><tr><th>Night</th><th>Price</th><th>Min</th><th>Avail.</th></tr>
+      ${p.changes.map(c => `<tr><td>${fmtDate(c.date)}${c.booked ? ' <span class="sub">(booked)</span>' : ''}</td><td>${cell(c, 'price')}</td><td>${cell(c, 'minStay')}</td><td>${cell(c, 'blocked')}</td></tr>`).join('')}
+      </table></div>
+      <button class="primary" id="rsave" ${canSave ? '' : 'disabled'}>Save ${p.changes.length} night${p.changes.length > 1 ? 's' : ''} to Beds24</button>
+      <div class="sub">Once Beds24 is connected to Airbnb, VRBO and Booking.com, saved changes reach them within minutes.</div>` : ''}`;
+  if ($('#rsave')) $('#rsave').onclick = async () => {
+    $('#rsave').disabled = true; $('#rsave').textContent = 'Saving…';
+    try {
+      const res = await api('/rates/apply', { method: 'POST', body });
+      ratesState.from = ratesState.to = null; ratesState.form = null;
+      banner(`Saved: ${res.summary} on ${res.applied} night${res.applied === 1 ? '' : 's'}.${res.warnings.length ? ' ' + res.warnings.join(' ') : ''}`, res.warnings.length ? '' : 'ok');
+      await ratesView();
+    } catch (err) {
+      if (err.message === 'login') return;
+      out.insertAdjacentHTML('beforeend', `<p class="bad">${esc(err.message)}</p>`);
+      $('#rsave').disabled = false; $('#rsave').textContent = 'Try again';
+    }
+  };
+}
+
 async function act(fn) {
   const btn = $('#sync'); btn.disabled = true; banner('Working…');
   try { await fn(); banner(''); await boot(true); } catch (e) { if (e.message !== 'login') banner(e.message, true); }
   btn.disabled = false;
 }
 
-const routes = { '': dashboard, calendar: calendarView, bookings: bookingsView, settings: settingsView };
+const routes = { '': dashboard, calendar: calendarView, bookings: bookingsView, rates: ratesView, settings: settingsView };
 async function render() {
   const r = location.hash.replace(/^#\/?/, '');
   document.querySelectorAll('nav a').forEach(a => a.classList.toggle('on', a.dataset.r === r));

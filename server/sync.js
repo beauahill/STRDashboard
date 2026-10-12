@@ -9,9 +9,11 @@ export const diffDays = (a, b) => Math.round((Date.parse(b) - Date.parse(a)) / D
 export function normalizeChannel(b) {
   const raw = `${b.channel || ''} ${b.referer || ''}`.toLowerCase();
   if (raw.includes('airbnb')) return 'Airbnb';
+  // Beds24's own booking page is channel "bookingpage": a direct booking, not Booking.com.
+  if (/bookingpage|direct|beds24|manual/.test(raw)) return 'Direct';
   if (raw.includes('booking')) return 'Booking.com';
-  if (/vrbo|homeaway|expedia/.test(raw)) return 'VRBO';
-  if (!b.channel || /direct|beds24|manual/.test(raw)) return 'Direct';
+  if (/vrbo|homeaway/.test(raw)) return 'VRBO';
+  if (!b.channel) return 'Direct';
   return 'Other';
 }
 
@@ -68,7 +70,7 @@ export async function syncBeds24(db, client) {
 
   const last = getSetting(db, 'last_sync');
   const query = last
-    ? { modifiedFrom: new Date(Date.parse(last) - 5 * 60000).toISOString() }
+    ? { modifiedFrom: new Date(Date.parse(last) - 5 * 60000).toISOString().slice(0, 19) } // Beds24 wants YYYY-MM-DDTHH:MM:SS
     : { departureFrom: addDays(iso(Date.now()), -365) };
   const bookings = await client.getAll('/bookings', { ...query, status: ['confirmed', 'new', 'request', 'cancelled', 'black'] });
   upsertBookings(db, bookings);
