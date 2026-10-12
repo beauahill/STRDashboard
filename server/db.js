@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_booking ON messages(booking_id, time);
 CREATE TABLE IF NOT EXISTS saved_replies (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, body TEXT NOT NULL);
+-- Dates that move prices: football weekends, festivals, holidays (inclusive first and last night).
+CREATE TABLE IF NOT EXISTS pricing_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL,
+  pct REAL NOT NULL, min_stay INTEGER, source TEXT
+);
 -- Every change sent to Beds24 from this app, successful or not.
 CREATE TABLE IF NOT EXISTS change_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, room_id INTEGER NOT NULL,

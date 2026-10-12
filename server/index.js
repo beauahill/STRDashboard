@@ -12,6 +12,10 @@ import { readGuestyExport, importGuesty, dedupeImported, removeGuestyImport } fr
 import { syncCalendar, readDays, planChanges, applyChanges, recentChanges } from './rates.js';
 import { SeamClient } from './seam.js';
 import {
+  pricingSettings, savePricingSettings, seedEvents, listEvents, saveEvent, deleteEvent, recommend, pendingChanges,
+  applyNightly, autoPrice, suggestFromHistory,
+} from './pricing.js';
+import {
   syncMessages, unreadCount, conversations, thread, sendMessage, refreshThread, markRead, attachment,
   savedReplies, saveReply, deleteReply,
 } from './messages.js';
@@ -73,6 +77,8 @@ async function runSync() {
     try { await syncCalendar(db, beds24); setSetting(db, 'calendar_error', null); }
     catch (e) { setSetting(db, 'calendar_error', e.message); }
     await runDoorCodes();
+    try { await autoPrice(db, beds24, localToday(doorSettings(db).tz)); setSetting(db, 'pricing_error', null); }
+    catch (e) { setSetting(db, 'pricing_error', e.message); }
     try { await syncMessages(db, beds24); setSetting(db, 'messages_error', null); }
     catch (e) { setSetting(db, 'messages_error', e.message); }
     return r;
@@ -186,6 +192,50 @@ async function api(req, res, url) {
       });
     }
     case 'POST /api/rates/preview': return send(res, 200, planChanges(db, await readJson(req)));
+    case 'GET /api/pricing': {
+      const rooms = db.prepare(`SELECT r.id, r.name, p.name property_name FROM rooms r JOIN properties p ON p.id = r.property_id
+        WHERE r.id > 0 ${prop ? 'AND r.property_id = ?' : ''} ORDER BY p.name, r.name`).all(...(prop ? [prop] : []));
+      const room = rooms.find(r => r.id === Number(q.room)) || rooms[0] || null;
+      if (!room) return send(res, 200, { rooms, room: null });
+      const today = localToday(doorSettings(db).tz);
+      const rec = recommend(db, room.id, { start: q.start, days: Math.min(Number(q.days) || 62, 400), today });
+      const ahead = days => {
+        const r = recommend(db, room.id, { days, today });
+        const p = pendingChanges(r, { includeMinStay: q.minStay !== '0' });
+        const set = p.filter(c => c.before != null);
+        return { nights: p.length, priceChanges: p.filter(c => c.price !== c.before).length,
+          avgNow: set.length ? Math.round(set.reduce((a, c) => a + c.before, 0) / set.length) : null,
+          avgNew: p.length ? Math.round(p.reduce((a, c) => a + c.price, 0) / p.length) : null };
+      };
+      return send(res, 200, {
+        rooms, room, today, settings: rec.settings, needsBase: !!rec.needsBase, nights: rec.nights, pace: rec.pace || {},
+        events: listEvents(db), pending: rec.needsBase ? null : { d30: ahead(30), d90: ahead(90), d365: ahead(365) },
+        canWrite: beds24.connected && beds24.canWriteInventory !== false, connected: beds24.connected,
+        lastAuto: getSetting(db, `pricing_auto_${room.id}`), error: getSetting(db, 'pricing_error'),
+      });
+    }
+    case 'POST /api/pricing/settings': {
+      const b = await readJson(req);
+      return send(res, 200, savePricingSettings(db, Number(b.roomId), b));
+    }
+    case 'POST /api/pricing/suggest': {
+      const { roomId } = await readJson(req);
+      return send(res, 200, suggestFromHistory(db, Number(roomId), localToday(doorSettings(db).tz)));
+    }
+    case 'POST /api/pricing/events': return send(res, 200, { id: saveEvent(db, await readJson(req)) });
+    case 'POST /api/pricing/events/delete': { const { id } = await readJson(req); deleteEvent(db, Number(id)); return send(res, 200, { ok: true }); }
+    case 'POST /api/pricing/apply': {
+      if (!beds24.connected) return send(res, 400, { error: 'Connect Beds24 first.' });
+      if (beds24.canWriteInventory === false) return send(res, 403, { error: 'Your Beds24 invite code can\'t change prices. Create one with write access to Inventory and paste it in Settings.' });
+      const { roomId, days, includeMinStay = true } = await readJson(req);
+      const n = Number(days);
+      if (!(Number.isInteger(n) && n >= 1 && n <= 400)) return send(res, 400, { error: 'Choose how many days ahead to apply (1 to 400).' });
+      // Recalculated here rather than trusting prices sent from the browser.
+      const today = localToday(doorSettings(db).tz);
+      const rec = recommend(db, Number(roomId), { days: n, today });
+      if (rec.needsBase) return send(res, 400, { error: 'Set a base price first.' });
+      return send(res, 200, await applyNightly(db, beds24, Number(roomId), pendingChanges(rec, { includeMinStay: !!includeMinStay }), { today }));
+    }
     case 'GET /api/inbox':
       return send(res, 200, { conversations: conversations(db, { filter: q.filter, q: q.q || '' }), unread: unreadCount(db),
         error: getSetting(db, 'messages_error'), connected: beds24.connected });
@@ -354,6 +404,7 @@ const server = createServer(async (req, res) => {
 if (process.env.STR_DEMO && getSetting(db, 'demo') !== '1' && !beds24.connected) loadDemo(db);
 // Demo data must never sit alongside real bookings (it skews every metric).
 if (beds24.connected) clearDemo(db);
+seedEvents(db, localToday(doorSettings(db).tz));
 
 // No password configured -> only reachable from this machine.
 const host = PASSWORD ? '0.0.0.0' : '127.0.0.1';

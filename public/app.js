@@ -616,13 +616,172 @@ function renderReplyManager(th) {
   });
 }
 
+// ---------- Pricing tool ----------
+const pr = { month: null, room: null, selected: null, open: { settings: false, events: false } };
+const DOWS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'], MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const pctStr = v => `${v > 0 ? '+' : ''}${Math.round(v * 10) / 10}%`;
+
+async function pricingView() {
+  const today = todayISO();
+  pr.month ||= today.slice(0, 8) + '01';
+  const P = await api('/pricing?' + q({ start: pr.month, days: 62, ...(pr.room && { room: pr.room }) }));
+  if (!P.room) { view.innerHTML = `<div class="card empty">${P.connected === false ? 'Connect Beds24 in Settings first.' : 'No rooms found in Beds24 yet.'}</div>`; return; }
+  pr.room = P.room.id;
+  const S = P.settings, byDate = Object.fromEntries(P.nights.map(n => [n.date, n]));
+  const notice = !P.connected ? 'Connect Beds24 in Settings to apply prices.' : !P.canWrite ? 'Your Beds24 invite code can\'t change prices. Create one with write access to Inventory and paste it in Settings.' : '';
+
+  const monthGrid = m => {
+    const first = new Date(m + 'T00:00:00Z'), len = new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth() + 1, 0)).getUTCDate();
+    let cells = Array.from({ length: first.getUTCDay() }, () => '<div class="day pad"></div>').join('');
+    for (let i = 1; i <= len; i++) {
+      const date = m.slice(0, 8) + String(i).padStart(2, '0'), n = byDate[date];
+      if (!n) { cells += `<div class="day past"><div class="n">${i}</div></div>`; continue; }
+      if (n.booked || n.blocked) {
+        cells += `<div class="day ${n.blocked ? 'blocked' : 'booked ' + (n.booking?.channel || '')}"><div class="n">${i}</div><div class="m">${n.blocked ? 'Blocked' : esc((n.booking?.guest || 'Booked').split(' ')[0])}</div></div>`;
+        continue;
+      }
+      const up = n.current != null && n.price > n.current, down = n.current != null && n.price < n.current;
+      cells += `<div class="day pday ${pr.selected === date ? 'sel' : ''} ${n.event ? 'event' : ''}" data-pdate="${date}" title="${esc(n.event || '')}">
+        <div class="n">${i}${n.event ? ' <span class="evdot">●</span>' : ''}${n.gap ? ' <span class="gapb">gap</span>' : ''}</div>
+        <div class="p">${money(n.price)}</div>
+        <div class="m">${n.current == null ? 'not set' : up || down ? `<span class="${up ? 'ok' : 'bad'}">${up ? '▲' : '▼'}</span> now ${money(n.current)}` : '✓ set'}</div></div>`;
+    }
+    return `<div class="month"><h4>${first.toLocaleDateString(undefined, { month: 'long', year: 'numeric', timeZone: 'UTC' })}</h4>
+      <div class="mgrid">${['S', 'M', 'T', 'W', 'T', 'F', 'S'].map(w => `<div class="wd">${w}</div>`).join('')}${cells}</div></div>`;
+  };
+  const sel = pr.selected && byDate[pr.selected];
+  const pendRow = (label, p, days) => p ? `<tr><td>${label}</td><td>${p.nights ? `<b>${p.nights}</b> night${p.nights === 1 ? '' : 's'}` : '<span class="ok">Up to date</span>'}</td>
+    <td class="sub">${p.nights ? `avg ${p.avgNow != null ? money(p.avgNow) : 'not set'} → ${money(p.avgNew)}` : ''}</td>
+    <td>${p.nights ? `<button data-apply="${days}" ${P.canWrite ? '' : 'disabled'}>Apply</button>` : ''}</td></tr>` : '';
+  const paceRows = Object.entries(P.pace).slice(0, 6).map(([m, v]) => `<tr><td>${MONTHS[+m.slice(5) - 1]} ${m.slice(0, 4)}</td><td>${Math.round(v.now * 100)}%</td>
+    <td>${v.lastYear == null ? '<span class="sub">no history</span>' : Math.round(v.lastYear * 100) + '%'}</td>
+    <td>${v.lastYear == null || !S.pacing ? '–' : (() => { const a = Math.max(-S.pacingMax, Math.min(S.pacingMax, (v.now - v.lastYear) * 25)); return Math.abs(a) >= 1 ? pctStr(a) : '0%'; })()}</td></tr>`).join('');
+
+  view.innerHTML = `${notice ? `<div class="notice">${notice}</div>` : ''}${P.error ? `<div class="notice">Auto-pricing problem: ${esc(P.error)}</div>` : ''}
+  ${P.needsBase ? `<div class="card stack" style="max-width:620px;margin-bottom:14px"><h3>Start here</h3>
+    <div>Set a <b>base price</b>: your normal weeknight rate before any adjustments. Everything else builds on it.</div>
+    <div class="sub">Not sure? <b>Suggest from my history</b> works it out from your past stays (including the Guesty import).</div></div>` : ''}
+  <div class="rates">
+    <div class="card">
+      <div class="toolbar">${P.rooms.length > 1 ? `<select id="proom">${P.rooms.map(r => `<option value="${r.id}" ${r.id === P.room.id ? 'selected' : ''}>${esc(r.property_name)} · ${esc(r.name)}</option>`).join('')}</select>` : `<b>${esc(P.room.property_name)}</b>`}
+        <button id="pprev">‹</button><button id="ptoday">Today</button><button id="pnext">›</button>
+        <span class="sub">Recommended price per night. ▲▼ = differs from Beds24 now. Click a night to see why.</span></div>
+      ${P.needsBase ? '<div class="empty">Recommendations appear once a base price is set.</div>' : `<div class="months">${[pr.month, addMonths(pr.month, 1)].map(monthGrid).join('')}</div>`}
+    </div>
+    <div class="stack" style="max-width:none">
+      ${sel ? `<div class="card"><h3>${new Date(sel.date + 'T00:00:00Z').toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric', timeZone: 'UTC' })}</h3>
+        <table class="pv">${sel.factors.map(f => `<tr><td>${esc(f.label)}</td><td style="text-align:right">${f.value != null ? money(f.value) : pctStr(f.pct)}</td></tr>`).join('')}
+        ${sel.notes.map(n => `<tr><td colspan="2" class="sub">${esc(n)}</td></tr>`).join('')}
+        <tr><td><b>Recommended</b></td><td style="text-align:right"><b>${money(sel.price)}</b></td></tr>
+        <tr><td>In Beds24 now</td><td style="text-align:right">${sel.current != null ? money(sel.current) : '—'}</td></tr>
+        <tr><td>Minimum stay</td><td style="text-align:right">${sel.minStay} night${sel.minStay === 1 ? '' : 's'}${sel.currentMinStay != null && sel.currentMinStay !== sel.minStay ? ` <span class="sub">(now ${sel.currentMinStay})</span>` : ''}</td></tr></table></div>` : ''}
+      ${P.pending ? `<div class="card"><h3>Apply to Beds24</h3><table class="pv">
+        ${pendRow('Next 30 days', P.pending.d30, 30)}${pendRow('Next 90 days', P.pending.d90, 90)}${pendRow('Next 12 months', P.pending.d365, 365)}</table>
+        <label class="sub"><input type="checkbox" id="pmin" checked> Also set minimum stays (events and gap nights)</label>
+        <div class="sub">Only unbooked, unblocked nights change. Each save is checked against Beds24 afterwards and logged on the Rates page.</div>
+        <hr><label><input type="checkbox" id="pauto" ${S.auto ? 'checked' : ''}> <b>Auto-pricing</b>: apply recommendations every day</label>
+        <div class="sub">Next ${S.autoHorizon} days, only where the price differs by $${S.autoThreshold}+, never more than ${S.autoMaxChangePct}% in one day.${P.lastAuto ? ` Last run ${fmtDate(P.lastAuto)}.` : ''}</div></div>` : ''}
+      <div class="card"><h3>Booking pace</h3><table class="pv"><tr><th>Month</th><th>Now</th><th>Last year</th><th>Adjust</th></tr>${paceRows}</table>
+        <div class="sub">Compares how full each month is today with how full it was a year ago today. Ahead of last year → prices up; behind → down.</div></div>
+    </div></div>
+
+  <details class="card" id="psettings" style="margin-top:14px" ${pr.open.settings || P.needsBase ? 'open' : ''}><summary><b>Pricing rules</b></summary>
+    <form id="psform" class="stack" style="max-width:none;margin-top:10px">
+      <div class="toolbar" style="margin:0">
+        <label class="sub">Base price ($)<br><input name="base" type="number" min="10" value="${S.base ?? ''}" required style="width:7em"></label>
+        <label class="sub">Never below ($)<br><input name="min" type="number" min="10" value="${S.min ?? ''}" style="width:7em"></label>
+        <label class="sub">Never above ($)<br><input name="max" type="number" min="10" value="${S.max ?? ''}" style="width:7em"></label>
+        <label class="sub">Round to ($)<br><input name="rounding" type="number" min="1" max="50" value="${S.rounding}" style="width:5em"></label>
+        <label class="sub">Usual minimum stay<br><input name="minStay" type="number" min="1" max="30" value="${S.minStay}" style="width:5em"></label></div>
+      <div class="sub">Day of week</div><div class="pctgrid">${DOWS.map((d, i) => `<label>${d}<input name="dow${i}" type="number" step="1" value="${S.dow[i]}">%</label>`).join('')}</div>
+      <div class="sub">Month (season)</div><div class="pctgrid">${MONTHS.map((m, i) => `<label>${m}<input name="season${i}" type="number" step="1" value="${S.season[i]}">%</label>`).join('')}</div>
+      <div class="toolbar" style="margin:0">
+        <label class="sub">Last-minute: up to <input name="lastMinutePct" type="number" max="0" value="${S.lastMinutePct}" style="width:5em">% off, starting <input name="lastMinuteDays" type="number" min="0" value="${S.lastMinuteDays}" style="width:4em"> days out</label>
+        <label class="sub">Far ahead: <input name="farOutPct" type="number" min="0" value="${S.farOutPct}" style="width:4em">% more, beyond <input name="farOutDays" type="number" min="14" value="${S.farOutDays}" style="width:5em"> days</label></div>
+      <div class="toolbar" style="margin:0">
+        <label class="sub"><input name="pacing" type="checkbox" ${S.pacing ? 'checked' : ''}> Adjust for booking pace, up to ±<input name="pacingMax" type="number" min="0" max="30" value="${S.pacingMax}" style="width:4em">%</label>
+        <label class="sub">Gap nights: <input name="gapPct" type="number" max="0" value="${S.gapPct}" style="width:5em">%</label></div>
+      <div class="toolbar" style="margin:0"><span class="sub">Auto-pricing:</span>
+        <label class="sub">next <input name="autoHorizon" type="number" min="7" max="365" value="${S.autoHorizon}" style="width:5em"> days</label>
+        <label class="sub">only if off by $<input name="autoThreshold" type="number" min="0" value="${S.autoThreshold}" style="width:4em">+</label>
+        <label class="sub">max <input name="autoMaxChangePct" type="number" min="5" max="100" value="${S.autoMaxChangePct}" style="width:4em">% change per day</label></div>
+      <div class="toolbar" style="margin:0"><button class="primary">Save rules</button><button type="button" id="psuggest">Suggest from my history</button><span class="sub" id="psuggestout"></span></div>
+    </form></details>
+
+  <details class="card" id="pevents" style="margin-top:14px" ${pr.open.events ? 'open' : ''}><summary><b>Events</b> <span class="sub">(${P.events.length}) · football weekends, festivals, holidays</span></summary>
+    <div style="overflow-x:auto;margin-top:10px"><table><tr><th>Event</th><th>Nights</th><th>Price</th><th>Min stay</th><th>Source</th><th></th></tr>
+    ${P.events.filter(e => e.end_date >= P.today).map(e => `<tr><td>${esc(e.name)}</td><td>${fmtDate(e.start_date)}${e.end_date !== e.start_date ? ' → ' + fmtDate(e.end_date) : ''}</td>
+      <td>${pctStr(e.pct)}</td><td>${e.min_stay || '–'}</td><td class="sub">${/estimated/.test(e.source || '') ? '<span class="warn">⚠ estimated, check the date</span>' : esc(e.source || '')}</td>
+      <td><a href="#" data-eedit="${e.id}">edit</a> · <a href="#" data-edel="${e.id}">delete</a></td></tr>`).join('')}</table></div>
+    <form id="peform" class="toolbar" style="margin-top:10px"><input type="hidden" name="id">
+      <input name="name" placeholder="Event name" size="22"><label class="sub">First night <input type="date" name="start_date"></label>
+      <label class="sub">Last night <input type="date" name="end_date"></label><label class="sub"><input name="pct" type="number" style="width:5em" placeholder="+%"> %</label>
+      <label class="sub">Min stay <input name="min_stay" type="number" min="1" max="30" style="width:4em"></label><button class="primary">Save event</button></form>
+    <div class="sub">Tip: add next season's UW home games when the schedule comes out (usually in March). Game weekends are usually the Friday and Saturday nights.</div></details>`;
+
+  const go = m => { pr.month = m; pricingView(); };
+  $('#pprev').onclick = () => go(addMonths(pr.month, -1)); $('#pnext').onclick = () => go(addMonths(pr.month, 1));
+  $('#ptoday').onclick = () => go(today.slice(0, 8) + '01');
+  if ($('#proom')) $('#proom').onchange = e => { pr.room = +e.target.value; pr.selected = null; pricingView(); };
+  view.querySelectorAll('[data-pdate]').forEach(el => el.onclick = () => { pr.selected = pr.selected === el.dataset.pdate ? null : el.dataset.pdate; pricingView(); });
+  $('#psettings').ontoggle = e => { pr.open.settings = e.target.open; };
+  $('#pevents').ontoggle = e => { pr.open.events = e.target.open; };
+  view.querySelectorAll('[data-apply]').forEach(b => b.onclick = async () => {
+    const days = +b.dataset.apply, p = P.pending[days === 30 ? 'd30' : days === 90 ? 'd90' : 'd365'];
+    if (!confirm(`Send ${p.nights} night${p.nights === 1 ? '' : 's'} of recommended prices to Beds24?`)) return;
+    b.disabled = true; b.textContent = 'Applying…';
+    try {
+      const r = await api('/pricing/apply', { method: 'POST', body: { roomId: pr.room, days, includeMinStay: $('#pmin').checked } });
+      banner(`Applied ${r.applied} night${r.applied === 1 ? '' : 's'} to Beds24.${r.warnings.length ? ' ' + r.warnings.join(' ') : ''}`, r.warnings.length ? '' : 'ok');
+      await pricingView();
+    } catch (err) { if (err.message !== 'login') banner(err.message, true); b.disabled = false; b.textContent = 'Apply'; }
+  });
+  if ($('#pauto')) $('#pauto').onchange = e => {
+    if (e.target.checked && !confirm('Turn on auto-pricing? Every day, the app will send recommended prices for unbooked nights to Beds24, within the limits under Pricing rules.')) { e.target.checked = false; return; }
+    act(() => api('/pricing/settings', { method: 'POST', body: { roomId: pr.room, auto: e.target.checked } }));
+  };
+  const f = $('#psform');
+  f.onsubmit = e => {
+    e.preventDefault();
+    const v = n => f[n].value;
+    act(() => api('/pricing/settings', { method: 'POST', body: {
+      roomId: pr.room, base: v('base'), min: v('min'), max: v('max'), rounding: v('rounding'), minStay: v('minStay'),
+      dow: DOWS.map((_, i) => +v('dow' + i)), season: MONTHS.map((_, i) => +v('season' + i)),
+      lastMinutePct: v('lastMinutePct'), lastMinuteDays: v('lastMinuteDays'), farOutPct: v('farOutPct'), farOutDays: v('farOutDays'),
+      pacing: f.pacing.checked, pacingMax: v('pacingMax'), gapPct: v('gapPct'),
+      autoHorizon: v('autoHorizon'), autoThreshold: v('autoThreshold'), autoMaxChangePct: v('autoMaxChangePct') } }));
+  };
+  $('#psuggest').onclick = async () => {
+    const r = await api('/pricing/suggest', { method: 'POST', body: { roomId: pr.room } });
+    if (!r.enough) { $('#psuggestout').textContent = `Not enough history yet (${r.nights} nights; 20 needed).`; return; }
+    f.base.value = r.base;
+    r.season.forEach((v, i) => { f['season' + i].value = v; }); r.dow.forEach((v, i) => { f['dow' + i].value = v; });
+    $('#psuggestout').textContent = `Filled in from ${r.nights} past nights (average ${money(r.adr)}/night). Review, then Save rules.`;
+  };
+  const ef = $('#peform');
+  ef.onsubmit = e => {
+    e.preventDefault();
+    act(() => api('/pricing/events', { method: 'POST', body: { id: ef.id.value ? +ef.id.value : null, name: ef.name.value,
+      start_date: ef.start_date.value, end_date: ef.end_date.value, pct: ef.pct.value, min_stay: ef.min_stay.value } }));
+  };
+  view.querySelectorAll('[data-eedit]').forEach(a => a.onclick = e => {
+    e.preventDefault(); const ev = P.events.find(x => x.id === +a.dataset.eedit);
+    ef.id.value = ev.id; ef.name.value = ev.name; ef.start_date.value = ev.start_date; ef.end_date.value = ev.end_date;
+    ef.pct.value = ev.pct; ef.min_stay.value = ev.min_stay || ''; ef.name.focus();
+  });
+  view.querySelectorAll('[data-edel]').forEach(a => a.onclick = e => {
+    e.preventDefault(); const ev = P.events.find(x => x.id === +a.dataset.edel);
+    if (confirm(`Delete "${ev.name}"?`)) act(() => api('/pricing/events/delete', { method: 'POST', body: { id: ev.id } }));
+  });
+}
+
 async function act(fn) {
   const btn = $('#sync'); btn.disabled = true; banner('Working…');
   try { await fn(); banner(''); await boot(true); } catch (e) { if (e.message !== 'login') banner(e.message, true); }
   btn.disabled = false;
 }
 
-const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, bookings: bookingsView, rates: ratesView, locks: locksView, settings: settingsView };
+const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, bookings: bookingsView, rates: ratesView, pricing: pricingView, locks: locksView, settings: settingsView };
 async function render() {
   const r = location.hash.replace(/^#\/?/, '');
   clearInterval(pageTimer); pageTimer = null;

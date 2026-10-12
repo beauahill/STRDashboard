@@ -2,6 +2,7 @@
   --airbnb:#e11d48; --booking:#1d4ed8; --vrbo:#0d9488; --direct:#7c3aed; --other:#6b7280; --block:#9ca3af; }
 @media (prefers-color-scheme: dark) { :root { --bg:#0f1216; --card:#181c22; --ink:#e8eaee; --mut:#9aa3b2; --line:#2a303a; } }
 * { box-sizing: border-box; }
+[hidden] { display:none !important; }
 body { margin:0; font:14px/1.45 system-ui,sans-serif; background:var(--bg); color:var(--ink); }
 header { display:flex; align-items:center; gap:16px; padding:10px 20px; background:var(--card); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5; flex-wrap:wrap; }
 nav { display:flex; gap:4px; flex:1; min-width:0; overflow-x:auto; }
@@ -36,8 +37,11 @@ form.stack { display:grid; gap:10px; max-width:460px; } .login { max-width:320px
 
 /* Rates */
 .rates { display:grid; gap:14px; grid-template-columns:minmax(0,1fr) 340px; align-items:start; }
-@media (max-width: 900px) { .rates { grid-template-columns:1fr; } }
-.months { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); }
+@media (max-width: 900px) { .rates { grid-template-columns:minmax(0,1fr); } }
+.rates > .card, .rates > .stack, .rates > .stack > .card { min-width:0; overflow-x:auto; }
+.pv th, .pv td { white-space:normal; }
+@media (max-width: 600px) { .mgrid { gap:2px; } .day { padding:2px 3px; font-size:10px; min-height:56px; } .day .p, .pday .p { font-size:11px; } }
+.months { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr)); }
 .month h4 { margin:0 0 6px; }
 .mgrid { display:grid; grid-template-columns:repeat(7,1fr); gap:3px; }
 .mgrid .wd { font-size:11px; color:var(--mut); text-align:center; padding-bottom:2px; }
@@ -119,3 +123,11 @@ a.kpi-link { text-decoration:none; color:inherit; border-color:#fca5a5; }
   .inbox.has-thread .convs { display:none; } .inbox:not(.has-thread) .tpane { display:none; }
   .inbox .tpane { height:calc(100vh - 140px); } .thead .back { display:inline-block; }
 }
+
+/* Pricing */
+.pday .p { font-size:13px; } .pday.event { background:#fef3c722; }
+.evdot { color:#d97706; font-size:9px; } .gapb { font-size:9px; background:#fde68a; color:#78350f; border-radius:4px; padding:0 3px; }
+.pctgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(78px,1fr)); gap:6px; }
+.pctgrid label { display:flex; flex-direction:column; font-size:11px; color:var(--mut); }
+.pctgrid input { width:100%; }
+details.card > summary { cursor:pointer; }
