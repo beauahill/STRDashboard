@@ -47,6 +47,8 @@ async function dashboard() {
   const max = Math.max(...s.months.map(m => m.revenue), 1);
   const ch = Object.entries(s.thisMonth.byChannel).sort((a, b) => b[1].revenue - a[1].revenue);
   view.innerHTML = `
+    ${s.automationIssues?.length ? `<div class="notice bad-notice"><b>Automated messages need attention</b> <a href="#/automations">Open Automations</a><ul>${s.automationIssues.map(i =>
+      `<li>${esc(i.automation)} to ${esc(i.guest_name || 'a guest')}: ${esc(i.error || i.status)}</li>`).join('')}</ul></div>` : ''}
     ${s.doorAlerts?.length ? `<div class="notice bad-notice"><b>Door codes need attention</b> <a href="#/locks">Open Locks</a><ul>${s.doorAlerts.map(a =>
       `<li>${esc(a.guest || 'Guest')} arriving ${fmtDate(a.arrival)}: ${esc(a.problem)}</li>`).join('')}</ul></div>` : ''}
     <div class="grid">
@@ -805,13 +807,124 @@ async function cleaningView() {
   $('#cregen').onclick = e => { e.preventDefault(); if (confirm('Make a new Turno link? The current link stops working until you update it in Turno.')) act(() => api('/cleaning/regenerate', { method: 'POST' })); };
 }
 
+// ---------- Automations: scheduled guest messages ----------
+const am = { editing: null, previewBooking: null };
+const ANCHOR_LABELS = { booked: 'After a booking is made', cancelled: 'After a booking is cancelled', dates_changed: 'After a booking\'s dates change',
+  arrival: 'Before / on / after check-in day', departure: 'Before / on / after checkout day' };
+const CHANNEL_LIST = ['Airbnb', 'Booking.com', 'VRBO', 'Direct', 'Other'];
+
+async function automationsView() {
+  const A = await api('/automations');
+  const statusTag = st => ({ sent: '<span class="ok">✓ sent</span>', failed: '<span class="bad">✗ failed</span>', waiting: '<span class="warn">⏳ waiting</span>',
+    pending: '<span class="sub">pending</span>', skipped: '<span class="sub">skipped</span>', scheduled: '<span class="sub">scheduled</span>' })[st] || esc(st);
+  const vars = [...A.builtins, ...new Set(A.properties.flatMap(p => Object.keys(p.vars)))];
+  const editor = a => {
+    const timed = ['arrival', 'departure'].includes(a.anchor);
+    return `<form class="stack amform" data-form="${a.id || 'new'}" style="max-width:none;margin-top:10px">
+      <input name="name" value="${esc(a.name || '')}" placeholder="Name, e.g. Wi-Fi details">
+      <div class="toolbar" style="margin:0"><select name="anchor">${Object.entries(ANCHOR_LABELS).map(([k, l]) => `<option value="${k}" ${a.anchor === k ? 'selected' : ''}>${l}</option>`).join('')}</select>
+        <span class="timed" ${timed ? '' : 'hidden'}><input type="number" name="days" min="0" max="30" value="${Math.abs(a.offset_days || 0)}" style="width:4em"> day(s)
+          <select name="dir"><option value="-1" ${(a.offset_days || 0) < 0 ? 'selected' : ''}>before</option><option value="1" ${(a.offset_days || 0) > 0 ? 'selected' : ''}>after</option></select>
+          at <input type="time" name="at_time" value="${a.at_time || '10:00'}"></span>
+        <span class="event" ${timed ? 'hidden' : ''}>wait <input type="number" name="delay" min="0" max="1440" value="${a.delay_minutes ?? 5}" style="width:5em"> minutes</span></div>
+      <div class="toolbar" style="margin:0"><span class="sub">Channels:</span>${CHANNEL_LIST.map(c => `<label class="sub"><input type="checkbox" name="ch" value="${c}" ${!a.channels || a.channels.includes(c) ? 'checked' : ''}> ${c}</label>`).join('')}
+        <label class="sub">Only stays of at least <input type="number" name="min_nights" min="1" max="60" value="${a.min_nights || ''}" style="width:4em"> nights</label></div>
+      <textarea name="body" rows="6" maxlength="5000">${esc(a.body || '')}</textarea>
+      <div class="chips">${vars.map(v => `<button type="button" class="chip" data-var="${v}">{${v}}</button>`).join('')}</div>
+      <div class="toolbar" style="margin:0"><select name="pb"><option value="">Preview with a booking…</option>${A.bookings.map(b => `<option value="${b.id}">${esc(b.guest_name || 'Guest')} · ${fmtDate(b.arrival)}</option>`).join('')}</select>
+        <button class="primary">Save</button><button type="button" data-cancel>Cancel</button></div>
+      <div class="pvbox" hidden></div></form>`;
+  };
+  view.innerHTML = `${!A.connected ? '<div class="notice">Connect Beds24 in Settings; messages are sent through it.</div>' : ''}
+    ${A.error ? `<div class="notice">Automations problem: ${esc(A.error)}</div>` : ''}
+    <div class="notice" style="background:var(--bg);color:var(--ink);border:1px solid var(--line)">Turn these on <b>on switch day</b>, after Beds24 is connected to your channels and has synced.
+      Don't also set up the same messages as Beds24 Auto Actions (guests would get them twice). Switching an automation on never sends a backlog: only messages due from then on.</div>
+    <div class="cols">
+      <div class="card"><h3>Automations</h3>
+        ${A.automations.map(a => `<div class="auto ${a.enabled ? 'on' : ''}">
+          <label class="switch"><input type="checkbox" data-toggle="${a.id}" ${a.enabled ? 'checked' : ''}><span></span></label>
+          <div style="flex:1;min-width:0"><b>${esc(a.name)}</b><div class="sub">${esc(a.when)}${a.channels ? ' · ' + a.channels.join(', ') : ''}${a.min_nights ? ` · ${a.min_nights}+ nights` : ''}</div>
+            ${am.editing === a.id ? editor(a) : `<div class="sub snip2">${esc(a.body.slice(0, 120))}${a.body.length > 120 ? '…' : ''}</div>`}</div>
+          ${am.editing === a.id ? '' : `<div><a href="#" data-edit="${a.id}">edit</a> · <a href="#" data-del="${a.id}">delete</a></div>`}</div>`).join('')}
+        ${am.editing === 'new' ? `<div class="auto"><div style="flex:1">${editor({ anchor: 'arrival', offset_days: -1, at_time: '10:00' })}</div></div>` : '<button id="anew" style="margin-top:8px">+ New automation</button>'}
+      </div>
+      <div class="stack" style="max-width:none">
+        <div class="card" style="overflow-x:auto"><h3>Coming up (14 days)</h3>${A.upcoming.length ? `<table class="pv"><tr><th>When</th><th>Message</th><th>Guest</th><th></th></tr>${A.upcoming.map(u => `<tr>
+          <td>${new Date(u.when).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: A.tz })}</td><td>${esc(u.automation)}${u.missing.length ? `<div class="warn sub">needs {${u.missing.join('}, {')}}</div>` : ''}</td>
+          <td>${esc(u.guest || 'Guest')}</td><td><a href="#" data-pv="${encodeURIComponent(u.preview)}">preview</a> · <a href="#" data-skip="${u.automationId}:${u.bookingId}">skip</a></td></tr>`).join('')}</table>`
+          : '<div class="empty">Nothing scheduled. Switch on an automation to see what it will send.</div>'}</div>
+        <div class="card" style="overflow-x:auto"><h3>Recently</h3>${A.history.length ? `<table class="pv"><tr><th>Time</th><th>Message</th><th>Guest</th><th>Status</th></tr>${A.history.slice(0, 25).map(h => `<tr>
+          <td>${h.updated_at ? new Date(h.updated_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: A.tz }) : ''}</td><td>${esc(h.automation)}</td>
+          <td>${esc(h.guest_name || '')}</td><td>${statusTag(h.status)}${h.error ? `<div class="sub">${esc(h.error)}</div>` : ''}</td></tr>`).join('')}</table>` : '<div class="empty">No automated messages yet.</div>'}</div>
+        <div class="card"><h3>Property details</h3><div class="sub">Your own fill-ins for messages, e.g. <code>{wifi_password}</code>. Built in: ${A.builtins.map(b => `<code>{${b}}</code>`).join(' ')}</div>
+          ${A.properties.map(p => `<form class="stack pvars" data-prop="${p.id}" style="max-width:none;margin-top:8px"><b>${esc(p.name)}</b>
+            ${[...Object.entries(p.vars), ['', ''], ['', '']].map(([k, v]) => `<div class="toolbar" style="margin:0"><input name="k" value="${esc(k)}" placeholder="name, e.g. wifi_name" style="width:12em"><input name="v" value="${esc(v)}" placeholder="value" style="flex:1;min-width:120px"></div>`).join('')}
+            <button class="primary">Save details</button></form>`).join('')}</div>
+      </div></div>`;
+
+  view.querySelectorAll('[data-toggle]').forEach(t => t.onchange = () => {
+    const a = A.automations.find(x => x.id === +t.dataset.toggle);
+    if (t.checked && !confirm(`Turn on "${a.name}"? It will send ${a.when} to every matching guest from now on.`)) { t.checked = false; return; }
+    act(() => api('/automations/enable', { method: 'POST', body: { id: a.id, enabled: t.checked } }));
+  });
+  view.querySelectorAll('[data-edit]').forEach(l => l.onclick = e => { e.preventDefault(); am.editing = +l.dataset.edit; automationsView(); });
+  view.querySelectorAll('[data-del]').forEach(l => l.onclick = e => {
+    e.preventDefault(); const a = A.automations.find(x => x.id === +l.dataset.del);
+    if (confirm(`Delete "${a.name}"?`)) act(() => api('/automations/delete', { method: 'POST', body: { id: a.id } }));
+  });
+  if ($('#anew')) $('#anew').onclick = () => { am.editing = 'new'; automationsView(); };
+  view.querySelectorAll('[data-skip]').forEach(l => l.onclick = e => {
+    e.preventDefault(); const [automationId, bookingId] = l.dataset.skip.split(':').map(Number);
+    if (confirm('Skip this message for this guest?')) act(() => api('/automations/skip', { method: 'POST', body: { automationId, bookingId } }));
+  });
+  view.querySelectorAll('[data-pv]').forEach(l => l.onclick = e => { e.preventDefault(); alert(decodeURIComponent(l.dataset.pv)); });
+  view.querySelectorAll('form.amform').forEach(f => {
+    const sync = () => { const timed = ['arrival', 'departure'].includes(f.anchor.value); f.querySelector('.timed').hidden = !timed; f.querySelector('.event').hidden = timed; };
+    f.anchor.onchange = sync;
+    // Insert fill-ins where the cursor last was (clicking a chip takes focus away from the message box).
+    let pos = f.body.value.length;
+    const remember = () => { pos = f.body.selectionStart; };
+    f.body.onkeyup = remember; f.body.onclick = remember; f.body.onblur = remember;
+    f.querySelectorAll('[data-var]').forEach(b => b.onclick = () => {
+      const t = f.body, v = `{${b.dataset.var}}`;
+      t.setRangeText(v, pos, pos, 'end'); pos += v.length; t.focus();
+    });
+    f.querySelector('[data-cancel]').onclick = () => { am.editing = null; automationsView(); };
+    const preview = async () => {
+      const box = f.querySelector('.pvbox');
+      if (!f.pb.value) { box.hidden = true; return; }
+      const r = await api('/automations/preview', { method: 'POST', body: { body: f.body.value, bookingId: +f.pb.value } });
+      box.hidden = false;
+      box.innerHTML = `<div class="bubble" style="white-space:pre-wrap">${esc(r.text)}</div>${r.missing.length ? `<div class="warn sub">Not filled in yet: {${r.missing.join('}, {')}}. A message waits until these are available.</div>` : ''}`;
+    };
+    f.pb.onchange = preview;
+    f.onsubmit = e => {
+      e.preventDefault();
+      const timed = ['arrival', 'departure'].includes(f.anchor.value);
+      const id = f.dataset.form === 'new' ? null : +f.dataset.form;
+      act(async () => {
+        await api('/automations', { method: 'POST', body: { id, name: f.name.value, anchor: f.anchor.value, body: f.body.value,
+          offset_days: timed ? Number(f.days.value) * Number(f.dir.value) : 0, at_time: timed ? f.at_time.value : null, delay_minutes: timed ? 0 : Number(f.delay.value),
+          channels: [...f.querySelectorAll('[name=ch]:checked')].map(x => x.value), min_nights: f.min_nights.value } });
+        am.editing = null;
+      });
+    };
+  });
+  view.querySelectorAll('form.pvars').forEach(f => f.onsubmit = e => {
+    e.preventDefault();
+    const ks = [...f.querySelectorAll('[name=k]')], vs = [...f.querySelectorAll('[name=v]')];
+    const vars = Object.fromEntries(ks.map((k, i) => [k.value.trim(), vs[i].value]).filter(([k, v]) => k || v.trim()));
+    act(() => api('/property-vars', { method: 'POST', body: { propertyId: +f.dataset.prop, vars } }));
+  });
+}
+
 async function act(fn) {
   const btn = $('#sync'); btn.disabled = true; banner('Working…');
   try { await fn(); banner(''); await boot(true); } catch (e) { if (e.message !== 'login') banner(e.message, true); }
   btn.disabled = false;
 }
 
-const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, bookings: bookingsView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
+const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, automations: automationsView, bookings: bookingsView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
 async function render() {
   const r = location.hash.replace(/^#\/?/, '');
   clearInterval(pageTimer); pageTimer = null;

@@ -450,3 +450,35 @@ test('Turno feed URL works without login, only with the right secret, and stops 
   await fetch(s.url('/api/cleaning/regenerate'), { method: 'POST', headers: { cookie: sid } });
   assert.equal((await fetch(s.url(feedPath))).status, 404, 'old link stops working');
 });
+
+test('Automations: a due message for a newly synced booking is sent through Beds24 once', async t => {
+  const beds = await fakeBeds24Messages();
+  t.after(() => beds.srv.close());
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), BEDS24_BASE: `http://127.0.0.1:${beds.srv.address().port}` });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+
+  const list = (await call('/api/automations')).json;
+  assert.equal(list.automations.length, 8);
+  assert.equal((await call('/api/automations', { name: 'x', body: '', anchor: 'booked' })).status, 400);
+  // Due 4 days before arrival, i.e. already in the past for this booking: it's sent only because the booking
+  // first appears after the automation was switched on (a last-minute booking).
+  const { json: { id } } = await call('/api/automations', { name: 'Hello', anchor: 'arrival', offset_days: -4, at_time: '00:00', body: 'Hi {guest_first_name}, see you soon at {property_name}!' });
+  await call('/api/automations/enable', { id, enabled: true });
+  assert.equal((await call('/api/connect', { inviteCode: 'abc' })).status, 200);   // first sync runs automations
+
+  const posts = beds.calls.filter(c => c.method === 'POST');
+  assert.deepEqual(posts.map(p => p.body), [[{ bookingId: 10, message: 'Hi Jordan, see you soon at Laramie Retreat!' }]]);
+  await call('/api/automations/run', {});
+  assert.equal(beds.calls.filter(c => c.method === 'POST').length, 1, 'not sent twice');
+  const after = (await call('/api/automations')).json;
+  assert.equal(after.history[0].status, 'sent');
+
+  const pv = await call('/api/automations/preview', { body: 'Code {door_code}, Wi-Fi {wifi_password}', bookingId: 10 });
+  assert.deepEqual(pv.json.missing, ['door_code', 'wifi_password']);
+  assert.equal((await call('/api/property-vars', { propertyId: 500, vars: { wifi_password: 'pokes' } })).status, 200);
+  assert.deepEqual((await call('/api/automations/preview', { body: 'Wi-Fi {wifi_password}', bookingId: 10 })).json, { text: 'Wi-Fi pokes', missing: [] });
+});

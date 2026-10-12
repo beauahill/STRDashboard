@@ -39,6 +39,14 @@ Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB
   thread, attachments, and saved replies with fill-ins (`{guest_first_name}`, `{door_code}`,
   `{check_in_time}`, …). Unread count in the menu and on the Dashboard. Checks for new messages every
   minute while the inbox is open (at most twice a minute against Beds24), otherwise with each 15-minute sync.
+- **Automations**: scheduled guest messages sent through Beds24: after a booking is made, cancelled or its
+  dates change, or N days before/after check-in or checkout at a set time; filtered by channel and minimum
+  nights. Eight editable starters (confirmation, check-in instructions with door code, check-in day,
+  mid-stay, checkout reminder, review request, cancellation, dates changed), all off by default. Safety:
+  switching one on never sends a backlog; last-minute bookings still get messages due before they existed;
+  messages with an unfilled `{fill-in}` wait (and fail after a deadline) instead of sending; each message goes
+  once per booking. Upcoming sends with preview and skip, history, and per-property custom fill-ins
+  (Wi-Fi, address, ...). Runs every 5 minutes; problems show on the Dashboard.
 - **Bookings**: searchable/filterable list.
 - Per-property filter on every view.
 - **Rates**: two-month calendar of nightly price, minimum stay, blocked and booked nights. Select a range
@@ -72,14 +80,14 @@ Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB
 
 `server/beds24.js` API client + token handling · `server/sync.js` mapping and sync ·
 `server/rates.js` prices, minimum stays and blocks · `server/doors.js` + `server/seam.js` door codes ·
-`server/messages.js` inbox and saved replies · `server/pricing.js` pricing tool · `server/cleaning.js` Turno feed and turnovers ·
+`server/messages.js` inbox and saved replies · `server/pricing.js` pricing tool · `server/cleaning.js` Turno feed and turnovers · `server/automations.js` automated messages ·
 `server/guesty.js` Guesty import ·
 `server/stats.js` metrics · `server/demo.js` sample data · `public/` UI · `test/` (`npm test`).
 
 ## Known gaps / next steps
 
 - No creating or editing bookings from the app yet (Beds24 `POST /bookings`).
-- Automated messages, listing editor, AI assistant and analytics, owner statements.
+- Listing editor, AI assistant and analytics, owner statements.
 - Beds24 request/response fields are checked against Beds24's published OpenAPI spec, but the app hasn't yet run
   against a Beds24 account with live channel connections.
 - Beds24 API credits are rate limited; the incremental sync keeps usage low.

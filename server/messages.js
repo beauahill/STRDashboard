@@ -55,18 +55,48 @@ export function thread(db, bookingId) {
   const messages = db.prepare('SELECT * FROM messages WHERE booking_id = ? ORDER BY time, id').all(bookingId);
   if (!booking && !messages.length) throw Object.assign(new Error('Conversation not found.'), { status: 404 });
   const door = doorCodesFor(db, [bookingId])[bookingId] || null;
+  const vars = templateVars(db, booking, door);
+  return { booking: booking && { ...booking, phone: undefined, email: undefined }, messages, door, vars, canReply: !!booking && booking.id > 0 && booking.source === 'beds24' };
+}
+
+const fmtLong = d => d ? new Date(d + 'T00:00:00Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', timeZone: 'UTC' }) : '';
+export const fmtTime = t => { const [h, m] = t.split(':').map(Number); return `${h % 12 || 12}${m ? ':' + String(m).padStart(2, '0') : ''} ${h < 12 ? 'AM' : 'PM'}`; };
+export const BUILTIN_VARS = ['guest_first_name', 'guest_name', 'check_in_date', 'check_out_date', 'check_in_time', 'check_out_time', 'nights', 'guests', 'property_name', 'door_code'];
+
+/** Fill-ins for a booking: stay details, door code, and the owner's property details (Wi-Fi, address...). */
+export function templateVars(db, booking, door = undefined) {
+  if (door === undefined && booking) door = doorCodesFor(db, [booking.id])[booking.id] || null;
   const ds = doorSettings(db);
-  const fmt = d => d ? new Date(d + 'T00:00:00Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', timeZone: 'UTC' }) : '';
-  const time = t => { const [h, m] = t.split(':').map(Number); return `${h % 12 || 12}${m ? ':' + String(m).padStart(2, '0') : ''} ${h < 12 ? 'AM' : 'PM'}`; };
-  const vars = {
+  return {
+    ...(booking?.property_id ? propertyVars(db, booking.property_id) : {}),
     guest_first_name: (booking?.guest_name || '').split(' ')[0] || 'there',
     guest_name: booking?.guest_name || '',
-    check_in_date: fmt(booking?.arrival), check_out_date: fmt(booking?.departure),
-    check_in_time: time(ds.checkin), check_out_time: time(ds.checkout),
-    nights: booking?.nights ?? '', property_name: booking?.property_name || '',
+    check_in_date: fmtLong(booking?.arrival), check_out_date: fmtLong(booking?.departure),
+    check_in_time: fmtTime(ds.checkin), check_out_time: fmtTime(ds.checkout),
+    nights: booking?.nights ?? '', guests: booking ? (booking.adults || 0) + (booking.children || 0) || '' : '',
+    property_name: booking?.property_name || (booking?.property_id ? db.prepare('SELECT name FROM properties WHERE id = ?').get(booking.property_id)?.name : '') || '',
     door_code: door?.code || '',
   };
-  return { booking: booking && { ...booking, phone: undefined, email: undefined }, messages, door, vars, canReply: !!booking && booking.id > 0 && booking.source === 'beds24' };
+}
+
+/** Owner-defined fill-ins per property, e.g. {wifi_password}. */
+export function propertyVars(db, propertyId) {
+  try { return JSON.parse(getSetting(db, `vars_${propertyId}`) || '{}'); } catch { return {}; }
+}
+
+export function savePropertyVars(db, propertyId, vars) {
+  if (!db.prepare('SELECT 1 FROM properties WHERE id = ?').get(propertyId)) throw userError('Unknown property.');
+  const clean = {};
+  for (const [k, v] of Object.entries(vars || {})) {
+    const key = String(k).trim().toLowerCase();
+    if (!key && !String(v || '').trim()) continue;
+    if (!/^[a-z][a-z0-9_]{1,30}$/.test(key)) throw userError(`"${k}" isn't a valid name: use lowercase letters, numbers and _ (e.g. wifi_password).`);
+    if (BUILTIN_VARS.includes(key)) throw userError(`{${key}} is filled in automatically; choose another name.`);
+    if (String(v).length > 1000) throw userError(`{${key}} is too long (1000 characters max).`);
+    clean[key] = String(v ?? '').trim();
+  }
+  setSetting(db, `vars_${propertyId}`, JSON.stringify(clean));
+  return clean;
 }
 
 /** Send a reply through Beds24, then re-read the thread so the stored copy has Beds24's id and time. */

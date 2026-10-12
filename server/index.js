@@ -13,12 +13,16 @@ import { syncCalendar, readDays, planChanges, applyChanges, recentChanges } from
 import { SeamClient } from './seam.js';
 import { feedToken, icsForRoom, turnovers } from './cleaning.js';
 import {
+  seedAutomations, listAutomations, saveAutomation, setEnabled, deleteAutomation, describe, runAutomations, upcoming,
+  skipSend, history, previewFor,
+} from './automations.js';
+import {
   pricingSettings, savePricingSettings, seedEvents, listEvents, saveEvent, deleteEvent, recommend, pendingChanges,
   applyNightly, autoPrice, suggestFromHistory,
 } from './pricing.js';
 import {
   syncMessages, unreadCount, conversations, thread, sendMessage, refreshThread, markRead, attachment,
-  savedReplies, saveReply, deleteReply,
+  savedReplies, saveReply, deleteReply, propertyVars, savePropertyVars, BUILTIN_VARS,
 } from './messages.js';
 import {
   doorSettings, saveDoorSettings, refreshLocks, assignLock, reconcileDoorCodes, doorCodesFor, setBookingCode,
@@ -82,10 +86,21 @@ async function runSync() {
     catch (e) { setSetting(db, 'pricing_error', e.message); }
     try { await syncMessages(db, beds24); setSetting(db, 'messages_error', null); }
     catch (e) { setSetting(db, 'messages_error', e.message); }
+    await runAutomationsSafely();
     return r;
   }
   catch (e) { setSetting(db, 'last_sync_error', e.message); throw e; }
   finally { syncing = false; }
+}
+
+// Automated messages: checked every 5 minutes (and after each sync). Never throws.
+let automationsRunning = false;
+async function runAutomationsSafely() {
+  if (automationsRunning || !beds24.connected) return null;
+  automationsRunning = true;
+  try { const r = await runAutomations(db, beds24); setSetting(db, 'automations_error', null); return r; }
+  catch (e) { setSetting(db, 'automations_error', e.message); return { error: e.message }; }
+  finally { automationsRunning = false; }
 }
 
 // Door codes run after every sync and after lock changes. Failures are recorded, never thrown, so a
@@ -246,6 +261,23 @@ async function api(req, res, url) {
         feeds: rooms.map(r => ({ ...r, url: `${origin}/cal/${token}/${r.id}.ics` })) });
     }
     case 'POST /api/cleaning/regenerate': feedToken(db, true); return send(res, 200, { ok: true });
+    case 'GET /api/automations': {
+      const props = db.prepare('SELECT id, name FROM properties ORDER BY name').all();
+      const soon = db.prepare(`SELECT id, guest_name, arrival, departure, channel FROM bookings WHERE source = 'beds24' AND id > 0
+        AND status IN ('confirmed','new') AND departure >= ? ORDER BY arrival LIMIT 30`).all(iso(Date.now()));
+      return send(res, 200, {
+        automations: listAutomations(db).map(a => ({ ...a, when: describe(a) })), upcoming: upcoming(db), history: history(db),
+        properties: props.map(p => ({ ...p, vars: propertyVars(db, p.id) })), builtins: BUILTIN_VARS, bookings: soon,
+        connected: beds24.connected, error: getSetting(db, 'automations_error'), tz: doorSettings(db).tz,
+      });
+    }
+    case 'POST /api/automations': return send(res, 200, { id: saveAutomation(db, await readJson(req)) });
+    case 'POST /api/automations/enable': { const { id, enabled } = await readJson(req); setEnabled(db, Number(id), !!enabled); return send(res, 200, { ok: true }); }
+    case 'POST /api/automations/delete': { const { id } = await readJson(req); deleteAutomation(db, Number(id)); return send(res, 200, { ok: true }); }
+    case 'POST /api/automations/skip': { const { automationId, bookingId } = await readJson(req); skipSend(db, Number(automationId), Number(bookingId)); return send(res, 200, { ok: true }); }
+    case 'POST /api/automations/preview': { const { body, bookingId } = await readJson(req); return send(res, 200, previewFor(db, body, Number(bookingId))); }
+    case 'POST /api/automations/run': return send(res, 200, (await runAutomationsSafely()) || { skipped: true });
+    case 'POST /api/property-vars': { const { propertyId, vars } = await readJson(req); return send(res, 200, savePropertyVars(db, Number(propertyId), vars)); }
     case 'GET /api/inbox':
       return send(res, 200, { conversations: conversations(db, { filter: q.filter, q: q.q || '' }), unread: unreadCount(db),
         error: getSetting(db, 'messages_error'), connected: beds24.connected });
@@ -355,6 +387,11 @@ async function api(req, res, url) {
         ...p, rooms: db.prepare('SELECT * FROM rooms WHERE property_id=? ORDER BY name').all(p.id) })));
     case 'GET /api/summary': {
       const sum = summary(db, iso(Date.now()), prop);
+      // Automated messages that failed recently, or are stuck waiting past their send time, need a look.
+      sum.automationIssues = db.prepare(`SELECT s.status, s.error, a.name automation, b.guest_name FROM automation_sends s
+        JOIN automations a ON a.id = s.automation_id LEFT JOIN bookings b ON b.id = s.booking_id
+        WHERE (s.status = 'failed' AND s.updated_at >= ?) OR (s.status = 'waiting' AND s.scheduled_at <= ?)
+        ORDER BY s.updated_at DESC LIMIT 5`).all(new Date(Date.now() - 7 * 86400e3).toISOString(), new Date(Date.now() - 3600e3).toISOString());
       const ds = doorSettings(db);
       if (ds.auto) {
         const soon = [...sum.arrivals, ...sum.inHouse, ...sum.upcoming];
@@ -423,6 +460,7 @@ if (process.env.STR_DEMO && getSetting(db, 'demo') !== '1' && !beds24.connected)
 // Demo data must never sit alongside real bookings (it skews every metric).
 if (beds24.connected) clearDemo(db);
 seedEvents(db, localToday(doorSettings(db).tz));
+seedAutomations(db);
 
 // No password configured -> only reachable from this machine.
 const host = PASSWORD ? '0.0.0.0' : '127.0.0.1';
@@ -432,6 +470,7 @@ server.listen(PORT, host, () => {
 });
 
 setInterval(() => runSync().catch(e => console.error('sync failed:', e.message)), 15 * 60000).unref();
+setInterval(() => runAutomationsSafely(), 5 * 60000).unref();
 
 // Railway sends SIGTERM on redeploy; close cleanly so SQLite isn't mid-write.
 for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => {
