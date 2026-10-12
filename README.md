@@ -17,21 +17,26 @@ APP_PASSWORD=secret npm start   # password-protects the UI and API
 ```
 
 Then open **Settings → Connect**. In Beds24 go to *Settings → Apps & Integrations → API → Invite codes*, create a
-code with read access to properties, inventory and bookings (including guest personal and financial details),
-and paste it in. Invite codes are single-use, so connect from the copy you'll actually keep using.
+code with access to properties and bookings (including guest personal and financial details) and write access
+to inventory (for the Rates page), and paste it in. Invite codes are single-use, so connect from the copy you'll actually keep using.
 The app exchanges the code for a refresh token, does a full sync (1 year back), then syncs incrementally every
 15 minutes (or press **Sync**).
 
 Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB_PATH` (`data/str.db`, or
 `$RAILWAY_VOLUME_MOUNT_PATH/str.db` on Railway). Failed logins are rate-limited (10 per IP per 15 minutes).
 
-## What's in it (read-only so far)
+## What's in it
 
 - **Dashboard**: arrivals / departures / in-house / same-day turnovers, occupancy, revenue, ADR, RevPAR,
   12-month revenue chart (with forecast), revenue by channel, pending requests.
 - **Calendar**: 30-day multi-property timeline, colored by channel, blocks and requests marked.
 - **Bookings**: searchable/filterable list.
 - Per-property filter on every view.
+- **Rates**: two-month calendar of nightly price, minimum stay, blocked and booked nights. Select a range
+  (optionally only some weekdays), set a price / minimum stay / block or open, preview exactly which nights
+  change, then save to Beds24. Every save is re-read from Beds24 to confirm it stuck, and logged under
+  "Recent changes". Edits Beds24's **Price 1** daily rate. Needs an invite code with **write** access to
+  Inventory; with a read-only code the page shows prices but can't save.
 - **Guesty history import** (Settings): upload a Guesty Lite reservations CSV, preview it, then import.
   Re-importing updates rather than duplicates, and once Beds24 has a stay, its copy replaces the Guesty one.
   Guest addresses, IDs and door key codes in the file are never stored.
@@ -39,13 +44,13 @@ Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB
 ## Layout
 
 `server/beds24.js` API client + token handling · `server/sync.js` mapping and sync ·
+`server/rates.js` prices, minimum stays and blocks · `server/guesty.js` Guesty import ·
 `server/stats.js` metrics · `server/demo.js` sample data · `public/` UI · `test/` (`npm test`).
 
 ## Known gaps / next steps
 
-- Read-only: no creating/editing bookings, rates or availability (Beds24 `POST /bookings`, `/inventory/rooms/calendar`).
+- No creating or editing bookings from the app yet (Beds24 `POST /bookings`).
 - Guest messaging, cleaning/turnover task assignment, owner statements, expenses/P&L.
-- Channel mapping in `normalizeChannel` is based on Beds24's `channel`/`referer` fields; check against your real
-  data (VRBO often arrives as `expedia`/`homeaway`).
-- Not yet tested against a live Beds24 account (only a mocked API); expect small field-name fixes on first real sync.
+- Beds24 request/response fields are checked against Beds24's published OpenAPI spec, but the app hasn't yet run
+  against a Beds24 account with live channel connections.
 - Beds24 API credits are rate limited; the incremental sync keeps usage low.

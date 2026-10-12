@@ -42,13 +42,15 @@ when you merge their pull request on GitHub, so nothing goes live until you choo
 ## 6. Connect Beds24
 
 1. Open your Railway address and sign in with `APP_PASSWORD`.
-2. In Beds24: **Settings → Apps & Integrations → API → generate an invite code**. Give it read access to
-   **properties, inventory and bookings, including guest personal details and financial details**
-   (otherwise guest names and booking totals come back blank).
+2. In Beds24: **Settings → Apps & Integrations → API → generate an invite code**. Give it access to
+   **properties and bookings, including guest personal details and financial details** (otherwise guest
+   names and booking totals come back blank), and **write access to inventory** so you can change prices,
+   minimum stays and blocked dates from the app's Rates page.
 3. In the app: **Settings → paste the invite code → Connect & sync**.
 
-The invite code is single-use: the app exchanges it for a long-lived key stored on the volume. If you
-ever disconnect, generate a fresh code.
+The invite code is single-use: the app exchanges it for a long-lived key stored on the volume. To change
+permissions later (e.g. add write access), generate a fresh code and paste it in Settings; it replaces
+the old one. Settings shows the permissions currently granted.
 
 ## Troubleshooting
 

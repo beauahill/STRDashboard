@@ -171,3 +171,90 @@ test('Guesty import endpoints: preview, import, bad file, remove', async t => {
   const big = await call('/api/import/guesty/preview', { csv: 'x'.repeat(31e6) });
   assert.equal(big.status, 413);
 });
+
+/** Fake Beds24 with a calendar that remembers writes, and configurable token scopes. */
+function fakeBeds24WithCalendar(scopes) {
+  const cal = new Map(), posts = [];
+  const iso = t => new Date(t).toISOString().slice(0, 10);
+  const srv = createServer(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    let raw = ''; for await (const c of req) raw += c;
+    const send = (status, b) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(b)); };
+    if (u.pathname.endsWith('/authentication/setup')) return send(200, { token: 't', refreshToken: 'r', expiresIn: 86400 });
+    if (u.pathname.endsWith('/authentication/details')) return send(200, { validToken: true, token: { scopes } });
+    if (u.pathname.endsWith('/properties')) return send(200, { data: [{ id: 500, name: 'Laramie Retreat', roomTypes: [{ id: 600, name: 'Whole house', qty: 1 }] }], pages: {} });
+    if (u.pathname.endsWith('/bookings')) return send(200, { data: [], pages: {} });
+    if (u.pathname.endsWith('/inventory/rooms/calendar') && req.method === 'GET') {
+      const calendar = [];
+      for (let t = Date.parse(u.searchParams.get('startDate')); t <= Date.parse(u.searchParams.get('endDate')); t += 86400000) {
+        calendar.push({ from: iso(t), to: iso(t), price1: 180, minStay: 2, numAvail: 1, override: 'none', ...cal.get(iso(t)) });
+      }
+      return send(200, { data: [{ roomId: 600, propertyId: 500, calendar }], pages: {} });
+    }
+    if (u.pathname.endsWith('/inventory/rooms/calendar') && req.method === 'POST') {
+      if (!scopes.some(s => /^(write|all):inventory$/.test(s))) return send(403, { success: false, error: 'missing write:inventory scope' });
+      const body = JSON.parse(raw); posts.push(body);
+      for (const r of body[0].calendar) for (let t = Date.parse(r.from); t <= Date.parse(r.to); t += 86400000) {
+        const { from, to, ...v } = r; cal.set(iso(t), { ...cal.get(iso(t)), ...v });
+      }
+      return send(201, [{ success: true, modified: {} }]);
+    }
+    send(404, { error: 'nope' });
+  });
+  return new Promise(ok => srv.listen(0, '127.0.0.1', () => ok({ srv, posts })));
+}
+
+async function connectedApp(t, scopes) {
+  const beds = await fakeBeds24WithCalendar(scopes);
+  t.after(() => beds.srv.close());
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), BEDS24_BASE: `http://127.0.0.1:${beds.srv.address().port}` });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (path, body) => fetch(s.url(path), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+  assert.equal((await call('/api/connect', { inviteCode: 'abc' })).status, 200);
+  return { call, posts: beds.posts };
+}
+
+test('Rates: prices load from Beds24, preview, save, and show in the change log', async t => {
+  const { call, posts } = await connectedApp(t, ['all:bookings', 'all:inventory', 'read:properties']);
+  const today = new Date().toISOString().slice(0, 10);
+  const d = n => new Date(Date.parse(today) + n * 86400000).toISOString().slice(0, 10);
+
+  const rates = (await call(`/api/rates?start=${today}&days=10`)).json;
+  assert.equal(rates.canWrite, true);
+  assert.equal(rates.room.id, 600);
+  assert.equal(rates.days[0].price, 180);
+  assert.equal((await call('/api/status')).json.scopes.length, 3);
+
+  const body = { roomId: 600, from: d(2), to: d(4), price: 225, minStay: 3 };
+  const prev = await call('/api/rates/preview', body);
+  assert.equal(prev.status, 200);
+  assert.equal(prev.json.changes.length, 3);
+  assert.equal(posts.length, 0, 'preview never writes');
+
+  const saved = await call('/api/rates/apply', body);
+  assert.equal(saved.status, 200, JSON.stringify(saved.json));
+  assert.equal(saved.json.applied, 3);
+  assert.deepEqual(saved.json.warnings, []);
+  assert.deepEqual(posts[0], [{ roomId: 600, calendar: [{ from: d(2), to: d(4), price1: 225, minStay: 3 }] }]);
+
+  const after = (await call(`/api/rates?start=${d(2)}&days=3`)).json;
+  assert.deepEqual(after.days.map(x => [x.price, x.minStay]), [[225, 3], [225, 3], [225, 3]]);
+  assert.equal(after.changes[0].summary, 'Price $225 · Min stay 3 nights');
+
+  assert.equal((await call('/api/rates/preview', { ...body, from: d(-3) })).status, 400);
+});
+
+test('Rates: a read-only invite code can view but not save', async t => {
+  const { call, posts } = await connectedApp(t, ['read:bookings', 'read:inventory']);
+  const today = new Date().toISOString().slice(0, 10);
+  const rates = (await call(`/api/rates?start=${today}&days=5`)).json;
+  assert.equal(rates.canWrite, false);
+  assert.equal(rates.days[0].price, 180, 'prices still visible');
+  const res = await call('/api/rates/apply', { roomId: 600, from: today, to: today, price: 250 });
+  assert.equal(res.status, 403);
+  assert.match(res.json.error, /write access to Inventory/);
+  assert.equal(posts.length, 0);
+});
