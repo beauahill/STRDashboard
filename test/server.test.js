@@ -482,3 +482,57 @@ test('Automations: a due message for a newly synced booking is sent through Beds
   assert.equal((await call('/api/property-vars', { propertyId: 500, vars: { wifi_password: 'pokes' } })).status, 200);
   assert.deepEqual((await call('/api/automations/preview', { body: 'Wi-Fi {wifi_password}', bookingId: 10 })).json, { text: 'Wi-Fi pokes', missing: [] });
 });
+
+function fakeBeds24Listing(scopes) {
+  const prop = { id: 500, name: 'Laramie Retreat', propertyType: 'house', texts: [{ language: 'en', headline: 'Cozy house', propertyDescription: 'Three bedrooms.' }],
+    roomTypes: [{ id: 600, name: 'Whole house', qty: 1, maxPeople: 6, texts: [{ language: 'en', roomDescription: 'Sleeps 6' }] }] };
+  const posts = [];
+  const srv = createServer(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    let raw = ''; for await (const c of req) raw += c;
+    const send = (st, b) => { res.writeHead(st, { 'content-type': 'application/json' }); res.end(JSON.stringify(b)); };
+    if (u.pathname.endsWith('/authentication/setup')) return send(200, { token: 't', refreshToken: 'r', expiresIn: 86400 });
+    if (u.pathname.endsWith('/authentication/details')) return send(200, { token: { scopes } });
+    if (u.pathname.endsWith('/properties') && req.method === 'GET') return send(200, { data: [prop], pages: {} });
+    if (u.pathname.endsWith('/properties') && req.method === 'POST') {
+      if (!scopes.some(s => /^(write|all):properties$/.test(s))) return send(403, { success: false, error: 'missing write:properties scope' });
+      const [b] = JSON.parse(raw); posts.push(b);
+      for (const t of b.texts || []) Object.assign(prop.texts[0], t);
+      if (b.name) prop.name = b.name;
+      return send(201, [{ success: true }]);
+    }
+    if (u.pathname.endsWith('/bookings') || u.pathname.endsWith('/calendar') || u.pathname.endsWith('/messages')) return send(200, { data: [], pages: {} });
+    send(404, { error: 'nope' });
+  });
+  return new Promise(ok => srv.listen(0, '127.0.0.1', () => ok({ srv, posts })));
+}
+
+for (const [label, scopes, canSave] of [['write access', ['all:properties', 'all:bookings'], true], ['read-only', ['read:properties', 'read:bookings'], false]]) {
+  test(`Listing editor over HTTP (${label})`, async t => {
+    const beds = await fakeBeds24Listing(scopes);
+    t.after(() => beds.srv.close());
+    const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), BEDS24_BASE: `http://127.0.0.1:${beds.srv.address().port}` });
+    t.after(() => s.child.kill());
+    await s.ready;
+    const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+    const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+      .then(async r => ({ status: r.status, json: await r.json() }));
+    await call('/api/connect', { inviteCode: 'abc' });
+    const L = (await call('/api/listing')).json;
+    assert.equal(L.canWrite, canSave);
+    assert.equal(L.listing.propertyText.headline, 'Cozy house');
+    const edited = { ...L.listing, propertyText: { ...L.listing.propertyText, headline: 'Walk to War Memorial Stadium' } };
+    const pv = await call('/api/listing/preview', { propertyId: 500, edited });
+    assert.deepEqual(pv.json.changes.map(c => [c.label, c.after]), [['Headline', 'Walk to War Memorial Stadium']]);
+    const saved = await call('/api/listing/save', { propertyId: 500, edited });
+    if (canSave) {
+      assert.equal(saved.status, 200, JSON.stringify(saved.json));
+      assert.deepEqual(beds.posts, [{ id: 500, texts: [{ language: 'en', headline: 'Walk to War Memorial Stadium' }] }]);
+      assert.equal((await call('/api/listing')).json.log[0].ok, 1);
+    } else {
+      assert.equal(saved.status, 403);
+      assert.match(saved.json.error, /write access to Properties/);
+      assert.equal(beds.posts.length, 0);
+    }
+  });
+}

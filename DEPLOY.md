@@ -45,7 +45,8 @@ when you merge their pull request on GitHub, so nothing goes live until you choo
 2. In Beds24: **Settings → Apps & Integrations → API → generate an invite code**. Give it access to
    **properties**, **bookings with write access, including guest personal details and financial details**
    (otherwise guest names and totals come back blank, and door codes can't be saved on bookings), and
-   **write access to inventory** (to change prices, minimum stays and blocked dates on the Rates page).
+   **write access to inventory** (to change prices, minimum stays and blocked dates on the Rates page), and
+   **write access to properties** (to edit listing content on the Listing page).
 3. In the app: **Settings → paste the invite code → Connect & sync**.
 
 The invite code is single-use: the app exchanges it for a long-lived key stored on the volume. To change

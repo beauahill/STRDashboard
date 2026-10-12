@@ -918,13 +918,83 @@ async function automationsView() {
   });
 }
 
+// ---------- Listing editor ----------
+const ls = { property: null, edited: null };
+const fieldInput = (f, val, name) => {
+  const v = val ?? '';
+  if (f.type === 'select') return `<select name="${name}"><option value=""></option>${f.options.map(o => `<option ${o === v ? 'selected' : ''}>${o}</option>`).join('')}</select>`;
+  if (f.type === 'textarea') return `<textarea name="${name}" rows="${f.max > 5000 ? 8 : 4}" maxlength="${f.max}" data-count="${f.max}" data-ai="${f.key}">${esc(v)}</textarea>`;
+  if (f.type === 'int' || f.type === 'money') return `<input name="${name}" type="number" step="${f.type === 'money' ? '0.01' : '1'}" min="${f.min}" max="${f.max}" value="${v}" style="width:9em">`;
+  return `<input name="${name}" value="${esc(v)}" maxlength="${f.max || 200}" data-count="${f.max || 200}" ${f.key === 'headline' || f.key === 'contentHeadline' ? `data-ai="${f.key}"` : ''}>`;
+};
+const fieldRow = (f, val, name) => `<label class="lfield"><span class="sub">${esc(f.label)}${f.hint ? ` <span class="hint">· ${esc(f.hint)}</span>` : ''}</span>${fieldInput(f, val, name)}<span class="sub count"></span></label>`;
+
+async function listingView() {
+  const L = await api('/listing?' + new URLSearchParams(ls.property ? { property: ls.property } : {}));
+  if (!L.connected) { view.innerHTML = '<div class="card empty">Connect Beds24 in Settings to edit your listing.</div>'; return; }
+  if (!L.listing) { view.innerHTML = '<div class="card empty">No properties found in Beds24 yet.</div>'; return; }
+  ls.property = L.listing.id;
+  const x = L.listing, F = L.fields;
+  view.innerHTML = `${L.canWrite === false ? '<div class="notice">Your Beds24 invite code can read but not change listing content. Create one with write access to <b>Properties</b> and paste it in Settings.</div>' : ''}
+    <div class="notice" style="background:var(--bg);color:var(--ink);border:1px solid var(--line)">This edits your listing content in Beds24. Whether a change reaches Airbnb, VRBO or Booking.com depends on each channel's content settings in Beds24 (Booking.com content is usually managed in its own extranet). Photos and amenities are managed in Beds24.</div>
+    <form id="lform">
+      <div class="card stack" style="max-width:none"><div class="toolbar" style="margin:0">
+        ${L.properties.length > 1 ? `<select id="lprop">${L.properties.map(p => `<option value="${p.id}" ${p.id === x.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>` : `<h3 style="margin:0">${esc(x.property.name)}</h3>`}
+        <span class="sub" style="margin-left:auto">Changes are previewed before anything is sent.</span></div>
+        <h3>Listing text</h3>${F.propertyText.map(f => fieldRow(f, x.propertyText[f.key], `pt.${f.key}`)).join('')}
+        <h3>Property details</h3><div class="lgrid">${F.property.map(f => fieldRow(f, x.property[f.key], `p.${f.key}`)).join('')}</div></div>
+      ${x.rooms.map((r, i) => `<div class="card stack" style="max-width:none;margin-top:14px"><h3>Room: ${esc(r.name || r.id)}</h3>
+        <div class="lgrid">${F.room.map(f => fieldRow(f, r[f.key], `r${i}.${f.key}`)).join('')}</div>
+        ${F.roomText.map(f => fieldRow(f, r.text[f.key], `rt${i}.${f.key}`)).join('')}</div>`).join('')}
+      <div class="card stack" style="max-width:none;margin-top:14px;position:sticky;bottom:0;z-index:3">
+        <div class="toolbar" style="margin:0"><button type="button" id="lpreview" class="primary">Preview changes</button><span class="sub" id="lstatus"></span></div>
+        <div id="ldiff"></div></div>
+    </form>
+    <div class="card" style="margin-top:14px"><h3>Recent listing changes</h3>${L.log.length ? `<ul class="list">${L.log.map(c => `<li><span>${c.ok ? '<span class="ok">✓</span>' : '<span class="bad">✗</span>'} ${esc(c.summary)}${c.error ? `<div class="sub">${esc(c.error)}</div>` : ''}</span><span class="sub">${new Date(c.at).toLocaleString()}</span></li>`).join('')}</ul>` : '<div class="empty">No listing changes from this app yet.</div>'}</div>`;
+
+  const form = $('#lform');
+  const counters = () => form.querySelectorAll('[data-count]').forEach(el => {
+    const c = el.parentElement.querySelector('.count'), n = el.value.length, max = +el.dataset.count;
+    c.textContent = n > max * 0.6 || el.dataset.ai === 'headline' ? `${n}/${max}` : '';
+    c.classList.toggle('warn', el.dataset.ai === 'headline' && n > 50);
+  });
+  form.oninput = counters; counters();
+  if ($('#lprop')) $('#lprop').onchange = e => { ls.property = +e.target.value; listingView(); };
+  const collect = () => {
+    const val = n => form.elements[n]?.value;
+    return { lang: x.lang,
+      property: Object.fromEntries(F.property.map(f => [f.key, val(`p.${f.key}`)])),
+      propertyText: Object.fromEntries(F.propertyText.map(f => [f.key, val(`pt.${f.key}`)])),
+      rooms: x.rooms.map((r, i) => ({ id: r.id, ...Object.fromEntries(F.room.map(f => [f.key, val(`r${i}.${f.key}`)])),
+        text: Object.fromEntries(F.roomText.map(f => [f.key, val(`rt${i}.${f.key}`)])) })) };
+  };
+  ls.collect = collect;
+  const short = v => { const t = v == null || v === '' ? '(empty)' : String(v); return esc(t.length > 140 ? t.slice(0, 140) + '…' : t); };
+  $('#lpreview').onclick = async () => {
+    try {
+      const edited = collect();
+      const { changes } = await api('/listing/preview', { method: 'POST', body: { propertyId: x.id, edited } });
+      $('#ldiff').innerHTML = changes.length ? `<table class="pv"><tr><th>Where</th><th>Field</th><th>Now</th><th>New</th></tr>${changes.map(c => `<tr><td>${esc(c.where)}</td><td>${esc(c.label)}</td><td class="sub">${short(c.before)}</td><td>${short(c.after)}</td></tr>`).join('')}</table>
+        <button type="button" class="primary" id="lsave" ${L.canWrite === false ? 'disabled' : ''}>Save ${changes.length} change${changes.length === 1 ? '' : 's'} to Beds24</button>` : '<span class="sub">No changes yet.</span>';
+      if ($('#lsave')) $('#lsave').onclick = async () => {
+        $('#lsave').disabled = true; $('#lsave').textContent = 'Saving…';
+        try {
+          const r = await api('/listing/save', { method: 'POST', body: { propertyId: x.id, edited } });
+          banner(`Saved ${r.applied} change${r.applied === 1 ? '' : 's'} to Beds24.${r.warnings.length ? ' ' + r.warnings.join(' ') : ''}`, r.warnings.length ? '' : 'ok');
+          await listingView();
+        } catch (err) { if (err.message !== 'login') { $('#lstatus').innerHTML = `<span class="bad">${esc(err.message)}</span>`; $('#lsave').disabled = false; $('#lsave').textContent = 'Try again'; } }
+      };
+    } catch (err) { if (err.message !== 'login') $('#ldiff').innerHTML = `<span class="bad">${esc(err.message)}</span>`; }
+  };
+}
+
 async function act(fn) {
   const btn = $('#sync'); btn.disabled = true; banner('Working…');
   try { await fn(); banner(''); await boot(true); } catch (e) { if (e.message !== 'login') banner(e.message, true); }
   btn.disabled = false;
 }
 
-const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, automations: automationsView, bookings: bookingsView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
+const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, automations: automationsView, bookings: bookingsView, listing: listingView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
 async function render() {
   const r = location.hash.replace(/^#\/?/, '');
   clearInterval(pageTimer); pageTimer = null;

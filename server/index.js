@@ -12,6 +12,7 @@ import { readGuestyExport, importGuesty, dedupeImported, removeGuestyImport } fr
 import { syncCalendar, readDays, planChanges, applyChanges, recentChanges } from './rates.js';
 import { SeamClient } from './seam.js';
 import { feedToken, icsForRoom, turnovers } from './cleaning.js';
+import { FIELDS as LISTING_FIELDS, fetchListing, diffListing, saveListing, listingLog } from './listing.js';
 import {
   seedAutomations, listAutomations, saveAutomation, setEnabled, deleteAutomation, describe, runAutomations, upcoming,
   skipSend, history, previewFor,
@@ -278,6 +279,24 @@ async function api(req, res, url) {
     case 'POST /api/automations/preview': { const { body, bookingId } = await readJson(req); return send(res, 200, previewFor(db, body, Number(bookingId))); }
     case 'POST /api/automations/run': return send(res, 200, (await runAutomationsSafely()) || { skipped: true });
     case 'POST /api/property-vars': { const { propertyId, vars } = await readJson(req); return send(res, 200, savePropertyVars(db, Number(propertyId), vars)); }
+    case 'GET /api/listing': {
+      const props = db.prepare('SELECT id, name FROM properties WHERE id > 0 ORDER BY name').all();
+      const pid = props.some(p => p.id === Number(q.property)) ? Number(q.property) : props[0]?.id;
+      const base = { properties: props, fields: LISTING_FIELDS, connected: beds24.connected, canWrite: beds24.canWriteProperties };
+      if (!pid || !beds24.connected) return send(res, 200, base);
+      return send(res, 200, { ...base, listing: await fetchListing(beds24, pid, q.lang || 'en'), log: listingLog(db, pid) });
+    }
+    case 'POST /api/listing/preview': {
+      const { propertyId, edited } = await readJson(req);
+      const current = await fetchListing(beds24, Number(propertyId), edited?.lang || 'en');
+      return send(res, 200, { changes: diffListing(current, edited || {}).changes });
+    }
+    case 'POST /api/listing/save': {
+      if (!beds24.connected) return send(res, 400, { error: 'Connect Beds24 first.' });
+      if (beds24.canWriteProperties === false) return send(res, 403, { error: 'Your Beds24 invite code can\'t change listing content. Create one with write access to Properties and paste it in Settings.' });
+      const { propertyId, edited } = await readJson(req, 2e6);
+      return send(res, 200, await saveListing(db, beds24, Number(propertyId), edited || {}));
+    }
     case 'GET /api/inbox':
       return send(res, 200, { conversations: conversations(db, { filter: q.filter, q: q.q || '' }), unread: unreadCount(db),
         error: getSetting(db, 'messages_error'), connected: beds24.connected });

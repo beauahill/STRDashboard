@@ -76,6 +76,10 @@ CREATE TABLE IF NOT EXISTS automation_sends (
 );
 -- Last known dates per booking, to notice date changes.
 CREATE TABLE IF NOT EXISTS booking_snapshots (booking_id INTEGER PRIMARY KEY, arrival TEXT, departure TEXT);
+-- Listing content saves (property and room texts/details) sent to Beds24.
+CREATE TABLE IF NOT EXISTS listing_changes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, property_id INTEGER NOT NULL, summary TEXT NOT NULL, ok INTEGER NOT NULL, error TEXT
+);
 -- Every change sent to Beds24 from this app, successful or not.
 CREATE TABLE IF NOT EXISTS change_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, room_id INTEGER NOT NULL,
