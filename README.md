@@ -46,6 +46,17 @@ Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB
   change, then save to Beds24. Every save is re-read from Beds24 to confirm it stuck, and logged under
   "Recent changes". Edits Beds24's **Price 1** daily rate. Needs an invite code with **write** access to
   Inventory; with a read-only code the page shows prices but can't save.
+- **Pricing** (Laramie pricing tool): a recommended price and minimum stay for every unbooked night, from a
+  base price × day-of-week × month × local events (UW football weekends, Jubilee Days, Frontier Days overflow,
+  commencement, move-in, holidays; editable, with sources and "estimated" flags) × booking pace versus the
+  same point last year × last-minute discount / far-ahead premium × gap-night discount, kept within a floor
+  and ceiling. Click any night for the breakdown. "Suggest from my history" derives the base and seasonal
+  adjustments from past stays. Apply 30/90/365 days to Beds24 (unbooked nights only, verified and logged),
+  or switch on daily auto-pricing (capped change per day, off by default).
+- **Cleaning**: upcoming turnovers with the time available to clean (same-day turnovers highlighted) and next
+  guests' head count, plus a private per-room calendar link for **Turno** (Turno has no public API; it
+  subscribes to iCal). The feed contains real stays only, so blocks never create cleanings, and no guest
+  names or contact details. The link can be regenerated.
 - **Locks** (Yale via [Seam](https://www.seam.co)): every confirmed Beds24 stay gets a door code on each lock
   of its property (last 4 digits of the guest's phone; last 5/6 if that clashes, random if no phone), active
   from check-in to checkout time in the property's time zone. Codes follow date changes and cancellations,
@@ -61,14 +72,14 @@ Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB
 
 `server/beds24.js` API client + token handling · `server/sync.js` mapping and sync ·
 `server/rates.js` prices, minimum stays and blocks · `server/doors.js` + `server/seam.js` door codes ·
-`server/messages.js` inbox and saved replies ·
+`server/messages.js` inbox and saved replies · `server/pricing.js` pricing tool · `server/cleaning.js` Turno feed and turnovers ·
 `server/guesty.js` Guesty import ·
 `server/stats.js` metrics · `server/demo.js` sample data · `public/` UI · `test/` (`npm test`).
 
 ## Known gaps / next steps
 
 - No creating or editing bookings from the app yet (Beds24 `POST /bookings`).
-- Cleaning/turnover task view (Turno), owner statements, expenses/P&L, Laramie pricing tool.
+- Automated messages, listing editor, AI assistant and analytics, owner statements.
 - Beds24 request/response fields are checked against Beds24's published OpenAPI spec, but the app hasn't yet run
   against a Beds24 account with live channel connections.
 - Beds24 API credits are rate limited; the incremental sync keeps usage low.

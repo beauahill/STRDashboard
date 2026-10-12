@@ -24,8 +24,9 @@ Nothing here touches your live listings yet.
       VRBO's connection checks this content and lists anything missing as "Fix Content Errors".
 - [ ] **Prices and minimum stays for the next 12 months.** This is the most important step: if prices
       aren't set when you connect, Beds24 sends its base rate and **overwrites your current Airbnb/VRBO
-      prices**. Match what's live on Airbnb today. The dashboard's **Rates** page is the quickest way:
-      select a range, tick Fri/Sat for weekend prices, preview, save. Then check a few nights in Beds24.
+      prices**. Match what's live on Airbnb today. Quickest: on the dashboard's **Pricing** page, click
+      "Suggest from my history", review the rules, then **Apply → Next 12 months**. (Or set ranges by hand on
+      the **Rates** page.) Then check a few nights in Beds24.
 - [ ] **Blocked dates** from your screenshots (Rates page → select the nights → "block").
 - [ ] **Auto Actions** (Settings → Guest Management → Auto Actions): recreate each Guesty auto-message with
       the same timing (on booking, X days before check-in, etc.). Write them as **plain text**, because
@@ -73,10 +74,10 @@ Do one channel at a time, and check each before moving on.
       Beds24 by hand (or via iCal) **before** the calendar goes live, or those dates could be sold twice.
 
 **Turno**
-- [ ] In Turno, replace the property's Guesty calendar with the **Beds24 iCal link** (in Beds24, under the
-      property's settings). Turno creates a cleaning at each check-out.
-- [ ] iCal can't tell bookings from blocked dates, so blocks may create stray cleanings. Check Turno's
-      schedule for the next month and delete any that aren't real.
+- [ ] In Turno, replace the property's Guesty calendar link with the dashboard's **Cleaning → Turno link**.
+      Turno creates a cleaning at each checkout. Unlike Beds24's own calendar link, this one lists real stays
+      only, so blocked dates don't create stray cleanings.
+- [ ] Check Turno's schedule for the next month matches the dashboard's Cleaning page.
 
 **Door codes**
 - [ ] Turn off Guesty's lock automation / check-in message, so guests don't get two different codes.
