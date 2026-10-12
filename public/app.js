@@ -67,27 +67,103 @@ async function dashboard() {
     </div>`;
 }
 
+// ---------- Calendar: month grid, bookings as bars across the nights they occupy ----------
+const calState = { month: null, room: '', selected: null };
+const addDaysISO = (d, n) => new Date(Date.parse(d) + n * 86400000).toISOString().slice(0, 10);
+const daysBetween = (a, b) => Math.round((Date.parse(b) - Date.parse(a)) / 86400000);
+
 async function calendarView() {
-  const days = 30;
-  const start = new Date().toISOString().slice(0, 10);
-  const c = await api('/calendar?' + q({ start, days }));
-  const col = d => Math.round((Date.parse(d) - Date.parse(c.start)) / 86400000);
-  const dayCells = Array.from({ length: days }, (_, i) => {
-    const d = new Date(Date.parse(c.start) + i * 86400000);
-    return `<div class="cal-day ${i === 0 ? 'today' : ''}">${d.getUTCDate()}</div>`;
-  }).join('');
-  const track = `grid-template-columns:repeat(${days},minmax(34px,1fr))`;
-  const rows = c.rooms.map(r => {
-    const bars = c.bookings.filter(b => b.room_id === r.id).map(b => {
-      const from = Math.max(col(b.arrival), 0), to = Math.min(col(b.departure), days);
-      // Bars start/end at mid-day so same-day turnovers don't overlap.
-      const left = ((from + (col(b.arrival) >= 0 ? 0.5 : 0)) / days) * 100, right = ((to - (col(b.departure) <= days ? 0.5 : 0)) / days) * 100;
-      const cls = b.status === 'block' ? 'block' : b.status === 'request' ? `request ${b.channel}` : b.channel;
-      return `<div class="cal-bar ${cls}" style="left:${left}%;width:${right - left}%" title="${esc(b.guest_name)} · ${b.arrival} → ${b.departure} · ${money(b.price)}">${esc(b.status === 'block' ? 'Blocked' : b.guest_name)}</div>`;
+  const today = todayISO();
+  calState.month ||= today.slice(0, 8) + '01';
+  const first = calState.month, next = addMonths(first, 1);
+  const gridStart = addDaysISO(first, -new Date(first + 'T00:00:00Z').getUTCDay());
+  const weeks = Math.ceil(daysBetween(gridStart, next) / 7);
+  const c = await api('/calendar?' + q({ start: gridStart, days: weeks * 7 }));
+  const rooms = c.rooms;
+  if (calState.room && !rooms.some(r => String(r.id) === calState.room)) calState.room = '';
+  const inView = calState.room ? rooms.filter(r => String(r.id) === calState.room) : rooms;
+  const roomIds = new Set(inView.map(r => r.id));
+  const bookings = c.bookings.filter(b => roomIds.has(b.room_id));
+  const doors = c.doors || {};
+  // Prices only make sense when one room is in view.
+  const priceRoom = inView.length === 1 ? inView[0].id : null;
+  const night = Object.fromEntries(c.nights.filter(n => n.room_id === priceRoom).map(n => [n.date, n]));
+
+  // Month summary for the rooms in view: booked nights and revenue inside this month (prorated).
+  let booked = 0, revenue = 0;
+  for (const b of bookings) {
+    if (!['confirmed', 'new'].includes(b.status)) continue;
+    const n = daysBetween(b.arrival > first ? b.arrival : first, b.departure < next ? b.departure : next);
+    if (n > 0) { booked += n; revenue += b.nights ? b.price * n / b.nights : 0; }
+  }
+  const available = daysBetween(first, next) * inView.length;
+
+  let html = '';
+  for (let w = 0; w < weeks; w++) {
+    const ws = addDaysISO(gridStart, w * 7), we = addDaysISO(ws, 7);
+    // Bars run from the middle of the arrival day to the middle of the departure day, so a same-day
+    // turnover sits in one lane without overlapping. Positions are in half-days within the week.
+    const segs = bookings.filter(b => b.arrival < we && b.departure > ws).map(b => {
+      const startsHere = b.arrival >= ws;
+      const s0 = startsHere ? daysBetween(ws, b.arrival) * 2 + 1 : 0;
+      const e0 = b.departure < we ? daysBetween(ws, b.departure) * 2 + 1 : 14;
+      return { b, s0, e0, startsHere, endsHere: b.departure <= we };
+    }).sort((x, y) => x.s0 - y.s0 || y.e0 - x.e0);
+    const laneEnd = [];
+    for (const sg of segs) {
+      let lane = laneEnd.findIndex(e => e <= sg.s0);
+      if (lane === -1) { lane = laneEnd.length; laneEnd.push(0); }
+      laneEnd[lane] = sg.e0; sg.lane = lane;
+    }
+    const cells = Array.from({ length: 7 }, (_, i) => {
+      const d = addDaysISO(ws, i), n = night[d];
+      const cls = ['mday', d.slice(0, 7) !== first.slice(0, 7) && 'other', d === today && 'today', d < today && 'past', n?.blocked && 'blocked'].filter(Boolean).join(' ');
+      return `<div class="${cls}"><span class="dn">${+d.slice(8)}</span>${n?.price != null ? `<span class="pr">${money(n.price)}</span>` : ''}</div>`;
     }).join('');
-    return `<div class="cal-row"><div class="cal-name">${esc(r.name)}<small>${esc(r.property_name)}</small></div><div class="cal-track" style="${track}">${bars}</div></div>`;
-  }).join('');
-  view.innerHTML = `<div class="cal"><div class="cal-row"><div class="cal-name">Next ${days} days</div><div class="cal-track" style="${track}">${dayCells}</div></div>${rows || '<div class="card empty">No rooms yet</div>'}</div>`;
+    const bars = segs.map(({ b, s0, e0, startsHere, endsHere, lane }) => {
+      const cls = ['mbar', b.status === 'block' ? 'block' : b.channel, b.status === 'request' && 'request', !startsHere && 'cont-l', !endsHere && 'cont-r',
+        calState.selected === b.id && 'sel'].filter(Boolean).join(' ');
+      const roomTag = inView.length > 1 ? ` · ${rooms.find(r => r.id === b.room_id)?.name || ''}` : '';
+      const label = (b.status === 'block' ? 'Blocked' : `${b.guest_name || 'Guest'}${doors[b.id] ? ' · 🔑' + doors[b.id].code : ''}`) + roomTag;
+      return `<div class="${cls}" data-bid="${b.id}" style="left:${s0 / 14 * 100}%;width:${(e0 - s0) / 14 * 100}%;top:${26 + lane * 24}px"
+        title="${esc(`${b.status === 'block' ? 'Blocked' : b.guest_name || 'Guest'} · ${fmtDate(b.arrival)} → ${fmtDate(b.departure)}`)}">${esc(label)}</div>`;
+    }).join('');
+    html += `<div class="mweek" style="min-height:${Math.max(84, 34 + laneEnd.length * 24)}px"><div class="mdays">${cells}</div>${bars}</div>`;
+  }
+
+  const sel = bookings.find(b => b.id === calState.selected);
+  view.innerHTML = `<div class="card">
+    <div class="toolbar">
+      <button id="cprev" aria-label="Previous month">‹</button><button id="ctoday">Today</button><button id="cnext" aria-label="Next month">›</button>
+      <h3 style="margin:0 8px;font-size:16px;text-transform:none;letter-spacing:0;color:var(--ink)">${new Date(first + 'T00:00:00Z').toLocaleDateString(undefined, { month: 'long', year: 'numeric', timeZone: 'UTC' })}</h3>
+      <input type="month" id="cmonth" value="${first.slice(0, 7)}" aria-label="Jump to month">
+      ${rooms.length > 1 ? `<select id="croom"><option value="">All rooms</option>${rooms.map(r => `<option value="${r.id}" ${String(r.id) === calState.room ? 'selected' : ''}>${esc(r.property_name)} · ${esc(r.name)}</option>`).join('')}</select>` : ''}
+      <span class="sub" style="margin-left:auto">${booked} of ${available} nights booked (${available ? Math.round(booked / available * 100) : 0}%) · ${money(revenue)}</span>
+    </div>
+    <div class="mcal"><div class="mhead">${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(d => `<div>${d}</div>`).join('')}</div>${html}</div>
+    <div class="legend sub">${['Airbnb', 'Booking.com', 'VRBO', 'Direct', 'Other'].map(ch => `<span><i class="sw ${ch}"></i>${ch}</span>`).join('')}
+      <span><i class="sw block"></i>Blocked</span><span><i class="sw request"></i>Request</span>${Object.keys(night).length ? '<span>Nightly prices from the Rates page</span>' : ''}</div>
+  </div>
+  ${sel ? `<div class="card" style="margin-top:14px" id="cdetail">
+    <div class="toolbar" style="margin:0"><h3 style="margin:0">${sel.status === 'block' ? 'Blocked dates' : esc(sel.guest_name || 'Guest')}</h3>${sel.status === 'block' ? '' : tag(sel.channel) + ' ' + tag(sel.status)}<button id="cclose" style="margin-left:auto">Close</button></div>
+    <ul class="list"><li><span>Stay</span><span>${fmtDate(sel.arrival)} → ${fmtDate(sel.departure)} · ${sel.nights} night${sel.nights === 1 ? '' : 's'}</span></li>
+      ${sel.status === 'block' ? '' : `<li><span>Guests</span><span>${sel.adults || 0} adult${sel.adults === 1 ? '' : 's'}${sel.children ? `, ${sel.children} child${sel.children === 1 ? '' : 'ren'}` : ''}</span></li>
+      <li><span>Total</span><span>${money(sel.price)}${sel.nights ? ` <span class="sub">(${money(sel.price / sel.nights)}/night)</span>` : ''}</span></li>`}
+      ${doors[sel.id] ? `<li><span>Door code</span><span><b class="code">${esc(doors[sel.id].code)}</b> ${doors[sel.id].perLock.map(l => `<span class="chip ${l.state}" title="${esc(l.label)}">${esc(l.lock)}</span>`).join(' ')}</span></li>` : ''}
+      ${rooms.length > 1 ? `<li><span>Room</span><span>${esc(rooms.find(r => r.id === sel.room_id)?.name || '')}</span></li>` : ''}
+      ${sel.source === 'guesty' ? '<li><span>Source</span><span class="sub">Imported from Guesty history</span></li>' : ''}</ul></div>` : ''}`;
+
+  const go = m => { calState.month = m; calState.selected = null; calendarView(); };
+  $('#cprev').onclick = () => go(addMonths(first, -1));
+  $('#cnext').onclick = () => go(addMonths(first, 1));
+  $('#ctoday').onclick = () => go(today.slice(0, 8) + '01');
+  $('#cmonth').onchange = e => e.target.value && go(e.target.value + '-01');
+  if ($('#croom')) $('#croom').onchange = e => { calState.room = e.target.value; calendarView(); };
+  view.querySelectorAll('.mbar[data-bid]').forEach(el => el.onclick = () => {
+    calState.selected = calState.selected === +el.dataset.bid ? null : +el.dataset.bid;
+    calendarView().then(() => $('#cdetail')?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }));
+  });
+  if ($('#cclose')) $('#cclose').onclick = () => { calState.selected = null; calendarView(); };
 }
 
 async function bookingsView() {

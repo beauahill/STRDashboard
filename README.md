@@ -29,7 +29,10 @@ Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB
 
 - **Dashboard**: arrivals / departures / in-house / same-day turnovers, occupancy, revenue, ADR, RevPAR,
   12-month revenue chart (with forecast), revenue by channel, pending requests.
-- **Calendar**: 30-day multi-property timeline, colored by channel, blocks and requests marked.
+- **Calendar**: month grid with previous/next and jump-to-month (back through imported history, forward as far
+  as bookings go). Stays are bars from check-in to checkout, coloured by channel; click one for guest count,
+  total, nightly rate and door code. Shows nightly prices and blocked nights for a single room, and the
+  month's booked nights, occupancy and revenue.
 - **Bookings**: searchable/filterable list.
 - Per-property filter on every view.
 - **Rates**: two-month calendar of nightly price, minimum stay, blocked and booked nights. Select a range

@@ -265,8 +265,11 @@ async function api(req, res, url) {
       }
       return send(res, 200, sum);
     }
-    case 'GET /api/calendar':
-      return send(res, 200, calendar(db, q.start || iso(Date.now()), Math.min(Number(q.days) || 30, 120), prop));
+    case 'GET /api/calendar': {
+      const cal = calendar(db, q.start || iso(Date.now()), Math.min(Number(q.days) || 42, 120), prop);
+      if (doorSettings(db).auto) cal.doors = doorCodesFor(db, cal.bookings.map(b => b.id));
+      return send(res, 200, cal);
+    }
     case 'GET /api/bookings': {
       const where = [], args = [];
       if (prop) { where.push('b.property_id = ?'); args.push(prop); }

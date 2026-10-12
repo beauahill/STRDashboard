@@ -75,8 +75,15 @@ export function calendar(db, start, days, propertyId = null) {
   const rooms = db.prepare(
     `SELECT r.id, r.name, r.property_id, p.name property_name FROM rooms r JOIN properties p ON p.id=r.property_id
      ${propertyId ? 'WHERE r.property_id = ?' : ''} ORDER BY p.name, r.name`).all(...(propertyId ? [propertyId] : []));
+  const ids = rooms.map(r => r.id);
+  if (!ids.length) return { start, days, end, rooms, bookings: [], nights: [] };
+  const inRooms = `room_id IN (${ids.map(() => '?').join(',')})`;
   const bookings = db.prepare(
-    `SELECT id, room_id, status, channel, arrival, departure, nights, guest_name, price FROM bookings
-     WHERE status IN ('confirmed','new','request','block') AND arrival < ? AND departure > ?`).all(end, start);
-  return { start, days, end, rooms, bookings };
+    `SELECT id, room_id, status, channel, arrival, departure, nights, guest_name, adults, children, price, source FROM bookings
+     WHERE status IN ('confirmed','new','request','block') AND arrival < ? AND departure > ? AND ${inRooms}
+     ORDER BY arrival`).all(end, start, ...ids);
+  // Nightly price and blocked nights from the Beds24 calendar copy (only exists from today forward).
+  const nights = db.prepare(`SELECT room_id, date, price, override = 'blackout' AS blocked FROM calendar_days
+     WHERE date >= ? AND date < ? AND ${inRooms}`).all(start, end, ...ids);
+  return { start, days, end, rooms, bookings, nights };
 }

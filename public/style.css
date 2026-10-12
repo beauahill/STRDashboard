@@ -32,15 +32,6 @@ th { font-size:12px; color:var(--mut); text-transform:uppercase; }
 .bar { flex:1; display:flex; flex-direction:column; justify-content:flex-end; align-items:center; height:100%; font-size:11px; color:var(--mut); }
 .bar i { display:block; width:100%; background:var(--acc); border-radius:4px 4px 0 0; min-height:2px; } .bar.future i { opacity:.45; }
 .toolbar { display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap; align-items:center; }
-.cal { overflow-x:auto; background:var(--card); border:1px solid var(--line); border-radius:10px; }
-.cal-row { display:grid; grid-template-columns:170px 1fr; border-top:1px solid var(--line); min-height:34px; }
-.cal-row:first-child { border-top:0; } .cal-name { padding:6px 10px; position:sticky; left:0; background:var(--card); z-index:2; border-right:1px solid var(--line); }
-.cal-name small { display:block; color:var(--mut); font-size:11px; }
-.cal-track { position:relative; display:grid; }
-.cal-day { text-align:center; font-size:10px; color:var(--mut); border-left:1px solid var(--line); padding-top:2px; } .cal-day.today { background:#2563eb22; color:var(--acc); font-weight:700; }
-.cal-bar { position:absolute; top:5px; bottom:5px; border-radius:5px; color:#fff; font-size:11px; padding:2px 6px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; background:var(--other); }
-.cal-bar.Airbnb{background:var(--airbnb)} .cal-bar.Booking\.com{background:var(--booking)} .cal-bar.VRBO{background:var(--vrbo)} .cal-bar.Direct{background:var(--direct)}
-.cal-bar.block{background:var(--block)} .cal-bar.request{outline:2px dashed #d97706; outline-offset:-2px}
 form.stack { display:grid; gap:10px; max-width:460px; } .login { max-width:320px; margin:12vh auto; }
 
 /* Rates */
@@ -70,3 +61,26 @@ form.stack { display:grid; gap:10px; max-width:460px; } .login { max-width:320px
 .chip { display:inline-block; padding:1px 7px; border-radius:99px; font-size:11px; border:1px solid var(--line); white-space:nowrap; }
 .chip.set { border-color:#16a34a; color:#15803d; } .chip.error { border-color:#dc2626; color:#b91c1c; } .chip.pending, .chip.missing { color:var(--mut); }
 .notice.bad-notice { background:#fee2e2; color:#7f1d1d; } .notice ul { margin:6px 0 0; padding-left:18px; }
+
+/* Calendar month grid */
+.mcal { border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+.mhead { display:grid; grid-template-columns:repeat(7,1fr); background:var(--bg); font-size:11px; color:var(--mut); text-transform:uppercase; }
+.mhead div { padding:6px 8px; }
+.mweek { position:relative; border-top:1px solid var(--line); }
+.mdays { position:absolute; inset:0; display:grid; grid-template-columns:repeat(7,1fr); }
+.mday { border-left:1px solid var(--line); padding:4px 6px; display:flex; justify-content:space-between; align-items:flex-start; font-size:12px; min-width:0; }
+.mday:first-child { border-left:0; }
+.mday.other { background:var(--bg); color:var(--mut); } .mday.past .dn { color:var(--mut); }
+.mday.today .dn { background:var(--acc); color:#fff; border-radius:99px; padding:0 6px; font-weight:700; }
+.mday.blocked { background:repeating-linear-gradient(45deg,transparent 0 5px,#9ca3af33 5px 10px); }
+.mday .pr { font-size:10px; color:var(--mut); }
+.mbar { position:absolute; height:20px; line-height:20px; padding:0 6px; border-radius:10px; font-size:11px; color:#fff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  cursor:pointer; background:var(--other); box-sizing:border-box; border:1px solid #0000; }
+.mbar.Airbnb{background:var(--airbnb)} .mbar.Booking\.com{background:var(--booking)} .mbar.VRBO{background:var(--vrbo)} .mbar.Direct{background:var(--direct)}
+.mbar.block { background:var(--block); } .mbar.request { outline:2px dashed #d97706; outline-offset:-2px; }
+.mbar.cont-l { border-top-left-radius:0; border-bottom-left-radius:0; } .mbar.cont-r { border-top-right-radius:0; border-bottom-right-radius:0; }
+.mbar.sel { box-shadow:0 0 0 2px var(--card), 0 0 0 4px var(--acc); }
+.legend { display:flex; flex-wrap:wrap; gap:12px; margin-top:10px; align-items:center; }
+.legend .sw { display:inline-block; width:12px; height:12px; border-radius:3px; margin-right:4px; vertical-align:-2px; background:var(--other); }
+.sw.Airbnb{background:var(--airbnb)} .sw.Booking\.com{background:var(--booking)} .sw.VRBO{background:var(--vrbo)} .sw.Direct{background:var(--direct)}
+.sw.block{background:var(--block)} .sw.request{background:transparent; outline:2px dashed #d97706; outline-offset:-2px}
