@@ -14,6 +14,7 @@ import { SeamClient } from './seam.js';
 import { feedToken, icsForRoom, turnovers } from './cleaning.js';
 import { FIELDS as LISTING_FIELDS, fetchListing, diffListing, saveListing, listingLog } from './listing.js';
 import { analytics } from './analytics.js';
+import { CATEGORIES, CHANNELS, moneySettings, saveMoneySettings, saveExpense, deleteExpense, receiptOf, listExpenses, pnl, payouts, markPayout, taxReport } from './money.js';
 import { guideSettings, saveGuide, guideFor, renderGuide, bookingForToken, saveCheckin, checkinId, pruneCheckins, regenerateLinks, guideOverview } from './guide.js';
 import { siteSettings, saveSite, siteFor, listPhotos, addPhoto, updatePhotos, importBeds24Photos, photo, availability, renderSite, renderTerms } from './site.js';
 import {
@@ -384,6 +385,24 @@ async function api(req, res, url) {
       const { propertyId } = await readJson(req);
       return send(res, 200, await importBeds24Photos(db, beds24, Number(propertyId)));
     }
+    case 'GET /api/money': {
+      const today = localToday(doorSettings(db).tz), year = Number(q.year) || Number(today.slice(0, 4));
+      const years = db.prepare(`SELECT DISTINCT substr(arrival,1,4) y FROM bookings WHERE status != 'block' UNION SELECT DISTINCT substr(date,1,4) FROM expenses ORDER BY 1 DESC`).all().map(r => Number(r.y));
+      return send(res, 200, { year, years: [...new Set([Number(today.slice(0, 4)), ...years])].sort((a, b) => b - a), today, categories: CATEGORIES, channels: CHANNELS,
+        settings: moneySettings(db), pnl: pnl(db, year, { propertyId: prop, today }), expenses: listExpenses(db, { year, propertyId: prop }),
+        payouts: payouts(db, today, { propertyId: prop }), tax: taxReport(db, year, { propertyId: prop }),
+        properties: db.prepare('SELECT id, name FROM properties WHERE id > 0 ORDER BY name').all() });
+    }
+    case 'POST /api/money/settings': return send(res, 200, { settings: saveMoneySettings(db, await readJson(req)) });
+    case 'POST /api/money/expense': return send(res, 200, { id: saveExpense(db, await readJson(req, 8e6)) });
+    case 'POST /api/money/expense/delete': { const { id } = await readJson(req); deleteExpense(db, Number(id)); return send(res, 200, { ok: true }); }
+    case 'GET /api/money/receipt': {
+      const r = receiptOf(db, Number(q.id));
+      if (!r) return send(res, 404, { error: 'No receipt.' });
+      res.writeHead(200, { 'content-type': r.receipt_mime, 'cache-control': 'private, max-age=3600', 'content-disposition': 'inline' });
+      return res.end(r.receipt_data);
+    }
+    case 'POST /api/money/payout': { const b = await readJson(req); return send(res, 200, { payout: markPayout(db, Number(b.bookingId), b) }); }
     case 'GET /api/guide': {
       rememberOrigin(req);
       const props = db.prepare('SELECT id, name FROM properties WHERE id > 0 ORDER BY name').all();

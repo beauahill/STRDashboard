@@ -223,3 +223,11 @@ ol.steps { margin:0; padding-left:20px; } ol.steps li { margin:3px 0; } #ntopic 
 .rep { display:grid; gap:6px; grid-template-columns:minmax(0,1fr); padding:8px 0; border-top:1px solid var(--line); }
 .rep.place { grid-template-columns:repeat(auto-fit,minmax(min(160px,100%),1fr)); }
 .rep textarea { width:100%; } .rep .rm { justify-self:start; }
+
+/* Money */
+.seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+.seg button { border:0; border-radius:0; border-left:1px solid var(--line); background:var(--card); }
+.seg button:first-child { border-left:0; } .seg button.on { background:var(--acc); color:#fff; }
+table.pnl td, table.pnl th { text-align:right; } table.pnl td:first-child, table.pnl th:first-child { text-align:left; position:sticky; left:0; background:var(--card); }
+table.pnl tr.minor td { font-size:12px; color:var(--mut); } table.pnl tr.strong td { border-top:2px solid var(--line); }
+table.pnl tr.total td { font-size:15px; } .fut { opacity:.5; }

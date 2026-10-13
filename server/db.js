@@ -111,6 +111,13 @@ CREATE TABLE IF NOT EXISTS site_photos (
 CREATE TABLE IF NOT EXISTS guide_checkins (
   booking_id INTEGER PRIMARY KEY, name TEXT, signed_at TEXT, ip TEXT, user_agent TEXT, id_mime TEXT, id_data BLOB, id_deleted_at TEXT
 );
+-- Money: expenses (optionally repeating monthly, with a receipt) and payouts the owner has marked as received.
+CREATE TABLE IF NOT EXISTS expenses (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, property_id INTEGER, date TEXT NOT NULL, category TEXT NOT NULL, vendor TEXT,
+  description TEXT, amount REAL NOT NULL, repeat TEXT, until TEXT, receipt_mime TEXT, receipt_data BLOB, created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
+CREATE TABLE IF NOT EXISTS payouts_received (booking_id INTEGER PRIMARY KEY, amount REAL, received_on TEXT, note TEXT, updated_at TEXT);
 -- Every change sent to Beds24 from this app, successful or not.
 CREATE TABLE IF NOT EXISTS change_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, room_id INTEGER NOT NULL,
@@ -125,6 +132,8 @@ const ADDED_COLUMNS = [
   ['bookings', 'payout', 'REAL'],                             // what reached the host, when known
   ['bookings', 'cancelled_at', 'TEXT'],                       // Beds24 cancelTime
   ['bookings', 'first_seen', 'TEXT'],                         // when this app first saw the booking
+  ['bookings', 'commission', 'REAL'],                         // channel commission (Beds24), when known
+  ['bookings', 'tax', 'REAL'],                                // tax on the booking (Beds24), when known
 ];
 
 export function openDb(path = ':memory:') {

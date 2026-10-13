@@ -745,3 +745,29 @@ test('Guidebook over HTTP: private link, online check-in for direct guests, ID o
   assert.equal(vars.status, 200);
   assert.equal(vars.json.vars.guidebook_link, direct.url, '{guidebook_link} fill-in');
 });
+
+test('Money over HTTP: profit and loss, expenses with receipts (owner only), payouts, tax', async t => {
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite') });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+  assert.equal((await call('/api/demo', {})).status, 200);
+  const before = (await call('/api/money')).json;
+  assert.ok(before.pnl.total.gross > 0);
+  const year = before.year;
+  const add = await call('/api/money/expense', { date: `${year}-01-15`, category: 'Utilities', amount: 120.5, vendor: 'Rocky Mountain Power',
+    receipt: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==' });
+  assert.equal(add.status, 200, JSON.stringify(add.json));
+  const after = (await call(`/api/money?year=${year}`)).json;
+  assert.equal(after.pnl.months[0].expenses - before.pnl.months[0].expenses, 120.5);
+  assert.equal((await fetch(s.url(`/api/money/receipt?id=${add.json.id}`))).status, 401, 'receipts are never public');
+  assert.equal((await fetch(s.url(`/api/money/receipt?id=${add.json.id}`), { headers: { cookie: sid } })).headers.get('content-type'), 'image/png');
+  const p = after.payouts[0];
+  assert.ok(p, 'demo checkouts in the last 90 days');
+  assert.equal((await call('/api/money/payout', { bookingId: p.id, amount: p.expected })).status, 200);
+  assert.equal((await call('/api/money')).json.payouts.find(x => x.id === p.id).status, 'ok');
+  assert.equal((await call('/api/money/settings', { taxes: [{ name: 'Lodging', pct: 5 }] })).status, 200);
+  assert.ok((await call('/api/money')).json.tax.total.due > 0, 'direct and Booking.com stays are taxable by you');
+});

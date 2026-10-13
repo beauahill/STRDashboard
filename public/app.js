@@ -1590,13 +1590,149 @@ async function guideView() {
   $('#gregen').onclick = () => confirm('Make new guidebook links for every booking? Links already sent will stop working.') && act(() => api('/guide/regenerate', { method: 'POST' }));
 }
 
+// ---------- Money: profit and loss, expenses, payouts, lodging tax ----------
+const mn = { tab: 'pnl', year: null, edit: null };
+const money2 = n => (n < 0 ? '−$' : '$') + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const smoney = n => (n < 0 ? '−' : '') + money(Math.abs(n));
+const moneyCell = n => Math.round(n) ? smoney(n) : '<span class="sub">–</span>';
+function downloadCsv(name, rows) {
+  const csv = rows.map(r => r.map(v => { const s = String(v ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; }).join(',')).join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' })); a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+async function fileToDataUrl(file) {
+  if (file.type.startsWith('image/')) return shrinkImage(file, 1800);
+  return new Promise((ok, no) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = no; r.readAsDataURL(file); });
+}
+
+async function moneyView() {
+  const M = await api('/money?' + q(mn.year ? { year: mn.year } : {}));
+  mn.year = M.year;
+  const P = M.pnl, T = M.tax;
+  const tabs = [['pnl', 'Profit & loss'], ['expenses', 'Expenses'], ['payouts', 'Payouts'], ['tax', 'Taxes']];
+  const head = `<div class="toolbar"><div class="seg">${tabs.map(([k, l]) => `<button type="button" data-tab="${k}" class="${mn.tab === k ? 'on' : ''}">${l}</button>`).join('')}</div>
+    ${mn.tab !== 'payouts' ? `<select id="myear">${M.years.map(y => `<option ${y === M.year ? 'selected' : ''}>${y}</option>`).join('')}</select>` : ''}</div>`;
+  const mlabel = m => MONTHS[+m.slice(5) - 1];
+  let body = '';
+  if (mn.tab === 'pnl') {
+    const margin = P.total.net ? Math.round(P.total.profit / P.total.net * 100) : 0;
+    const row = (label, vals, total, cls = '') => `<tr class="${cls}"><td>${label}</td>${vals.map((v, i) => `<td class="${P.months[i].future ? 'fut' : ''}">${moneyCell(v)}</td>`).join('')}<td><b>${moneyCell(total)}</b></td></tr>`;
+    body = `<div class="grid">${kpi(`Income ${M.year}`, money(P.total.net), `${money(P.total.gross)} booked, ${money(P.total.fees)} channel fees`)}${kpi('Expenses', money(P.total.expenses), `${P.expenses.length} categories`)}
+      ${kpi('Profit', `<span class="${P.total.profit < 0 ? 'bad' : ''}">${smoney(P.total.profit)}</span>`, `${margin}% of income`)}${kpi('Nights', P.total.nights, `${P.total.nights ? money(P.total.gross / P.total.nights) : '$0'} average per night`)}</div>
+      <div class="card"><div class="toolbar"><h3 style="margin:0">By month</h3><span style="margin-left:auto"></span><button type="button" id="mcsv">Download CSV</button></div>
+      <div class="tscroll"><table class="pv pnl"><tr><th></th>${P.months.map(m => `<th class="${m.future ? 'fut' : ''}">${mlabel(m.month)}</th>`).join('')}<th>Total</th></tr>
+        ${row('<b>Booked</b>', P.months.map(m => m.gross), P.total.gross)}
+        ${P.channels.map(c => row(`<span class="sub">${esc(c.channel)}</span>`, c.months, c.total, 'minor')).join('')}
+        ${row('Channel fees', P.months.map(m => -m.fees), -P.total.fees)}
+        ${row('<b>Income</b>', P.months.map(m => m.net), P.total.net, 'strong')}
+        ${P.expenses.map(e => row(esc(e.category), e.months.map(v => -v), -e.total, 'minor')).join('')}
+        ${row('<b>Expenses</b>', P.months.map(m => -m.expenses), -P.total.expenses, 'strong')}
+        ${row('<b>Profit</b>', P.months.map(m => m.profit), P.total.profit, 'strong total')}</table></div>
+      <div class="sub" style="margin-top:8px">Income is counted by night of stay (a stay crossing months counts partly in each), like the Dashboard. Channel fees are Beds24's commission where the channel reports it; for imported Guesty history, total minus payout. Faded months are still to come (bookings on the books and repeating expenses).</div></div>
+      <form class="card stack" id="mset" style="max-width:none;margin-top:14px"><h3>Cleaning cost</h3>
+        <label class="sub">Estimated cleaning cost per stay ($), counted at each checkout <input name="cleaningPerStay" type="number" min="0" step="1" value="${M.settings.cleaningPerStay ?? ''}" style="width:8em"></label>
+        <div class="sub">Use this if you don't enter each Turno payment as an expense; leave empty if you do.</div><div><button class="primary">Save</button></div></form>`;
+  } else if (mn.tab === 'expenses') {
+    const e = mn.edit || { date: M.today, category: 'Supplies', amount: '', vendor: '', description: '', repeat: null, until: '', property_id: null };
+    const total = M.expenses.reduce((a, x) => a + (x.repeat ? 0 : x.amount), 0);
+    body = `<form class="card stack" id="mexp" style="max-width:none"><h3>${mn.edit ? 'Edit expense' : 'Add an expense'}</h3>
+      <div class="toolbar" style="margin:0"><label class="sub">Date<br><input type="date" name="date" value="${esc(e.date)}" required></label>
+        <label class="sub">Category<br><select name="category">${M.categories.map(c => `<option ${c === e.category ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></label>
+        <label class="sub">Amount ($)<br><input type="number" name="amount" min="0.01" step="0.01" value="${e.amount}" required style="width:8em"></label>
+        ${M.properties.length > 1 ? `<label class="sub">Property<br><select name="propertyId"><option value="">All properties</option>${M.properties.map(p => `<option value="${p.id}" ${p.id === e.property_id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label>` : ''}</div>
+      <div class="toolbar" style="margin:0"><label class="sub" style="flex:1">Vendor<br><input name="vendor" value="${esc(e.vendor)}" style="width:100%" placeholder="e.g. Turno, Rocky Mountain Power"></label>
+        <label class="sub" style="flex:2">Note<br><input name="description" value="${esc(e.description)}" style="width:100%"></label></div>
+      <div class="toolbar" style="margin:0"><label class="sub"><input type="checkbox" name="repeat" ${e.repeat ? 'checked' : ''}> Repeats monthly</label>
+        <label class="sub">until (optional) <input type="date" name="until" value="${esc(e.until || '')}"></label>
+        <label class="sub">Receipt (photo or PDF) <input type="file" name="receipt" accept="image/*,application/pdf"></label></div>
+      <div class="toolbar" style="margin:0"><button class="primary">${mn.edit ? 'Save changes' : 'Add expense'}</button>${mn.edit ? '<button type="button" id="mcancel">Cancel</button>' : ''}</div></form>
+      <div class="card" style="margin-top:14px"><div class="toolbar"><h3 style="margin:0">${M.year} expenses</h3><span class="sub">${money2(total)} one-off${M.expenses.some(x => x.repeat) ? ' plus monthly items' : ''}</span>
+        <span style="margin-left:auto"></span><button type="button" id="mexpcsv">Download CSV</button></div>
+      ${M.expenses.length ? `<div class="tscroll"><table class="pv"><tr><th>Date</th><th>Category</th><th>Vendor / note</th><th>Amount</th><th></th></tr>
+        ${M.expenses.map(x => `<tr><td>${fmtDate(x.date)}${x.repeat ? ` <span class="chip">monthly${x.until ? ` to ${fmtDate(x.until)}` : ''}</span>` : ''}</td><td>${esc(x.category)}</td>
+          <td>${esc(x.vendor)}${x.description ? `<div class="sub">${esc(x.description)}</div>` : ''}</td><td>${money2(x.amount)}</td>
+          <td style="white-space:nowrap">${x.has_receipt ? `<a href="/api/money/receipt?id=${x.id}" target="_blank" rel="noopener">Receipt</a> · ` : ''}<a href="#" data-edit="${x.id}">Edit</a> · <a href="#" data-del="${x.id}">Delete</a></td></tr>`).join('')}</table></div>`
+        : '<div class="empty">No expenses for this year yet.</div>'}</div>`;
+  } else if (mn.tab === 'payouts') {
+    const waiting = M.payouts.filter(p => p.status === 'waiting'), short = M.payouts.filter(p => p.status === 'short');
+    body = `<div class="grid">${kpi('Not yet marked received', waiting.length, `${money(waiting.reduce((a, p) => a + p.expected, 0))} expected`)}${kpi('Paid short', short.length, short.length ? `${money2(short.reduce((a, p) => a + p.diff, 0))} in total` : 'None')}</div>
+      <div class="card"><h3>Stays that checked out in the last 90 days</h3><div class="sub" style="margin-bottom:8px">Enter what actually reached your bank for each stay to catch missing or short payouts. Expected = booking total minus the channel's commission (where Beds24 reports it).</div>
+      ${M.payouts.length ? `<div class="tscroll"><table class="pv"><tr><th>Guest</th><th>Checkout</th><th>Booked</th><th>Fees</th><th>Expected</th><th>Received</th><th></th></tr>
+        ${M.payouts.map(p => `<tr data-id="${p.id}"><td>${esc(p.guest || 'Guest')} ${tag(p.channel)}</td><td>${fmtDate(p.departure)}</td><td>${money2(p.gross)}</td>
+          <td>${p.feesKnown ? money2(p.fees) : '<span class="sub">not reported</span>'}</td><td><b>${money2(p.expected)}</b></td>
+          <td><input type="number" step="0.01" min="0" value="${p.received ?? ''}" style="width:7.5em" placeholder="amount"> <input type="date" value="${esc(p.receivedOn || '')}"></td>
+          <td>${{ ok: '<span class="chip set">matches</span>', short: `<span class="chip error">short ${money2(-p.diff)}</span>`, over: `<span class="chip set">+${money2(p.diff)}</span>`, waiting: '<span class="chip">waiting</span>' }[p.status]}
+            <button type="button" class="msavep">Save</button></td></tr>`).join('')}</table></div>` : '<div class="empty">No checkouts in the last 90 days.</div>'}</div>`;
+  } else {
+    const S = T.settings;
+    body = `<form class="card stack" id="mtax" style="max-width:none"><h3>Who collects lodging tax</h3>
+      <div class="sub">Tick the channels that collect and pay the tax for you. Bookings on the others are yours to report. Check the current rules and rates for Wyoming and your city and county; this report is an estimate, not tax advice.</div>
+      <div class="chips">${M.channels.map(c => `<label class="sub"><input type="checkbox" name="remit_${esc(c)}" ${S.remits[c] ? 'checked' : ''}> ${esc(c)} collects it</label>`).join('')}</div>
+      <div class="sub">Tax rates you pay on the other bookings:</div>
+      <div id="mrates">${(S.taxes.length ? S.taxes : [{ name: '', pct: '' }]).map(t => `<div class="toolbar rate" style="margin:0"><input placeholder="Name, e.g. State lodging tax" value="${esc(t.name)}" data-k="name" style="flex:1"><input type="number" step="0.01" min="0" max="30" placeholder="%" value="${t.pct}" data-k="pct" style="width:6em"> %<button type="button" class="rm">Remove</button></div>`).join('')}</div>
+      <div class="toolbar" style="margin:0"><button type="button" id="maddrate">Add a rate</button><button class="primary">Save</button></div></form>
+      <div class="card" style="margin-top:14px"><div class="toolbar"><h3 style="margin:0">${M.year}</h3><span class="sub">Revenue by night of stay</span><span style="margin-left:auto"></span><button type="button" id="mtaxcsv">Download CSV</button></div>
+      <div class="grid">${T.quarters.map(qq => kpi(qq.quarter, money(qq.due), `on ${money(qq.owner)} you report`)).join('')}</div>
+      <div class="tscroll"><table class="pv"><tr><th>Month</th><th>Collected by channels</th><th>You report</th>${S.taxes.map(t => `<th>${esc(t.name)} (${t.pct}%)</th>`).join('')}<th>Estimated due</th></tr>
+        ${T.months.map(m => `<tr><td>${mlabel(m.month)}</td><td>${moneyCell(m.remitted)}</td><td>${moneyCell(m.owner)}</td>${m.byTax.map(x => `<td>${moneyCell(x.amount)}</td>`).join('')}<td><b>${moneyCell(m.due)}</b></td></tr>`).join('')}
+        <tr class="total"><td><b>Total</b></td><td><b>${money(T.total.remitted)}</b></td><td><b>${money(T.total.owner)}</b></td>${S.taxes.map(() => '<td></td>').join('')}<td><b>${money(T.total.due)}</b></td></tr></table></div>
+      ${!S.taxes.length ? '<div class="sub warn" style="margin-top:8px">Add your tax rates above to see what\'s due.</div>' : ''}</div>`;
+  }
+  view.innerHTML = head + body;
+
+  view.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { mn.tab = b.dataset.tab; mn.edit = null; moneyView(); });
+  if ($('#myear')) $('#myear').onchange = e => { mn.year = +e.target.value; moneyView(); };
+  const done = async (fn, msg) => { try { await fn(); await moneyView(); if (msg) banner(msg, 'ok'); } catch (err) { if (err.message !== 'login') banner(err.message, true); } };
+  if (mn.tab === 'pnl') {
+    $('#mcsv').onclick = () => downloadCsv(`profit-and-loss-${M.year}.csv`, [['', ...P.months.map(m => mlabel(m.month)), 'Total'],
+      ['Booked', ...P.months.map(m => m.gross), P.total.gross], ['Channel fees', ...P.months.map(m => -m.fees), -P.total.fees], ['Income', ...P.months.map(m => m.net), P.total.net],
+      ...P.expenses.map(x => [x.category, ...x.months.map(v => -v), -x.total]), ['Expenses', ...P.months.map(m => -m.expenses), -P.total.expenses], ['Profit', ...P.months.map(m => m.profit), P.total.profit]]);
+    $('#mset').onsubmit = e => { e.preventDefault(); done(() => api('/money/settings', { method: 'POST', body: { cleaningPerStay: e.target.cleaningPerStay.value } }), 'Saved.'); };
+  }
+  if (mn.tab === 'expenses') {
+    $('#mexp').onsubmit = async e => {
+      e.preventDefault();
+      const f = e.target, file = f.receipt.files[0];
+      const body = { id: mn.edit?.id, date: f.date.value, category: f.category.value, amount: f.amount.value, vendor: f.vendor.value, description: f.description.value,
+        repeat: f.repeat.checked ? 'monthly' : null, until: f.until.value, propertyId: f.propertyId?.value ?? null };
+      try { if (file) body.receipt = await fileToDataUrl(file); } catch { return banner('Couldn\'t read that receipt.', true); }
+      const editing = !!mn.edit;
+      mn.edit = null;
+      done(() => api('/money/expense', { method: 'POST', body }), editing ? 'Expense updated.' : 'Expense added.');
+    };
+    if ($('#mcancel')) $('#mcancel').onclick = () => { mn.edit = null; moneyView(); };
+    view.querySelectorAll('[data-edit]').forEach(a => a.onclick = ev => { ev.preventDefault(); mn.edit = M.expenses.find(x => x.id === +a.dataset.edit); moneyView(); });
+    view.querySelectorAll('[data-del]').forEach(a => a.onclick = ev => { ev.preventDefault(); if (confirm('Delete this expense?')) done(() => api('/money/expense/delete', { method: 'POST', body: { id: +a.dataset.del } }), 'Deleted.'); });
+    $('#mexpcsv').onclick = () => downloadCsv(`expenses-${M.year}.csv`, [['Date', 'Category', 'Vendor', 'Note', 'Amount', 'Repeats', 'Until'],
+      ...M.expenses.map(x => [x.date, x.category, x.vendor, x.description, x.amount, x.repeat || '', x.until || ''])]);
+  }
+  if (mn.tab === 'payouts') view.querySelectorAll('.msavep').forEach(b => b.onclick = () => {
+    const tr = b.closest('tr'), [amt, on] = tr.querySelectorAll('input');
+    done(() => api('/money/payout', { method: 'POST', body: { bookingId: +tr.dataset.id, amount: amt.value, receivedOn: on.value } }), amt.value ? 'Payout saved.' : 'Cleared.');
+  });
+  if (mn.tab === 'tax') {
+    const wire = () => view.querySelectorAll('.rate .rm').forEach(b => b.onclick = () => b.closest('.rate').remove());
+    wire();
+    $('#maddrate').onclick = () => { $('#mrates').insertAdjacentHTML('beforeend', '<div class="toolbar rate" style="margin:0"><input placeholder="Name" data-k="name" style="flex:1"><input type="number" step="0.01" min="0" max="30" placeholder="%" data-k="pct" style="width:6em"> %<button type="button" class="rm">Remove</button></div>'); wire(); };
+    $('#mtax').onsubmit = e => {
+      e.preventDefault();
+      const remits = Object.fromEntries(M.channels.map(c => [c, e.target.elements[`remit_${c}`].checked]));
+      const taxes = [...view.querySelectorAll('.rate')].map(r => ({ name: r.querySelector('[data-k=name]').value, pct: r.querySelector('[data-k=pct]').value })).filter(t => t.name || t.pct);
+      done(() => api('/money/settings', { method: 'POST', body: { remits, taxes } }), 'Tax settings saved.');
+    };
+    $('#mtaxcsv').onclick = () => downloadCsv(`lodging-tax-${M.year}.csv`, [['Month', 'Collected by channels', 'You report', ...T.settings.taxes.map(t => `${t.name} (${t.pct}%)`), 'Estimated due'],
+      ...T.months.map(m => [m.month, m.remitted, m.owner, ...m.byTax.map(x => x.amount), m.due])]);
+  }
+}
+
 async function act(fn) {
   const btn = $('#sync'); btn.disabled = true; banner('Working…');
   try { await fn(); banner(''); await boot(true); } catch (e) { if (e.message !== 'login') banner(e.message, true); }
   btn.disabled = false;
 }
 
-const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, automations: automationsView, bookings: bookingsView, analytics: analyticsView, home: homeView, site: siteView, guide: guideView, listing: listingView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
+const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, automations: automationsView, bookings: bookingsView, analytics: analyticsView, home: homeView, site: siteView, guide: guideView, money: moneyView, listing: listingView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
 async function render() {
   // #/inbox/123 (from a phone notification) opens that conversation.
   const [r, arg] = location.hash.replace(/^#\/?/, '').split('/');

@@ -89,6 +89,16 @@ Settings is the gear at the top right. On a phone, "Add to Home Screen" installs
   and help/emergency details. Optional for direct guests: online check-in (typed-name acceptance of the rental
   agreement and an ID photo) before the code and address appear; ID photos are deleted N days after checkout and
   only the signed-in owner can view them. Links are signed per booking and can all be revoked at once.
+- **Money**:
+  - *Profit & loss* by month for any year: booked income by channel, channel fees (Beds24's commission; total minus
+    payout for Guesty history), income, expenses by category and profit, with upcoming months shown faded; optional
+    estimated cleaning cost per checkout; CSV download for your accountant.
+  - *Expenses*: date, category, vendor, note, amount, optional monthly repeat (with an end date) and a receipt photo
+    or PDF (viewable only when signed in); edit, delete, CSV download.
+  - *Payouts*: stays that checked out in the last 90 days with the expected payout (total minus commission); enter
+    what reached your bank to flag short or missing payouts.
+  - *Taxes*: choose which channels collect and remit lodging tax and enter your rates; monthly and quarterly
+    estimates of what's due on the rest (direct and other bookings), with CSV download. An estimate, not tax advice.
 - **Bookings**: searchable/filterable list.
 - **Analytics**: year to date, last 12 months and next 90 days against the same dates last year; revenue,
   occupancy or ADR by month next to the same month last year; pace (on the books now versus what was booked
@@ -149,14 +159,13 @@ Settings is the gear at the top right. On a phone, "Add to Home Screen" installs
 `server/beds24.js` API client + token handling · `server/sync.js` mapping and sync ·
 `server/rates.js` prices, minimum stays and blocks · `server/doors.js` + `server/seam.js` door codes ·
 `server/messages.js` inbox and saved replies · `server/pricing.js` pricing tool · `server/cleaning.js` Turno feed and turnovers · `server/automations.js` automated messages · `server/listing.js` listing editor ·
-`server/analytics.js` analytics · `server/ai.js` AI assistant · `server/notify.js` phone notifications · `server/ha.js` Home Assistant · `server/site.js` booking site · `server/guide.js` guidebook ·
+`server/analytics.js` analytics · `server/ai.js` AI assistant · `server/notify.js` phone notifications · `server/ha.js` Home Assistant · `server/site.js` booking site · `server/guide.js` guidebook · `server/money.js` money ·
 `server/guesty.js` Guesty import ·
 `server/stats.js` metrics · `server/demo.js` sample data · `public/` UI · `test/` (`npm test`).
 
 ## Known gaps / next steps
 
 - No creating or editing bookings from the app yet (Beds24 `POST /bookings`).
-- Owner statements / profit and loss (expenses aren't tracked yet).
 - The AI assistant has only been run against a stand-in for Anthropic's API in tests; try it on a few real
   drafts before relying on it.
 - Beds24 request/response fields are checked against Beds24's published OpenAPI spec, but the app hasn't yet run
