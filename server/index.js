@@ -308,7 +308,7 @@ async function api(req, res, url) {
     case 'POST /api/ai/settings': return send(res, 200, saveAiSettings(db, await readJson(req)));
     case 'POST /api/ai/draft': {
       const { bookingId, instructions } = await readJson(req);
-      return send(res, 200, await draftReply(db, Number(bookingId), { instructions: String(instructions || '') }));
+      return send(res, 200, await draftReply(db, Number(bookingId), { instructions: String(instructions || ''), client: beds24.connected ? beds24 : null }));
     }
     case 'POST /api/ai/listing': {
       const b = await readJson(req, 2e6);
