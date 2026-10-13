@@ -2,33 +2,56 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>STR Dashboard</title>
+<meta name="theme-color" content="#2563eb">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="STR Dashboard">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-180.png">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<header>
-  <strong class="brand">STR Dashboard</strong>
-  <nav>
-    <a href="#/" data-r="">Dashboard</a>
-    <a href="#/calendar" data-r="calendar">Calendar</a>
-    <a href="#/inbox" data-r="inbox">Inbox <span id="unread" class="badge" hidden></span></a>
-    <a href="#/automations" data-r="automations">Automations</a>
-    <a href="#/bookings" data-r="bookings">Bookings</a>
-    <a href="#/analytics" data-r="analytics">Analytics</a>
-    <a href="#/listing" data-r="listing">Listing</a>
-    <a href="#/rates" data-r="rates">Rates</a>
-    <a href="#/pricing" data-r="pricing">Pricing</a>
-    <a href="#/cleaning" data-r="cleaning">Cleaning</a>
-    <a href="#/locks" data-r="locks">Locks</a>
-    <a href="#/home" data-r="home">Smart home</a>
-    <a href="#/settings" data-r="settings">Settings</a>
-  </nav>
+<header class="topbar">
+  <button id="menubtn" class="iconbtn" aria-label="Menu" aria-controls="side" aria-expanded="false">
+    <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+  </button>
+  <a class="brand" href="#/">STR Dashboard</a>
+  <span class="spacer"></span>
   <select id="prop" title="Property filter"><option value="">All properties</option></select>
-  <button id="sync" title="Sync from Beds24">&#8635; Sync</button>
+  <button id="sync" title="Sync from Beds24"><span aria-hidden="true">&#8635;</span><span class="lbl"> Sync</span></button>
+  <a href="#/settings" data-r="settings" class="iconbtn gear" aria-label="Settings" title="Settings">
+    <svg viewBox="0 0 24 24" width="21" height="21" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+  </a>
 </header>
-<div id="banner" hidden></div>
-<main id="view"></main>
+<div class="layout">
+  <nav id="side" aria-label="Main">
+    <div class="side-brand">STR Dashboard</div>
+    <div class="group"><div class="gl">Today</div>
+      <a href="#/" data-r="">Dashboard</a>
+      <a href="#/inbox" data-r="inbox">Inbox <span id="unread" class="badge" hidden></span></a>
+      <a href="#/calendar" data-r="calendar">Calendar</a></div>
+    <div class="group"><div class="gl">Guests</div>
+      <a href="#/bookings" data-r="bookings">Bookings</a>
+      <a href="#/automations" data-r="automations">Automations</a></div>
+    <div class="group"><div class="gl">Revenue</div>
+      <a href="#/pricing" data-r="pricing">Pricing</a>
+      <a href="#/rates" data-r="rates">Rates</a>
+      <a href="#/analytics" data-r="analytics">Analytics</a></div>
+    <div class="group"><div class="gl">Property</div>
+      <a href="#/listing" data-r="listing">Listing</a>
+      <a href="#/cleaning" data-r="cleaning">Cleaning</a>
+      <a href="#/locks" data-r="locks">Locks</a>
+      <a href="#/home" data-r="home">Smart home</a></div>
+  </nav>
+  <div id="scrim" hidden></div>
+  <div class="content">
+    <div id="banner" hidden></div>
+    <main id="view"></main>
+  </div>
+</div>
 <script type="module" src="app.js"></script>
 </body>
 </html>

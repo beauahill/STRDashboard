@@ -30,6 +30,9 @@ Settings). Failed logins are rate-limited (10 per IP per 15 minutes).
 
 ## What's in it
 
+Pages are grouped in a sidebar (Today, Guests, Revenue, Property), which becomes a slide-in menu on phones;
+Settings is the gear at the top right. On a phone, "Add to Home Screen" installs it as an app.
+
 - **Dashboard**: arrivals / departures / in-house / same-day turnovers, occupancy, revenue, ADR, RevPAR,
   12-month revenue chart (with forecast), revenue by channel, pending requests.
 - **Calendar**: month grid with previous/next and jump-to-month (back through imported history, forward as far

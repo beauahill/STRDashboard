@@ -22,6 +22,7 @@ const q = (extra = {}) => new URLSearchParams({ ...(prop() && { property: prop()
 function banner(msg, kind) { const b = $('#banner'); b.hidden = !msg; b.textContent = msg || ''; b.className = kind === true || kind === 'err' ? 'err' : kind === 'ok' ? 'ok' : ''; }
 
 function showLogin() {
+  document.body.classList.add('signed-out');
   view.innerHTML = `<form class="card stack login"><h3>Sign in</h3><input type="password" name="password" placeholder="Password" autofocus><button class="primary">Sign in</button><div class="sub" id="lerr"></div></form>`;
   view.querySelector('form').onsubmit = async e => {
     e.preventDefault();
@@ -1439,7 +1440,8 @@ async function render() {
   const [r, arg] = location.hash.replace(/^#\/?/, '').split('/');
   if (r === 'inbox' && /^\d+$/.test(arg || '')) inbox.booking = +arg;
   clearInterval(pageTimer); pageTimer = null;
-  document.querySelectorAll('nav a').forEach(a => a.classList.toggle('on', a.dataset.r === r));
+  document.querySelectorAll('a[data-r]').forEach(a => a.classList.toggle('on', a.dataset.r === r));
+  setMenu(false);
   try {
     if (status.empty && r !== 'settings') return location.hash = '#/settings';
     await (routes[r] || dashboard)();
@@ -1449,16 +1451,28 @@ async function render() {
 async function boot(keepProp) {
   try {
     status = await api('/status');
+    document.body.classList.remove('signed-out');
     setUnread(status.unreadMessages || 0);
     const cur = prop();
     const props = await api('/properties');
     $('#prop').innerHTML = '<option value="">All properties</option>' + props.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
     if (keepProp) $('#prop').value = cur;
+    $('#prop').hidden = props.length < 2;   // nothing to filter with a single property
     banner(status.lastSyncError ? 'Last sync failed: ' + status.lastSyncError : '', true);
     render();
   } catch (e) { if (e.message !== 'login') banner(e.message, true); }
 }
 
+// Phone menu: the sidebar slides in; it closes on navigation, the backdrop, or Escape.
+function setMenu(open) {
+  $('#side').classList.toggle('open', open);
+  $('#scrim').hidden = !open;
+  $('#menubtn').setAttribute('aria-expanded', String(open));
+}
+$('#menubtn').onclick = () => setMenu(!$('#side').classList.contains('open'));
+$('#scrim').onclick = () => setMenu(false);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') setMenu(false); });
+$('#side').addEventListener('click', e => { if (e.target.closest('a')) setMenu(false); });
 $('#sync').onclick = () => status.connected ? act(() => api('/sync', { method: 'POST' })) : (location.hash = '#/settings');
 $('#prop').onchange = render;
 window.onhashchange = render;

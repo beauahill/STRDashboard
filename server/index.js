@@ -182,7 +182,7 @@ const readJson = (req, limit = 1e6) => new Promise((ok, no) => {
   });
 });
 
-const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.webmanifest': 'application/manifest+json' };
 
 async function api(req, res, url) {
   const q = Object.fromEntries(url.searchParams);
