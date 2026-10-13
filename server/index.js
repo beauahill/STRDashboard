@@ -15,6 +15,10 @@ import { feedToken, icsForRoom, turnovers } from './cleaning.js';
 import { FIELDS as LISTING_FIELDS, fetchListing, diffListing, saveListing, listingLog } from './listing.js';
 import { analytics } from './analytics.js';
 import {
+  ROLES as HA_ROLES, haConfigured, haClient, connectHA, disconnectHA, discover, saveEntities, saveHASettings, pollHA, runClimate, homeStatus, homeBrief,
+  stayList, stayRecord,
+} from './ha.js';
+import {
   notifySettings, saveNotifySettings, publicNotify, regenerateTopic, runNotifications, sendTest, recentNotifications, fillMissingBookings, appOrigin,
 } from './notify.js';
 import { aiStatus, saveKey, saveAiSettings, cacheListing, draftReply, writeListing, reviewPricing, askData } from './ai.js';
@@ -127,6 +131,17 @@ async function runNotificationsSafely({ pollMessages = false } = {}) {
   finally { notifying = false; }
 }
 
+// Home Assistant: every minute, read the devices, update alerts and run the thermostat / lock automations,
+// then send any notifications. Never throws.
+let haRunning = false;
+async function runHASafely() {
+  if (haRunning || !haConfigured(db)) return null;
+  haRunning = true;
+  try { return await pollHA(db); }
+  catch (e) { return { error: e.message }; }
+  finally { haRunning = false; runNotificationsSafely(); }
+}
+
 // Door codes run after every sync and after lock changes. Failures are recorded, never thrown, so a
 // Seam outage can't stop bookings from syncing.
 async function runDoorCodes() {
@@ -200,7 +215,7 @@ async function api(req, res, url) {
         lastSync: getSetting(db, 'last_sync'), lastSyncError: getSetting(db, 'last_sync_error'),
         empty: db.prepare('SELECT COUNT(*) n FROM bookings').get().n === 0,
         guestyImported: db.prepare("SELECT COUNT(*) n FROM bookings WHERE source = 'guesty'").get().n,
-        unreadMessages: unreadCount(db), ai: aiStatus(db).configured,
+        unreadMessages: unreadCount(db), ai: aiStatus(db).configured, home: haConfigured(db),
       });
     case 'POST /api/connect': {
       const { inviteCode } = await readJson(req);
@@ -347,6 +362,40 @@ async function api(req, res, url) {
       return send(res, 200, { ok: true, topic: s.topic });
     }
     case 'POST /api/notify/new-topic': return send(res, 200, { settings: publicNotify(regenerateTopic(db)) });
+    case 'GET /api/home':
+      return send(res, 200, { ...homeStatus(db), stays: stayList(db, Date.now(), { propertyId: prop }) });
+    case 'POST /api/home/connect': {
+      const { url, token } = await readJson(req);
+      const s = await connectHA(db, { url, token });
+      runHASafely();
+      return send(res, 200, { ok: true, devices: Object.keys(s.entities).length });
+    }
+    case 'POST /api/home/disconnect': disconnectHA(db); return send(res, 200, { ok: true });
+    case 'GET /api/home/devices': return send(res, 200, { devices: await discover(db), roles: HA_ROLES,
+      properties: db.prepare('SELECT id, name FROM properties WHERE id > 0 ORDER BY name').all() });
+    case 'POST /api/home/devices': {
+      const { entities } = await readJson(req);
+      saveEntities(db, entities);
+      await runHASafely();
+      return send(res, 200, { ok: true });
+    }
+    case 'POST /api/home/settings': {
+      saveHASettings(db, await readJson(req));
+      await runHASafely();
+      return send(res, 200, { ok: true });
+    }
+    case 'POST /api/home/refresh': {
+      const r = await runHASafely();
+      if (r?.error) return send(res, 502, { error: r.error });
+      return send(res, 200, { ok: true });
+    }
+    case 'POST /api/home/climate/apply': {
+      const { propertyId } = await readJson(req);
+      const c = haClient(db);
+      if (!c) return send(res, 400, { error: 'Connect Home Assistant first.' });
+      return send(res, 200, { applied: await runClimate(db, c, Date.now(), { force: true, propertyId: Number(propertyId) }) });
+    }
+    case 'GET /api/home/stay': return send(res, 200, stayRecord(db, Number(q.booking)));
     case 'GET /api/ai': return send(res, 200, aiStatus(db));
     case 'POST /api/ai/key': { const { apiKey } = await readJson(req); return send(res, 200, await saveKey(db, apiKey)); }
     case 'POST /api/ai/settings': return send(res, 200, saveAiSettings(db, await readJson(req)));
@@ -476,6 +525,7 @@ async function api(req, res, url) {
         ...p, rooms: db.prepare('SELECT * FROM rooms WHERE property_id=? ORDER BY name').all(p.id) })));
     case 'GET /api/summary': {
       const sum = summary(db, iso(Date.now()), prop);
+      sum.home = homeBrief(db);
       // Automated messages that failed recently, or are stuck waiting past their send time, need a look.
       sum.automationIssues = db.prepare(`SELECT s.status, s.error, a.name automation, b.guest_name FROM automation_sends s
         JOIN automations a ON a.id = s.automation_id LEFT JOIN bookings b ON b.id = s.booking_id
@@ -561,6 +611,7 @@ server.listen(PORT, host, () => {
 setInterval(() => runSync().catch(e => console.error('sync failed:', e.message)), 15 * 60000).unref();
 setInterval(() => runAutomationsSafely(), 5 * 60000).unref();
 setInterval(() => { if (notifySettings(db).enabled) runNotificationsSafely({ pollMessages: true }); }, 60000).unref();
+setInterval(() => runHASafely(), 60000).unref();
 
 // Railway sends SIGTERM on redeploy; close cleanly so SQLite isn't mid-write.
 for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => {

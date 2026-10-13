@@ -5,16 +5,17 @@ import { randomBytes } from 'node:crypto';
 import { getSetting, setSetting } from './db.js';
 import { doorAlerts } from './doors.js';
 import { upsertBookings } from './sync.js';
+import { homeNotifications } from './ha.js';
 
 const userError = msg => Object.assign(new Error(msg), { status: 400 });
 export const NOTIFY_DEFAULTS = {
   enabled: false, server: 'https://ntfy.sh', topic: '', token: '', preview: true,
-  messages: true, bookings: true, cancellations: true, problems: true, enabledAt: null,
+  messages: true, bookings: true, cancellations: true, problems: true, home: true, enabledAt: null,
 };
 const MAX_AGE = 24 * 3600e3;   // never send about anything older than this (e.g. after the app was down)
 const MAX_ATTEMPTS = 5;        // a notification that fails this often is given up on
 const PER_RUN = 10;            // the rest wait for the next minute
-const EVENTS = ['messages', 'bookings', 'cancellations', 'problems'];
+const EVENTS = ['messages', 'bookings', 'cancellations', 'problems', 'home'];
 
 // The topic is the only thing protecting a ntfy.sh topic, so it's long and random.
 export const newTopic = () => 'str-' + randomBytes(15).toString('base64url');
@@ -156,6 +157,13 @@ export function collect(db, now = Date.now()) {
         tags: ['warning'], priority: 4, click: link('/#/settings'), refs: [['sync', day]], time: now });
     }
   }
+  // Home Assistant alerts are about now (a leak that started before notifications were on still matters).
+  if (s.home) {
+    for (const h of homeNotifications(db, now, at(s.enabledAt) || now)) {
+      if (!pending('home', h.ref)) continue;
+      out.push({ title: h.title, message: h.message, tags: h.tags, priority: h.priority, click: link('/#/home'), refs: [['home', h.ref]], time: h.time });
+    }
+  }
   return out.sort((a, b) => a.time - b.time);
 }
 
@@ -192,8 +200,13 @@ export const recentNotifications = db => db.prepare('SELECT kind, ref, at, title
 export async function fillMissingBookings(db, client) {
   const ids = db.prepare(`SELECT DISTINCT m.booking_id id FROM messages m LEFT JOIN bookings b ON b.id = m.booking_id
     WHERE b.id IS NULL AND m.source = 'guest' AND m.read = 0 LIMIT 20`).all().map(r => r.id);
-  if (!ids.length) return 0;
-  const rows = await client.getAll('/bookings', { id: ids, status: ['confirmed', 'new', 'request', 'cancelled', 'black', 'inquiry'] });
+  // Each booking is asked for at most once an hour, in case Beds24 never returns it.
+  const tried = JSON.parse(getSetting(db, 'notify_missing_tried') || '{}'), now = Date.now();
+  const ask = ids.filter(id => !(now - (tried[id] || 0) < 3600e3));
+  if (!ask.length) return 0;
+  for (const id of ask) tried[id] = now;
+  setSetting(db, 'notify_missing_tried', JSON.stringify(Object.fromEntries(Object.entries(tried).filter(([, t]) => now - t < 86400e3))));
+  const rows = await client.getAll('/bookings', { id: ask, status: ['confirmed', 'new', 'request', 'cancelled', 'black', 'inquiry'] });
   upsertBookings(db, rows);
   return rows.length;
 }
