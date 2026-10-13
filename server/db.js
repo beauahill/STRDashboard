@@ -85,6 +85,11 @@ CREATE TABLE IF NOT EXISTS ai_usage (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, task TEXT NOT NULL, calls INTEGER, input_tokens INTEGER,
   output_tokens INTEGER, cache_write_tokens INTEGER, cache_read_tokens INTEGER, cost REAL, error TEXT
 );
+-- Phone notifications sent (or tried) per event, so each goes out once.
+CREATE TABLE IF NOT EXISTS notification_log (
+  kind TEXT NOT NULL, ref TEXT NOT NULL, at TEXT NOT NULL, title TEXT, ok INTEGER NOT NULL, error TEXT, attempts INTEGER DEFAULT 0,
+  PRIMARY KEY (kind, ref)
+);
 -- Every change sent to Beds24 from this app, successful or not.
 CREATE TABLE IF NOT EXISTS change_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, room_id INTEGER NOT NULL,

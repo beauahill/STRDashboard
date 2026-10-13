@@ -59,7 +59,18 @@ On the app's **Locks** page: paste a Seam API key (from your workspace at seam.c
 account** to sign in to Yale Access through Seam, then choose which property each lock opens. See the
 "Door codes" items in `CUTOVER.md` for turning on automatic guest codes.
 
-## 8. AI assistant (optional)
+## 8. Phone notifications (optional)
+
+1. Install the free **ntfy** app on each phone ([App Store and Google Play links](https://docs.ntfy.sh/subscribe/phone/)).
+2. In the app: **Settings → Phone notifications**. Copy the topic name shown there.
+3. In ntfy on each phone: tap **+**, paste the topic, leave the server as ntfy.sh, and allow notifications.
+4. Press **Send test**. When it arrives, tick **Send notifications** and save.
+
+Anyone who knows the topic name can read the alerts on ntfy.sh, so keep it private; **New topic name** (under
+Advanced) replaces it if it leaks. Email alerts aren't built in: Railway blocks outgoing email (SMTP) below the
+Pro plan, so they'd need an email service such as Resend.
+
+## 9. AI assistant (optional)
 
 1. At [console.anthropic.com](https://console.anthropic.com): add a payment method or credits under
    **Billing**, then **API keys → Create key**. Copy it (it starts with `sk-ant-`).
