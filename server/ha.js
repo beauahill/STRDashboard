@@ -5,6 +5,7 @@
 import { getSetting, setSetting } from './db.js';
 import { addDays } from './sync.js';
 import { doorSettings, localToday, zonedTimeToUtc } from './doors.js';
+import { haFetch, isTailnetHost } from './tailnet.js';
 
 const err = (msg, status = 400) => Object.assign(new Error(msg), { status });
 const iso = t => new Date(t).toISOString();
@@ -33,7 +34,7 @@ const fromF = (f, unit) => (unit === '°C' ? Math.round((f - 32) * 5 / 9 * 2) / 
 
 // ---------- Client ----------
 export class HAClient {
-  constructor(url, token, fetchImpl = fetch) { this.url = url; this.token = token; this.fetch = fetchImpl; }
+  constructor(url, token, fetchImpl = haFetch) { this.url = url; this.token = token; this.fetch = fetchImpl; }
   async request(method, path, body) {
     let res;
     try {
@@ -42,6 +43,11 @@ export class HAClient {
         body: body && JSON.stringify(body), signal: AbortSignal.timeout(15000),
       });
     } catch (e) {
+      const host = new URL(this.url).hostname;
+      if (e.cause?.code === 'ENOTFOUND' && isTailnetHost(host)) {
+        throw err(`Couldn't find ${host}: that's a Tailscale address, which only works inside your Tailscale network. `
+          + 'Add a Tailscale auth key to the dashboard (TS_AUTHKEY, see DEPLOY.md section 9), or turn on Tailscale Funnel for it.', 502);
+      }
       throw err(`Couldn't reach Home Assistant at ${this.url} (${e.name === 'TimeoutError' ? 'timed out' : e.cause?.code || e.message}).`, 502);
     }
     if (res.status === 401 || res.status === 403) throw err('Home Assistant rejected the access token.');
@@ -83,7 +89,7 @@ export function classify(st) {
 }
 
 /** Check the address and token, then (on first connection) follow every relevant device, assigned to the first property. */
-export async function connectHA(db, { url, token } = {}, fetchImpl = fetch) {
+export async function connectHA(db, { url, token } = {}, fetchImpl = haFetch) {
   url = String(url || '').trim().replace(/\/+$/, '');
   token = String(token || '').trim() || haSettings(db).token;
   if (!/^https?:\/\/[^\s/]+(\/\S*)?$/.test(url)) throw err('Enter your Home Assistant address, like https://home.example.com.');

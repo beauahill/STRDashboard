@@ -72,17 +72,57 @@ Pro plan, so they'd need an email service such as Resend.
 
 ## 9. Home Assistant (optional)
 
-Home Assistant must be reachable from the internet (Home Assistant Cloud, or your own address through DuckDNS,
-a Cloudflare Tunnel or a reverse proxy), because the app runs on Railway, not in the house.
+The app runs on Railway, not in the house, so it needs a way to reach Home Assistant. The recommended way keeps
+Home Assistant off the public internet: Home Assistant and the dashboard both join your Tailscale network, and the
+dashboard is only allowed to reach Home Assistant. (Any public address also works: Home Assistant Cloud,
+Tailscale Funnel or a Cloudflare Tunnel. Then skip to step 5, and turn on multi-factor login in Home Assistant,
+because its login page is then on the internet.)
 
-1. In Home Assistant: your profile (bottom left) → **Security** → **Long-lived access tokens → Create token**.
-2. In the app: **Smart home** → paste the address and token → **Connect**. Everything relevant is followed;
-   **Choose devices** lets you untick anything that isn't part of the rental and fix a device's type.
-3. Review **Alert thresholds**, then switch on **Thermostat around bookings** and **Lock up after checkout** if
+1. **Put Home Assistant on Tailscale.** In Home Assistant: **Settings → Add-ons → Add-on Store → Tailscale →
+   Install**, start it, open its Web UI and sign in to your Tailscale account. In the add-on's **Configuration**,
+   set **Share Home Assistant** to **serve** (not funnel) on port 443, then restart the add-on. Then in
+   **Settings → System → Network**, turn on **Trust X-Forwarded-For** and add `127.0.0.1` to **Trusted proxies**.
+   On the Tailscale admin console's **Machines** page, note Home Assistant's name and IP (100.x.y.z), and in its
+   ⋯ menu choose **Disable key expiry**. Its address is `https://<name>.<your-tailnet>.ts.net`, for example
+   `https://homeassistant.tail1ebd8f.ts.net`.
+2. **Let the dashboard reach only Home Assistant.** Admin console → **Access controls**. Merge this into the
+   policy (keep your existing `ssh` and `nodeAttrs` sections; use Home Assistant's IP from step 1):
+
+   ```json
+   "tagOwners": { "tag:str-dashboard": ["autogroup:admin"] },
+   "hosts": { "homeassistant": "100.x.y.z" },
+   "grants": [
+     { "src": ["autogroup:member"], "dst": ["*"], "ip": ["*"] },
+     { "src": ["tag:str-dashboard"], "dst": ["homeassistant"], "ip": ["tcp:443"] }
+   ]
+   ```
+
+   If the policy has the default allow-everything rule (`"src": ["*"]`), replace it with the `autogroup:member`
+   line above: left as it is, it would let the dashboard reach every device you own. (Older policies use `acls`
+   instead of `grants`: change that rule's `"src": ["*"]` to `["autogroup:member"]` and add
+   `{ "action": "accept", "src": ["tag:str-dashboard"], "dst": ["homeassistant:443"] }`.)
+3. **Create a key for the dashboard.** Admin console → **Settings → Keys → Generate auth key**: turn on **Tags**
+   and pick `tag:str-dashboard` (tagged machines never expire), and **Pre-approved** if device approval is on.
+   Leave **Reusable** off. The key is only used the first time; after that the dashboard's Tailscale identity is
+   kept on the volume, so redeploys stay the same machine.
+4. **Add it to Railway.** Service → **Variables** → `TS_AUTHKEY` = the key. Railway redeploys, and the dashboard
+   appears on the Machines page as `str-dashboard`. Leave the variable in place.
+5. **Connect.** In Home Assistant: your profile (bottom left) → **Security** → **Long-lived access tokens → Create
+   token**. In the app: **Smart home** → paste Home Assistant's address and the token → **Connect**. With
+   Tailscale, the page says "Tailscale connected as str-dashboard… Home Assistant is reached privately."
+   Everything relevant is followed; **Choose devices** lets you untick anything that isn't part of the rental and
+   fix a device's type.
+6. Review **Alert thresholds**, then switch on **Thermostat around bookings** and **Lock up after checkout** if
    you want them. Phone notifications include Home Assistant alerts (Settings → Phone notifications).
 
 The token gives full control of Home Assistant, so it stays on the server; you can revoke it in Home Assistant at
 any time. If you use Home Assistant's own automations for the same thermostat, switch one of them off.
+
+If the Smart home page says Tailscale isn't connected: *needs a new auth key* means the key expired before its
+first use or was already used (generate another and update `TS_AUTHKEY`); *approve it in the Tailscale admin
+console* means device approval is on (approve `str-dashboard` on the Machines page). *Tailscale couldn't reach
+…* means the dashboard is connected but can't get to Home Assistant: check the access rule from step 2 and that
+the Tailscale add-on is running.
 
 ## 10. AI assistant (optional)
 

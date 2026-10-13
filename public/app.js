@@ -1283,13 +1283,23 @@ function sparkline(points, unit) {
     <span class="sub">low ${y0}${unit} · high ${y1}${unit}</span></div>`;
 }
 
+// One line about the private Tailscale route (only shown when TS_AUTHKEY is set on the server).
+function tailscaleLine(T) {
+  if (!T?.enabled) return '';
+  if (T.state === 'Running') return `<span class="ok">●</span> Tailscale connected as <b>${esc(T.name || 'str-dashboard')}</b>${T.used ? ': Home Assistant is reached privately.' : '.'}`;
+  return `<span class="bad">●</span> Tailscale not connected (${esc({ starting: 'starting', off: 'off', NoState: 'starting', Starting: 'starting', NeedsLogin: 'needs a new auth key', NeedsMachineAuth: 'approve it in the Tailscale admin console', Stopped: 'stopped' }[T.state] || T.state)})${T.error ? `: ${esc(T.error)}` : ''}.`;
+}
+
 async function homeView() {
   const H = await api('/home?' + q());
+  const T = H.tailscale || {};
   if (!H.configured) {
     view.innerHTML = `<div class="card stack"><h3>Connect Home Assistant</h3>
       <div class="sub">Shows your thermostats, locks, leak, air-quality and temperature sensors here, alerts your phones about problems, adjusts the thermostat around bookings, locks up after checkout, and keeps a record of conditions during each stay.</div>
       <ol class="sub steps"><li>In Home Assistant, open your profile (bottom left), then the <b>Security</b> tab, then <b>Long-lived access tokens → Create token</b>. Name it "STR Dashboard" and copy it.</li>
-        <li>Paste the address you use to reach Home Assistant from outside the house, and the token.</li></ol>
+        <li>Paste Home Assistant's address (its Tailscale address, or one you use from outside the house) and the token.</li></ol>
+      ${T.enabled ? `<div class="sub">${tailscaleLine(T)} Use Home Assistant's Tailscale address, like https://homeassistant.<i>your-tailnet</i>.ts.net.</div>`
+        : '<div class="sub">Home Assistant only on your Tailscale network? Add a Tailscale auth key to the dashboard first (DEPLOY.md, section 9), so it can stay off the public internet.</div>'}
       <form id="haform" class="stack"><input name="url" placeholder="https://home.example.com" value="${esc(H.url || '')}" autocomplete="off">
         <input name="token" type="password" placeholder="Long-lived access token" autocomplete="off"><button class="primary">Connect</button></form>
       <div class="sub">The token stays on the server. Thermostat and lock automations stay off until you switch them on.</div></div>`;
@@ -1317,8 +1327,8 @@ async function homeView() {
   const num = (name, label, v, extra = '') => `<label class="sub">${label}<br><input name="${name}" type="number" value="${v ?? ''}" style="width:6em" ${extra}></label>`;
 
   view.innerHTML = `
-    <div class="toolbar"><span class="sub">Home Assistant${H.name ? ` · ${esc(H.name)}` : ''} · updated ${H.lastPoll ? timeAgo(H.lastPoll) : 'never'}</span>
-      ${H.error ? `<span class="bad sub">${esc(H.error)}</span>` : ''}
+    <div class="toolbar"><span class="sub">Home Assistant${H.name ? ` · ${esc(H.name)}` : ''}${T.used && T.state === 'Running' ? ' · via Tailscale' : ''} · updated ${H.lastPoll ? timeAgo(H.lastPoll) : 'never'}</span>
+      ${T.used && T.state !== 'Running' ? `<span class="sub">${tailscaleLine(T)}</span>` : H.error ? `<span class="bad sub">${esc(H.error)}</span>` : ''}
       <span style="margin-left:auto"></span><button id="harefresh">↻ Refresh</button><button id="hadev">${hs.devices ? 'Hide devices' : 'Choose devices'}</button></div>
     ${H.alerts.length ? `<div class="notice bad-notice"><b>Needs attention</b><ul>${H.alerts.map(a => `<li>${esc(a.title)}${a.message ? ` · <span>${esc(a.message)}</span>` : ''}</li>`).join('')}</ul></div>` : ''}
     <div id="hadevices"></div>

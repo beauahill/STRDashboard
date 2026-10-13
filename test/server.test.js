@@ -663,6 +663,7 @@ test('Smart home over HTTP: connect Home Assistant, status without the token, au
   assert.ok(!raw.includes('ha-token'), 'the token is never sent to the browser');
   const home = JSON.parse(raw);
   assert.equal(home.devices.find(d => d.id === 'climate.living_room').current, 64);
+  assert.deepEqual([home.tailscale.enabled, home.tailscale.used], [false, false], 'no TS_AUTHKEY: Tailscale stays off');
   const pid = home.properties[0].id;
   const saved = await call('/api/home/settings', { climate: { propertyId: pid, enabled: true, thermostats: ['climate.living_room'] } });
   assert.equal(saved.status, 200, JSON.stringify(saved.json));

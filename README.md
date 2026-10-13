@@ -60,6 +60,9 @@ Settings is the gear at the top right. On a phone, "Add to Home Screen" installs
   and the topic is long and random because on ntfy.sh it's what keeps the alerts private. Settings has a test
   button and the recent sends.
 - **Smart home** (Home Assistant, through its API with a long-lived access token; checked every minute):
+  - *Private connection*: with a Tailscale auth key (`TS_AUTHKEY`), the dashboard joins your Tailscale network
+    and reaches Home Assistant there, so Home Assistant never has to be on the public internet. Tailscale runs
+    inside the app's container (userspace mode, no special permissions); only tailnet addresses go through it.
   - *Status*: thermostats (temperature, setpoint, mode), inside/outside temperatures, humidity, air quality, leak
     sensors and smoke/CO alarms, locks, batteries and offline devices, plus whether a guest is staying and when the
     next check-in is. A summary card on the Dashboard.
@@ -159,7 +162,7 @@ Settings is the gear at the top right. On a phone, "Add to Home Screen" installs
 `server/beds24.js` API client + token handling · `server/sync.js` mapping and sync ·
 `server/rates.js` prices, minimum stays and blocks · `server/doors.js` + `server/seam.js` door codes ·
 `server/messages.js` inbox and saved replies · `server/pricing.js` pricing tool · `server/cleaning.js` Turno feed and turnovers · `server/automations.js` automated messages · `server/listing.js` listing editor ·
-`server/analytics.js` analytics · `server/ai.js` AI assistant · `server/notify.js` phone notifications · `server/ha.js` Home Assistant · `server/site.js` booking site · `server/guide.js` guidebook · `server/money.js` money ·
+`server/analytics.js` analytics · `server/ai.js` AI assistant · `server/notify.js` phone notifications · `server/ha.js` Home Assistant · `server/tailnet.js` Tailscale · `server/site.js` booking site · `server/guide.js` guidebook · `server/money.js` money ·
 `server/guesty.js` Guesty import ·
 `server/stats.js` metrics · `server/demo.js` sample data · `public/` UI · `test/` (`npm test`).
 
