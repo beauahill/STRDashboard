@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning server/index.js",
     "demo": "STR_DEMO=1 node --disable-warning=ExperimentalWarning server/index.js",
-    "test": "node --disable-warning=ExperimentalWarning --test test/app.test.js test/guesty.test.js test/rates.test.js test/doors.test.js test/messages.test.js test/pricing.test.js test/cleaning.test.js test/automations.test.js test/listing.test.js test/analytics.test.js test/ai.test.js test/notify.test.js test/ha.test.js test/server.test.js"
+    "test": "node --disable-warning=ExperimentalWarning --test test/app.test.js test/guesty.test.js test/rates.test.js test/doors.test.js test/messages.test.js test/pricing.test.js test/cleaning.test.js test/automations.test.js test/listing.test.js test/analytics.test.js test/ai.test.js test/notify.test.js test/ha.test.js test/site.test.js test/guide.test.js test/money.test.js test/server.test.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.128.0"

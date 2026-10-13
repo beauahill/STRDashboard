@@ -14,6 +14,9 @@ import { SeamClient } from './seam.js';
 import { feedToken, icsForRoom, turnovers } from './cleaning.js';
 import { FIELDS as LISTING_FIELDS, fetchListing, diffListing, saveListing, listingLog } from './listing.js';
 import { analytics } from './analytics.js';
+import { CATEGORIES, CHANNELS, moneySettings, saveMoneySettings, saveExpense, deleteExpense, receiptOf, listExpenses, pnl, payouts, markPayout, taxReport } from './money.js';
+import { guideSettings, saveGuide, guideFor, renderGuide, bookingForToken, saveCheckin, checkinId, pruneCheckins, regenerateLinks, guideOverview } from './guide.js';
+import { siteSettings, saveSite, siteFor, listPhotos, addPhoto, updatePhotos, importBeds24Photos, photo, availability, renderSite, renderTerms } from './site.js';
 import {
   ROLES as HA_ROLES, haConfigured, haClient, connectHA, disconnectHA, discover, saveEntities, saveHASettings, pollHA, runClimate, homeStatus, homeBrief,
   stayList, stayRecord,
@@ -98,6 +101,7 @@ async function runSync() {
     catch (e) { setSetting(db, 'messages_error', e.message); }
     await runAutomationsSafely();
     await runNotificationsSafely();
+    try { pruneCheckins(db, localToday(doorSettings(db).tz)); } catch (e) { console.error('ID cleanup failed:', e.message); }
     return r;
   }
   catch (e) { setSetting(db, 'last_sync_error', e.message); throw e; }
@@ -182,7 +186,7 @@ const readJson = (req, limit = 1e6) => new Promise((ok, no) => {
   });
 });
 
-const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.webmanifest': 'application/manifest+json' };
 
 async function api(req, res, url) {
   const q = Object.fromEntries(url.searchParams);
@@ -362,6 +366,58 @@ async function api(req, res, url) {
       return send(res, 200, { ok: true, topic: s.topic });
     }
     case 'POST /api/notify/new-topic': return send(res, 200, { settings: publicNotify(regenerateTopic(db)) });
+    case 'GET /api/site': {
+      const props = db.prepare('SELECT id, name FROM properties WHERE id > 0 ORDER BY name').all();
+      const pid = props.some(p => p.id === Number(q.property)) ? Number(q.property) : props[0]?.id;
+      if (!pid) return send(res, 200, { properties: props });
+      const s = siteSettings(db, pid), origin = appOrigin(db) || rememberOrigin(req) || '';
+      return send(res, 200, { properties: props, site: s, photos: listPhotos(db, pid), url: `${origin}/stay/${s.slug}`, connected: beds24.connected,
+        openNights: availability(db, pid, { days: 90 }).filter(n => n.open).length });
+    }
+    case 'POST /api/site': { const b = await readJson(req); return send(res, 200, { site: saveSite(db, Number(b.propertyId), b) }); }
+    case 'POST /api/site/photos': {
+      const b = await readJson(req, 6e6);
+      return send(res, 200, { id: addPhoto(db, Number(b.propertyId), { dataUrl: b.dataUrl, caption: b.caption }) });
+    }
+    case 'POST /api/site/photos/update': { const b = await readJson(req); return send(res, 200, { photos: updatePhotos(db, Number(b.propertyId), b) }); }
+    case 'POST /api/site/photos/import': {
+      if (!beds24.connected) return send(res, 400, { error: 'Connect Beds24 first.' });
+      const { propertyId } = await readJson(req);
+      return send(res, 200, await importBeds24Photos(db, beds24, Number(propertyId)));
+    }
+    case 'GET /api/money': {
+      const today = localToday(doorSettings(db).tz), year = Number(q.year) || Number(today.slice(0, 4));
+      const years = db.prepare(`SELECT DISTINCT substr(arrival,1,4) y FROM bookings WHERE status != 'block' UNION SELECT DISTINCT substr(date,1,4) FROM expenses ORDER BY 1 DESC`).all().map(r => Number(r.y));
+      return send(res, 200, { year, years: [...new Set([Number(today.slice(0, 4)), ...years])].sort((a, b) => b - a), today, categories: CATEGORIES, channels: CHANNELS,
+        settings: moneySettings(db), pnl: pnl(db, year, { propertyId: prop, today }), expenses: listExpenses(db, { year, propertyId: prop }),
+        payouts: payouts(db, today, { propertyId: prop }), tax: taxReport(db, year, { propertyId: prop }),
+        properties: db.prepare('SELECT id, name FROM properties WHERE id > 0 ORDER BY name').all() });
+    }
+    case 'POST /api/money/settings': return send(res, 200, { settings: saveMoneySettings(db, await readJson(req)) });
+    case 'POST /api/money/expense': return send(res, 200, { id: saveExpense(db, await readJson(req, 8e6)) });
+    case 'POST /api/money/expense/delete': { const { id } = await readJson(req); deleteExpense(db, Number(id)); return send(res, 200, { ok: true }); }
+    case 'GET /api/money/receipt': {
+      const r = receiptOf(db, Number(q.id));
+      if (!r) return send(res, 404, { error: 'No receipt.' });
+      res.writeHead(200, { 'content-type': r.receipt_mime, 'cache-control': 'private, max-age=3600', 'content-disposition': 'inline' });
+      return res.end(r.receipt_data);
+    }
+    case 'POST /api/money/payout': { const b = await readJson(req); return send(res, 200, { payout: markPayout(db, Number(b.bookingId), b) }); }
+    case 'GET /api/guide': {
+      rememberOrigin(req);
+      const props = db.prepare('SELECT id, name FROM properties WHERE id > 0 ORDER BY name').all();
+      const pid = props.some(p => p.id === Number(q.property)) ? Number(q.property) : props[0]?.id;
+      if (!pid) return send(res, 200, { properties: props });
+      return send(res, 200, { properties: props, guide: guideSettings(db, pid), stays: guideOverview(db, pid) });
+    }
+    case 'POST /api/guide': { const b = await readJson(req); return send(res, 200, { guide: saveGuide(db, Number(b.propertyId), b) }); }
+    case 'POST /api/guide/regenerate': regenerateLinks(db); return send(res, 200, { ok: true });
+    case 'GET /api/guide/id': {
+      const id = checkinId(db, Number(q.booking));
+      if (!id) return send(res, 404, { error: 'No ID on file for this booking.' });
+      res.writeHead(200, { 'content-type': id.id_mime, 'cache-control': 'no-store', 'content-disposition': 'inline' });
+      return res.end(id.id_data);
+    }
     case 'GET /api/home':
       return send(res, 200, { ...homeStatus(db), stays: stayList(db, Date.now(), { propertyId: prop }) });
     case 'POST /api/home/connect': {
@@ -582,6 +638,46 @@ const server = createServer(async (req, res) => {
       if (!ics) return send(res, 404, 'Not found', 'text/plain');
       res.writeHead(200, { 'content-type': 'text/calendar; charset=utf-8', 'cache-control': 'no-store' });
       return res.end(ics);
+    }
+    // Guest guidebook (public, private link per booking).
+    const gm = url.pathname.match(/^\/guide\/([\w-]+?)(\/checkin)?\/?$/);
+    if (gm) {
+      const bookingId = bookingForToken(db, gm[1]);
+      if (bookingId == null) return send(res, 404, 'Not found', 'text/plain');
+      if (gm[2] && req.method === 'POST') {
+        const body = await readJson(req, 8e6);
+        saveCheckin(db, bookingId, body, { ip: clientIp(req), userAgent: req.headers['user-agent'] });
+        return send(res, 200, { ok: true });
+      }
+      const html = renderGuide(guideFor(db, bookingId), { token: gm[1] });
+      if (!html) return send(res, 404, 'Not found', 'text/plain');
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' });
+      return res.end(html);
+    }
+    // Direct booking site (public): /stay/<slug>[/...], or the root of its own domain.
+    const host = (req.headers['x-forwarded-host'] || req.headers.host || '').toLowerCase();
+    const stay = url.pathname.match(/^\/stay\/([\w-]+)(\/.*)?$/);
+    const byDomain = !stay && !url.pathname.startsWith('/api/') && siteFor(db, { host });
+    const domainPath = byDomain && (['/', '/terms', '/availability.json'].includes(url.pathname) || /^\/photo\/\d+$/.test(url.pathname));
+    if (stay || domainPath) {
+      const site = stay ? siteFor(db, { slug: stay[1] }) : byDomain;
+      const rest = stay ? stay[2] || '/' : url.pathname;
+      const base = stay ? `/stay/${site?.slug}` : '';
+      const preview = !!site && !site.enabled && (!PASSWORD || validSession(cookie(req).sid));
+      if (!site || (!site.enabled && !preview)) return send(res, 404, 'Not found', 'text/plain');
+      if (rest === '/' || rest === '') {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
+        return res.end(renderSite(db, site, { base, preview: preview || url.searchParams.has('preview'), origin: appOrigin(db) || '' }));
+      }
+      if (rest === '/terms') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); return res.end(renderTerms(db, site, { base: base || '/' })); }
+      if (rest === '/availability.json') {
+        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'public, max-age=120' });
+        return res.end(JSON.stringify({ nights: availability(db, site.propertyId) }));
+      }
+      const ph = rest.match(/^\/photo\/(\d+)$/) && photo(db, site.propertyId, Number(rest.split('/')[2]));
+      if (ph?.url) { res.writeHead(302, { location: ph.url, 'cache-control': 'public, max-age=3600' }); return res.end(); }
+      if (ph?.data) { res.writeHead(200, { 'content-type': ph.mime, 'cache-control': 'public, max-age=86400' }); return res.end(ph.data); }
+      return send(res, 404, 'Not found', 'text/plain');
     }
     if (url.pathname.startsWith('/api/')) return await api(req, res, url);
     const rel = normalize(url.pathname === '/' ? '/index.html' : url.pathname).replace(/^(\.\.[/\\])+/, '');

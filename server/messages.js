@@ -1,6 +1,7 @@
 // Guest messaging through Beds24, which relays to Airbnb, Booking.com and VRBO message threads.
 import { getSetting, setSetting } from './db.js';
 import { doorCodesFor, doorSettings } from './doors.js';
+import { guideUrl } from './guide.js';
 
 const userError = msg => Object.assign(new Error(msg), { status: 400 });
 export const MAX_MESSAGE = 5000;
@@ -61,7 +62,7 @@ export function thread(db, bookingId) {
 
 const fmtLong = d => d ? new Date(d + 'T00:00:00Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', timeZone: 'UTC' }) : '';
 export const fmtTime = t => { const [h, m] = t.split(':').map(Number); return `${h % 12 || 12}${m ? ':' + String(m).padStart(2, '0') : ''} ${h < 12 ? 'AM' : 'PM'}`; };
-export const BUILTIN_VARS = ['guest_first_name', 'guest_name', 'check_in_date', 'check_out_date', 'check_in_time', 'check_out_time', 'nights', 'guests', 'property_name', 'door_code'];
+export const BUILTIN_VARS = ['guest_first_name', 'guest_name', 'check_in_date', 'check_out_date', 'check_in_time', 'check_out_time', 'nights', 'guests', 'property_name', 'door_code', 'guidebook_link'];
 
 /** Fill-ins for a booking: stay details, door code, and the owner's property details (Wi-Fi, address...). */
 export function templateVars(db, booking, door = undefined) {
@@ -76,6 +77,7 @@ export function templateVars(db, booking, door = undefined) {
     nights: booking?.nights ?? '', guests: booking ? (booking.adults || 0) + (booking.children || 0) || '' : '',
     property_name: booking?.property_name || (booking?.property_id ? db.prepare('SELECT name FROM properties WHERE id = ?').get(booking.property_id)?.name : '') || '',
     door_code: door?.code || '',
+    guidebook_link: booking?.id > 0 ? guideUrl(db, booking.id) : '',
   };
 }
 

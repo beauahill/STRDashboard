@@ -30,6 +30,9 @@ Settings). Failed logins are rate-limited (10 per IP per 15 minutes).
 
 ## What's in it
 
+Pages are grouped in a sidebar (Today, Guests, Revenue, Property), which becomes a slide-in menu on phones;
+Settings is the gear at the top right. On a phone, "Add to Home Screen" installs it as an app.
+
 - **Dashboard**: arrivals / departures / in-house / same-day turnovers, occupancy, revenue, ADR, RevPAR,
   12-month revenue chart (with forecast), revenue by channel, pending requests.
 - **Calendar**: month grid with previous/next and jump-to-month (back through imported history, forward as far
@@ -40,7 +43,7 @@ Settings). Failed logins are rate-limited (10 per IP per 15 minutes).
   inquiries. One conversation per booking (unread first; filters for unread, current/upcoming stays and
   inquiries), chat-style thread with the stay details and door code, replies sent to the guest's channel
   thread, attachments, and saved replies with fill-ins (`{guest_first_name}`, `{door_code}`,
-  `{check_in_time}`, …). Unread count in the menu and on the Dashboard. Checks for new messages every
+  `{check_in_time}`, `{guidebook_link}`, …). Unread count in the menu and on the Dashboard. Checks for new messages every
   minute while the inbox is open (at most twice a minute against Beds24), otherwise with each 15-minute sync.
 - **Automations**: scheduled guest messages sent through Beds24: after a booking is made, cancelled or its
   dates change, or N days before/after check-in or checkout at a set time; filtered by channel and minimum
@@ -73,6 +76,29 @@ Settings). Failed logins are rate-limited (10 per IP per 15 minutes).
   - *Stay records*: readings saved every 10 minutes (kept 400 days) give each stay's temperature range, humidity,
     worst PM2.5 / CO₂, alerts and lock/leak events, with charts, for smoking or damage claims.
   - Door codes stay with Seam (Home Assistant's Yale integration doesn't manage keypad codes).
+- **Booking site** (direct bookings): a public page per property at `/stay/<name>` (or your own domain) with
+  photos, description, highlights, house rules, neighbourhood, cancellation policy and check-in times; a two-month
+  availability calendar with nightly prices from Beds24 (booked, blocked and unpriced nights closed, minimum stays
+  respected); an estimate with the cleaning fee; and **Book now**, which opens your Beds24 booking page with the dates
+  and guests filled in, where the guest pays (Stripe through Beds24) and gets Beds24's confirmation email. A rental
+  agreement page to link from the booking page's terms. Only availability and prices are public. Off until switched
+  on; while off, you see a preview when signed in. Photos are uploaded (resized in the browser) or imported from Beds24.
+- **Guidebook**: a private page per booking (`/guide/<link>`, sent with the `{guidebook_link}` fill-in) with a welcome,
+  check-in steps, the door code and address (only from N days before check-in until checkout), Wi-Fi with a copy
+  button, house rules, a house guide (heating, TV, trash…), local tips by category, a tickable checkout checklist
+  and help/emergency details. Optional for direct guests: online check-in (typed-name acceptance of the rental
+  agreement and an ID photo) before the code and address appear; ID photos are deleted N days after checkout and
+  only the signed-in owner can view them. Links are signed per booking and can all be revoked at once.
+- **Money**:
+  - *Profit & loss* by month for any year: booked income by channel, channel fees (Beds24's commission; total minus
+    payout for Guesty history), income, expenses by category and profit, with upcoming months shown faded; optional
+    estimated cleaning cost per checkout; CSV download for your accountant.
+  - *Expenses*: date, category, vendor, note, amount, optional monthly repeat (with an end date) and a receipt photo
+    or PDF (viewable only when signed in); edit, delete, CSV download.
+  - *Payouts*: stays that checked out in the last 90 days with the expected payout (total minus commission); enter
+    what reached your bank to flag short or missing payouts.
+  - *Taxes*: choose which channels collect and remit lodging tax and enter your rates; monthly and quarterly
+    estimates of what's due on the rest (direct and other bookings), with CSV download. An estimate, not tax advice.
 - **Bookings**: searchable/filterable list.
 - **Analytics**: year to date, last 12 months and next 90 days against the same dates last year; revenue,
   occupancy or ADR by month next to the same month last year; pace (on the books now versus what was booked
@@ -133,14 +159,13 @@ Settings). Failed logins are rate-limited (10 per IP per 15 minutes).
 `server/beds24.js` API client + token handling · `server/sync.js` mapping and sync ·
 `server/rates.js` prices, minimum stays and blocks · `server/doors.js` + `server/seam.js` door codes ·
 `server/messages.js` inbox and saved replies · `server/pricing.js` pricing tool · `server/cleaning.js` Turno feed and turnovers · `server/automations.js` automated messages · `server/listing.js` listing editor ·
-`server/analytics.js` analytics · `server/ai.js` AI assistant · `server/notify.js` phone notifications · `server/ha.js` Home Assistant ·
+`server/analytics.js` analytics · `server/ai.js` AI assistant · `server/notify.js` phone notifications · `server/ha.js` Home Assistant · `server/site.js` booking site · `server/guide.js` guidebook · `server/money.js` money ·
 `server/guesty.js` Guesty import ·
 `server/stats.js` metrics · `server/demo.js` sample data · `public/` UI · `test/` (`npm test`).
 
 ## Known gaps / next steps
 
 - No creating or editing bookings from the app yet (Beds24 `POST /bookings`).
-- Owner statements / profit and loss (expenses aren't tracked yet).
 - The AI assistant has only been run against a stand-in for Anthropic's API in tests; try it on a few real
   drafts before relying on it.
 - Beds24 request/response fields are checked against Beds24's published OpenAPI spec, but the app hasn't yet run

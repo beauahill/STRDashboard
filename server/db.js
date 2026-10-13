@@ -101,6 +101,23 @@ CREATE TABLE IF NOT EXISTS ha_alerts (entity_id TEXT NOT NULL, rule TEXT NOT NUL
 CREATE TABLE IF NOT EXISTS ha_alert_log (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_id TEXT NOT NULL, rule TEXT NOT NULL, since TEXT NOT NULL, until TEXT, peak REAL);
 CREATE TABLE IF NOT EXISTS ha_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, entity_id TEXT, kind TEXT NOT NULL, detail TEXT, ok INTEGER NOT NULL, notify INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS ha_done (key TEXT PRIMARY KEY, at TEXT NOT NULL);
+-- Photos for the direct booking site (uploaded, or links to Beds24's copies).
+CREATE TABLE IF NOT EXISTS site_photos (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, property_id INTEGER NOT NULL, sort INTEGER DEFAULT 0, caption TEXT,
+  mime TEXT, data BLOB, url TEXT, created_at TEXT
+);
+-- Direct guests' online check-in from the guidebook: typed-name signature of the rental agreement and an ID photo
+-- (the photo is deleted a set number of days after checkout).
+CREATE TABLE IF NOT EXISTS guide_checkins (
+  booking_id INTEGER PRIMARY KEY, name TEXT, signed_at TEXT, ip TEXT, user_agent TEXT, id_mime TEXT, id_data BLOB, id_deleted_at TEXT
+);
+-- Money: expenses (optionally repeating monthly, with a receipt) and payouts the owner has marked as received.
+CREATE TABLE IF NOT EXISTS expenses (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, property_id INTEGER, date TEXT NOT NULL, category TEXT NOT NULL, vendor TEXT,
+  description TEXT, amount REAL NOT NULL, repeat TEXT, until TEXT, receipt_mime TEXT, receipt_data BLOB, created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
+CREATE TABLE IF NOT EXISTS payouts_received (booking_id INTEGER PRIMARY KEY, amount REAL, received_on TEXT, note TEXT, updated_at TEXT);
 -- Every change sent to Beds24 from this app, successful or not.
 CREATE TABLE IF NOT EXISTS change_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, room_id INTEGER NOT NULL,
@@ -115,6 +132,8 @@ const ADDED_COLUMNS = [
   ['bookings', 'payout', 'REAL'],                             // what reached the host, when known
   ['bookings', 'cancelled_at', 'TEXT'],                       // Beds24 cancelTime
   ['bookings', 'first_seen', 'TEXT'],                         // when this app first saw the booking
+  ['bookings', 'commission', 'REAL'],                         // channel commission (Beds24), when known
+  ['bookings', 'tax', 'REAL'],                                // tax on the booking (Beds24), when known
 ];
 
 export function openDb(path = ':memory:') {

@@ -676,3 +676,98 @@ test('Smart home over HTTP: connect Home Assistant, status without the token, au
   assert.equal((await call('/api/home/disconnect', {})).status, 200);
   assert.equal((await call('/api/home')).json.configured, false);
 });
+
+test('Direct booking site: hidden until switched on, preview for the owner, live page, photos and custom domain', async t => {
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite') });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+  assert.equal((await call('/api/demo', {})).status, 200);
+  const site = (await call('/api/site')).json;
+  const pid = site.site.propertyId, path = `/stay/${site.site.slug}`;
+  assert.equal((await fetch(s.url(path))).status, 404, 'off: not public');
+  const preview = await fetch(s.url(path), { headers: { cookie: sid } });
+  assert.equal(preview.status, 200, 'the signed-in owner sees a preview');
+  assert.match(await preview.text(), /only you can see it/);
+  const up = await call('/api/site/photos', { propertyId: pid, dataUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==' });
+  assert.equal(up.status, 200);
+  assert.equal((await call('/api/site', { propertyId: pid, enabled: true, domain: 'book.example.com', perk: 'Best price here' })).status, 200);
+  const live = await fetch(s.url(path));
+  assert.equal(live.status, 200);
+  const html = await live.text();
+  assert.match(html, /Best price here/);
+  assert.ok(!/only you can see it/.test(html));
+  const av = await (await fetch(s.url(`${path}/availability.json`))).json();
+  assert.ok(Array.isArray(av.nights) && av.nights.length === 365);
+  assert.ok(!JSON.stringify(av).match(/guest|name/i), 'no guest details in the public data');
+  const img = await fetch(s.url(`${path}/photo/${up.json.id}`));
+  assert.equal(img.headers.get('content-type'), 'image/png');
+  assert.equal((await fetch(s.url(`${path}/photo/999`))).status, 404);
+  assert.match(await (await fetch(s.url(`${path}/terms`))).text(), /Rental agreement/);
+  const byDomain = await fetch(s.url('/'), { headers: { 'x-forwarded-host': 'book.example.com' } });
+  assert.match(await byDomain.text(), /Best price here/, 'the custom domain opens the site');
+  assert.match(await (await fetch(s.url('/'))).text(), /STR Dashboard/, 'the app itself is unchanged on its own address');
+});
+
+test('Guidebook over HTTP: private link, online check-in for direct guests, ID only for the signed-in owner', async t => {
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), RAILWAY_PUBLIC_DOMAIN: 'str.example.app' });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+  assert.equal((await call('/api/demo', {})).status, 200);
+  const g = (await call('/api/guide')).json;
+  const pid = g.guide.propertyId;
+  assert.equal((await call('/api/guide', { propertyId: pid, requireDirect: true, welcome: 'Howdy from Laramie' })).status, 200);
+  const stays = (await call(`/api/guide?property=${pid}`)).json.stays;
+  const direct = stays.find(x => x.channel === 'Direct');
+  assert.ok(direct, 'the demo data has an upcoming direct booking');
+  assert.match(direct.url, /^https:\/\/str\.example\.app\/guide\/\d+-[\w-]{22}$/);
+  const path = new URL(direct.url).pathname;
+  const page = await fetch(s.url(path));
+  assert.equal(page.status, 200, 'no login needed for the guest');
+  assert.match(await page.text(), /Howdy from Laramie/);
+  assert.equal((await fetch(s.url(path.replace(/-[\w-]{22}$/, '-' + 'x'.repeat(22))))).status, 404, 'a guessed link fails');
+  {
+    const bad = await fetch(s.url(path + '/checkin'), { method: 'POST', body: JSON.stringify({ name: 'Dee', agree: false }) });
+    assert.equal(bad.status, 400);
+    const ok = await fetch(s.url(path + '/checkin'), { method: 'POST', body: JSON.stringify({ name: 'Dee Direct', agree: true,
+      idDataUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==' }) });
+    assert.equal(ok.status, 200);
+    assert.equal((await fetch(s.url(`/api/guide/id?booking=${direct.id}`))).status, 401, 'IDs are never public');
+    const id = await fetch(s.url(`/api/guide/id?booking=${direct.id}`), { headers: { cookie: sid } });
+    assert.equal(id.headers.get('content-type'), 'image/png');
+  }
+  const vars = await call(`/api/inbox/thread?booking=${direct.id}`);
+  assert.equal(vars.status, 200);
+  assert.equal(vars.json.vars.guidebook_link, direct.url, '{guidebook_link} fill-in');
+});
+
+test('Money over HTTP: profit and loss, expenses with receipts (owner only), payouts, tax', async t => {
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite') });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+  assert.equal((await call('/api/demo', {})).status, 200);
+  const before = (await call('/api/money')).json;
+  assert.ok(before.pnl.total.gross > 0);
+  const year = before.year;
+  const add = await call('/api/money/expense', { date: `${year}-01-15`, category: 'Utilities', amount: 120.5, vendor: 'Rocky Mountain Power',
+    receipt: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==' });
+  assert.equal(add.status, 200, JSON.stringify(add.json));
+  const after = (await call(`/api/money?year=${year}`)).json;
+  assert.equal(after.pnl.months[0].expenses - before.pnl.months[0].expenses, 120.5);
+  assert.equal((await fetch(s.url(`/api/money/receipt?id=${add.json.id}`))).status, 401, 'receipts are never public');
+  assert.equal((await fetch(s.url(`/api/money/receipt?id=${add.json.id}`), { headers: { cookie: sid } })).headers.get('content-type'), 'image/png');
+  const p = after.payouts[0];
+  assert.ok(p, 'demo checkouts in the last 90 days');
+  assert.equal((await call('/api/money/payout', { bookingId: p.id, amount: p.expected })).status, 200);
+  assert.equal((await call('/api/money')).json.payouts.find(x => x.id === p.id).status, 'ok');
+  assert.equal((await call('/api/money/settings', { taxes: [{ name: 'Lodging', pct: 5 }] })).status, 200);
+  assert.ok((await call('/api/money')).json.tax.total.due > 0, 'direct and Booking.com stays are taxable by you');
+});
