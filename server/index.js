@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { createHmac, timingSafeEqual, randomBytes } from 'node:crypto';
-import { extname, join, normalize } from 'node:path';
+import { dirname, extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb, getSetting, setSetting } from './db.js';
 import { Beds24Client } from './beds24.js';
@@ -24,6 +24,7 @@ import {
 import {
   notifySettings, saveNotifySettings, publicNotify, regenerateTopic, runNotifications, sendTest, recentNotifications, fillMissingBookings, appOrigin,
 } from './notify.js';
+import { startTailnet, tailnetStatus, routesViaTailnet } from './tailnet.js';
 import { aiStatus, saveKey, saveAiSettings, cacheListing, draftReply, writeListing, reviewPricing, askData } from './ai.js';
 import {
   seedAutomations, listAutomations, saveAutomation, setEnabled, deleteAutomation, describe, runAutomations, upcoming,
@@ -53,7 +54,8 @@ if (ON_RAILWAY && !PASSWORD) fail('APP_PASSWORD is not set. Add it under the ser
 if (ON_RAILWAY && !VOLUME && !process.env.DB_PATH) fail('No volume attached. Add a volume to this service mounted at /data.');
 function fail(msg) { console.error(`\nSTARTUP ERROR: ${msg}\n`); process.exit(1); }
 
-const db = openDb(process.env.DB_PATH || (VOLUME ? join(VOLUME, 'str.db') : 'data/str.db'));
+const DB_PATH = process.env.DB_PATH || (VOLUME ? join(VOLUME, 'str.db') : 'data/str.db');
+const db = openDb(DB_PATH);
 const beds24 = new Beds24Client(db);
 const seam = () => new SeamClient(getSetting(db, 'seam_api_key'));
 
@@ -418,8 +420,10 @@ async function api(req, res, url) {
       res.writeHead(200, { 'content-type': id.id_mime, 'cache-control': 'no-store', 'content-disposition': 'inline' });
       return res.end(id.id_data);
     }
-    case 'GET /api/home':
-      return send(res, 200, { ...homeStatus(db), stays: stayList(db, Date.now(), { propertyId: prop }) });
+    case 'GET /api/home': {
+      const h = homeStatus(db);
+      return send(res, 200, { ...h, tailscale: { ...tailnetStatus(), used: !!h.url && routesViaTailnet(h.url) }, stays: stayList(db, Date.now(), { propertyId: prop }) });
+    }
     case 'POST /api/home/connect': {
       const { url, token } = await readJson(req);
       const s = await connectHA(db, { url, token });
@@ -708,9 +712,12 @@ setInterval(() => runSync().catch(e => console.error('sync failed:', e.message))
 setInterval(() => runAutomationsSafely(), 5 * 60000).unref();
 setInterval(() => { if (notifySettings(db).enabled) runNotificationsSafely({ pollMessages: true }); }, 60000).unref();
 setInterval(() => runHASafely(), 60000).unref();
+// Tailscale (only with TS_AUTHKEY): a private route to Home Assistant. Its identity lives next to the database.
+const tailnet = startTailnet({ dataDir: dirname(DB_PATH) });
 
 // Railway sends SIGTERM on redeploy; close cleanly so SQLite isn't mid-write.
 for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => {
+  tailnet?.stop();
   server.close(() => { db.close(); process.exit(0); });
   setTimeout(() => process.exit(0), 5000).unref();
 });
