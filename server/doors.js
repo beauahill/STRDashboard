@@ -231,6 +231,22 @@ export function doorCodesFor(db, bookingIds, now = Date.now()) {
 }
 
 /**
+ * Confirmed Beds24 stays arriving in the next `days` days (within the code window) at a room with a lock, that
+ * don't yet have a working code on every lock. Empty when automatic guest codes are off.
+ */
+export function doorAlerts(db, { days = 3, now = Date.now() } = {}) {
+  const ds = doorSettings(db);
+  if (!ds.auto) return [];
+  const today = localToday(ds.tz, now), limit = addDays(today, Math.min(days, ds.lookahead));
+  const lockRooms = new Set(db.prepare('SELECT DISTINCT room_id FROM locks WHERE room_id IS NOT NULL').all().map(r => r.room_id));
+  const soon = db.prepare(`SELECT id, guest_name, arrival, room_id, first_seen FROM bookings WHERE status IN ('confirmed','new')
+    AND source = 'beds24' AND arrival >= ? AND arrival <= ? ORDER BY arrival`).all(today, limit).filter(b => lockRooms.has(b.room_id));
+  const codes = doorCodesFor(db, soon.map(b => b.id), now);
+  return soon.filter(b => !codes[b.id]?.ok).map(b => ({ id: b.id, guest: b.guest_name, arrival: b.arrival, firstSeen: b.first_seen,
+    problem: codes[b.id]?.perLock.find(l => !['set', 'scheduled'].includes(l.state))?.label || 'No door code yet' }));
+}
+
+/**
  * Choose a specific code for one booking (e.g. the guest asked for a different one). Applied on the next
  * reconcile. `otherCodes` (from lockOverview) is used to refuse a code already used by someone else, which
  * would otherwise be swapped straight back out.

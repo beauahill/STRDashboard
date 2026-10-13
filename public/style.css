@@ -179,3 +179,6 @@ tr.sameday td { background:#fef3c744; }
 .aiw { margin:-2px 0 6px; } #aiset textarea { width:100%; resize:vertical; }
 .aisugg { white-space:pre-wrap; padding:8px 10px; border:1px dashed #a5b4fc; border-radius:8px; background:#6366f10d; overflow-wrap:anywhere; }
 @media (max-width: 600px) { .gbars { gap:1px; height:140px; } .hrow { grid-template-columns:78px minmax(0,1fr) auto; } }
+
+/* Notifications */
+ol.steps { margin:0; padding-left:20px; } ol.steps li { margin:3px 0; } #ntopic { user-select:all; overflow-wrap:anywhere; white-space:normal; }

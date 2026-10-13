@@ -50,6 +50,12 @@ Settings). Failed logins are rate-limited (10 per IP per 15 minutes).
   messages with an unfilled `{fill-in}` wait (and fail after a deadline) instead of sending; each message goes
   once per booking. Upcoming sends with preview and skip, history, and per-property custom fill-ins
   (Wi-Fi, address, ...). Runs every 5 minutes; problems show on the Dashboard.
+- **Phone notifications** (free [ntfy](https://ntfy.sh) app): new guest messages and inquiries (checked every
+  minute while on), new bookings and booking requests, cancellations, and problems (a failed automated message, a
+  door code not working before arrival, Beds24 not syncing for an hour). Tap one to open that conversation. Each
+  event is sent once, nothing from before notifications were switched on is sent, the message text can be left out,
+  and the topic is long and random because on ntfy.sh it's what keeps the alerts private. Settings has a test
+  button and the recent sends.
 - **Bookings**: searchable/filterable list.
 - **Analytics**: year to date, last 12 months and next 90 days against the same dates last year; revenue,
   occupancy or ADR by month next to the same month last year; pace (on the books now versus what was booked
@@ -110,7 +116,7 @@ Settings). Failed logins are rate-limited (10 per IP per 15 minutes).
 `server/beds24.js` API client + token handling · `server/sync.js` mapping and sync ·
 `server/rates.js` prices, minimum stays and blocks · `server/doors.js` + `server/seam.js` door codes ·
 `server/messages.js` inbox and saved replies · `server/pricing.js` pricing tool · `server/cleaning.js` Turno feed and turnovers · `server/automations.js` automated messages · `server/listing.js` listing editor ·
-`server/analytics.js` analytics · `server/ai.js` AI assistant ·
+`server/analytics.js` analytics · `server/ai.js` AI assistant · `server/notify.js` phone notifications ·
 `server/guesty.js` Guesty import ·
 `server/stats.js` metrics · `server/demo.js` sample data · `public/` UI · `test/` (`npm test`).
 

@@ -581,3 +581,48 @@ test('Analytics and AI assistant over HTTP: key stays on the server, answers com
   const usage = (await call('/api/ai')).json;
   assert.equal(usage.month.requests, 2);
 });
+
+test('Phone notifications: test message, then a new guest message is pushed to ntfy once', async t => {
+  const beds = await fakeBeds24Messages();
+  t.after(() => beds.srv.close());
+  const pushes = [];
+  const ntfy = createServer((req, res) => { let b = ''; req.on('data', c => b += c); req.on('end', () => { pushes.push({ path: req.url, auth: req.headers.authorization, body: JSON.parse(b) }); res.end('{}'); }); });
+  await new Promise(ok => ntfy.listen(0, '127.0.0.1', ok));
+  t.after(() => ntfy.close());
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), BEDS24_BASE: `http://127.0.0.1:${beds.srv.address().port}`, RAILWAY_PUBLIC_DOMAIN: 'str.example.app' });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+  assert.equal((await call('/api/connect', { inviteCode: 'abc' })).status, 200);
+
+  const n = (await call('/api/notify')).json;
+  assert.equal(n.settings.enabled, false);
+  assert.match(n.settings.topic, /^str-/);
+  const saved = await call('/api/notify', { server: `http://127.0.0.1:${ntfy.address().port}`, token: 'tk_private' });
+  assert.equal(saved.status, 200);
+  assert.equal(saved.json.settings.tokenSet, true);
+  assert.ok(!JSON.stringify((await call('/api/notify')).json).includes('tk_private'), 'the token is never sent to the browser');
+
+  assert.equal((await call('/api/notify/test', {})).status, 200);
+  assert.equal(pushes.length, 1);
+  assert.equal(pushes[0].path, '/');
+  assert.equal(pushes[0].auth, 'Bearer tk_private');
+  assert.equal(pushes[0].body.topic, n.settings.topic);
+
+  assert.equal((await call('/api/notify', { enabled: true })).status, 200);
+  await call('/api/inbox/refresh', {});
+  await new Promise(r => setTimeout(r, 300));
+  assert.equal(pushes.length, 1, 'messages from before notifications were switched on are not sent');
+
+  beds.msgs.push({ id: 100, bookingId: 10, source: 'guest', message: 'Can we check in early?', time: new Date(Date.now() + 1000).toISOString(), read: false });
+  assert.equal((await call('/api/sync', {})).status, 200);   // the sync sends notifications before it returns
+  assert.equal(pushes.length, 2);
+  assert.equal(pushes[1].body.title, 'Message from Jordan (Airbnb)');
+  assert.match(pushes[1].body.message, /^Can we check in early\?/);
+  assert.equal(pushes[1].body.click, 'https://str.example.app/#/inbox/10');
+  assert.equal((await call('/api/notify')).json.recent[0].ok, 1);
+  assert.equal((await call('/api/sync', {})).status, 200);
+  assert.equal(pushes.length, 2, 'not sent twice');
+});

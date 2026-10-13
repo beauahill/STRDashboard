@@ -14,6 +14,9 @@ import { SeamClient } from './seam.js';
 import { feedToken, icsForRoom, turnovers } from './cleaning.js';
 import { FIELDS as LISTING_FIELDS, fetchListing, diffListing, saveListing, listingLog } from './listing.js';
 import { analytics } from './analytics.js';
+import {
+  notifySettings, saveNotifySettings, publicNotify, regenerateTopic, runNotifications, sendTest, recentNotifications, fillMissingBookings, appOrigin,
+} from './notify.js';
 import { aiStatus, saveKey, saveAiSettings, cacheListing, draftReply, writeListing, reviewPricing, askData } from './ai.js';
 import {
   seedAutomations, listAutomations, saveAutomation, setEnabled, deleteAutomation, describe, runAutomations, upcoming,
@@ -90,6 +93,7 @@ async function runSync() {
     try { await syncMessages(db, beds24); setSetting(db, 'messages_error', null); }
     catch (e) { setSetting(db, 'messages_error', e.message); }
     await runAutomationsSafely();
+    await runNotificationsSafely();
     return r;
   }
   catch (e) { setSetting(db, 'last_sync_error', e.message); throw e; }
@@ -104,6 +108,23 @@ async function runAutomationsSafely() {
   try { const r = await runAutomations(db, beds24); setSetting(db, 'automations_error', null); return r; }
   catch (e) { setSetting(db, 'automations_error', e.message); return { error: e.message }; }
   finally { automationsRunning = false; }
+}
+
+// Phone notifications: while they're on, new guest messages are checked every minute (the full sync runs every
+// 15), then anything new is sent. Never throws.
+let notifying = false;
+async function runNotificationsSafely({ pollMessages = false } = {}) {
+  if (notifying) return null;
+  notifying = true;
+  try {
+    if (pollMessages && beds24.connected && !syncing && getSetting(db, 'messages_synced')) {
+      try { await syncMessages(db, beds24, { maxAge: 1 }); setSetting(db, 'messages_error', null); }
+      catch (e) { setSetting(db, 'messages_error', e.message); }
+    }
+    if (beds24.connected) await fillMissingBookings(db, beds24).catch(() => {});
+    return await runNotifications(db);
+  } catch (e) { setSetting(db, 'notify_error', e.message); return { error: e.message }; }
+  finally { notifying = false; }
 }
 
 // Door codes run after every sync and after lock changes. Failures are recorded, never thrown, so a
@@ -121,6 +142,15 @@ function checkEntries(entries) {
     if (!known.has(e.deviceId) || typeof e.accessCodeId !== 'string') throw Object.assign(new Error('Unknown lock code.'), { status: 400 });
   }
   return entries.map(e => ({ deviceId: e.deviceId, accessCodeId: e.accessCodeId, managed: !!e.managed }));
+}
+
+// The app's own address, remembered from the browser so notifications can link back to it (Railway also provides it).
+function rememberOrigin(req) {
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  if (!host || /^(localhost|127\.|\[::1\])/.test(host)) return null;
+  const origin = `${req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http'}://${host}`;
+  setSetting(db, 'app_origin', origin);
+  return origin;
 }
 
 const send = (res, code, body, type = 'application/json') => {
@@ -303,6 +333,20 @@ async function api(req, res, url) {
     }
     case 'GET /api/analytics':
       return send(res, 200, analytics(db, localToday(doorSettings(db).tz), { propertyId: prop, range: q.range }));
+    case 'GET /api/notify':
+      return send(res, 200, { settings: publicNotify(notifySettings(db)), recent: recentNotifications(db), error: getSetting(db, 'notify_error'),
+        linksWork: !!(appOrigin(db) || rememberOrigin(req)) });
+    case 'POST /api/notify': {
+      rememberOrigin(req);
+      return send(res, 200, { settings: publicNotify(saveNotifySettings(db, await readJson(req))) });
+    }
+    case 'POST /api/notify/test': {
+      rememberOrigin(req);
+      const s = notifySettings(db);
+      try { await sendTest(db); } catch (e) { throw Object.assign(new Error(`Couldn't send the test: ${e.message}`), { status: 502 }); }
+      return send(res, 200, { ok: true, topic: s.topic });
+    }
+    case 'POST /api/notify/new-topic': return send(res, 200, { settings: publicNotify(regenerateTopic(db)) });
     case 'GET /api/ai': return send(res, 200, aiStatus(db));
     case 'POST /api/ai/key': { const { apiKey } = await readJson(req); return send(res, 200, await saveKey(db, apiKey)); }
     case 'POST /api/ai/settings': return send(res, 200, saveAiSettings(db, await readJson(req)));
@@ -333,6 +377,7 @@ async function api(req, res, url) {
         setSetting(db, 'messages_poll', Date.now());
         try { await syncMessages(db, beds24); setSetting(db, 'messages_error', null); }
         catch (e) { setSetting(db, 'messages_error', e.message); }
+        runNotificationsSafely();
       }
       return send(res, 200, { unread: unreadCount(db), error: getSetting(db, 'messages_error') });
     }
@@ -515,6 +560,7 @@ server.listen(PORT, host, () => {
 
 setInterval(() => runSync().catch(e => console.error('sync failed:', e.message)), 15 * 60000).unref();
 setInterval(() => runAutomationsSafely(), 5 * 60000).unref();
+setInterval(() => { if (notifySettings(db).enabled) runNotificationsSafely({ pollMessages: true }); }, 60000).unref();
 
 // Railway sends SIGTERM on redeploy; close cleanly so SQLite isn't mid-write.
 for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => {

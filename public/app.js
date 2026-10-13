@@ -187,7 +187,8 @@ async function bookingsView() {
 
 async function settingsView() {
   status = await api('/status');
-  const AI = await api('/ai');
+  const [AI, N] = await Promise.all([api('/ai'), api('/notify')]);
+  const NS = N.settings;
   view.innerHTML = `<div class="card stack"><h3>Beds24 connection</h3>
     <div>${status.connected ? '✅ Connected' : 'Not connected'}${status.demo ? ' · <b>demo data loaded</b>' : ''}</div>
     <div class="sub">Last sync: ${status.lastSync ? new Date(status.lastSync).toLocaleString() : 'never'}${status.lastSyncError ? ' · error: ' + esc(status.lastSyncError) : ''}</div>
@@ -198,6 +199,29 @@ async function settingsView() {
     ${status.demo ? '<hr><button id="cleardemo">Clear demo data</button>'
       : status.connected ? '' : '<hr><button id="demo">Load demo data</button><div class="sub">Fills the app with sample properties and bookings so you can try it before connecting. Connecting to Beds24 removes it automatically.</div>'}
     ${status.auth ? '<hr><button id="lo">Sign out</button>' : ''}</div>
+    <div class="card stack" style="margin-top:14px"><h3>Phone notifications</h3>
+      <div>${NS.enabled ? '✅ On' : 'Off'}${N.error ? ` · <span class="bad">Last send failed: ${esc(N.error)}</span>` : ''}</div>
+      <div class="sub">Alerts on your phones through the free <a href="https://ntfy.sh" target="_blank" rel="noopener">ntfy</a> app, within about a minute of a guest message. Tap one to open that conversation.</div>
+      <ol class="sub steps">
+        <li>Install <b>ntfy</b> on each phone (<a href="https://docs.ntfy.sh/subscribe/phone/" target="_blank" rel="noopener">App Store and Google Play links</a>).</li>
+        <li>In ntfy, tap <b>+</b> and subscribe to the topic <code class="code" id="ntopic">${esc(NS.topic)}</code> <button type="button" id="ncopy" class="linkbtn">Copy</button>${NS.server !== 'https://ntfy.sh' ? ` on the server <code class="code">${esc(NS.server)}</code>` : ' (leave the server as ntfy.sh)'}. Allow notifications when the phone asks.</li>
+        <li>Press <b>Send test</b>. When it arrives, tick <b>Send notifications</b> and save.</li>
+      </ol>
+      <form id="nform" class="stack" style="max-width:none">
+        <label><input type="checkbox" name="enabled" ${NS.enabled ? 'checked' : ''}> <b>Send notifications</b></label>
+        <div class="sub">Notify about:</div>
+        <label class="sub"><input type="checkbox" name="messages" ${NS.messages ? 'checked' : ''}> New guest messages and inquiries</label>
+        <label class="sub"><input type="checkbox" name="bookings" ${NS.bookings ? 'checked' : ''}> New bookings and booking requests</label>
+        <label class="sub"><input type="checkbox" name="cancellations" ${NS.cancellations ? 'checked' : ''}> Cancellations</label>
+        <label class="sub"><input type="checkbox" name="problems" ${NS.problems ? 'checked' : ''}> Problems: a failed automated message, a door code not working before arrival, Beds24 not syncing</label>
+        <label class="sub"><input type="checkbox" name="preview" ${NS.preview ? 'checked' : ''}> Include the guest's message text (otherwise just "New message from …")</label>
+        <details><summary class="sub">Advanced</summary><div class="stack" style="max-width:none;margin-top:8px">
+          <label class="sub">ntfy server <input name="server" value="${esc(NS.server)}" style="width:100%"></label>
+          <label class="sub">Access token (only for a private or self-hosted ntfy server)${NS.tokenSet ? ' · one is saved' : ''} <input name="token" type="password" autocomplete="off" placeholder="${NS.tokenSet ? 'Leave blank to keep it' : 'tk_…'}" style="width:100%"></label>
+          <div><button type="button" id="nnew">New topic name</button> <span class="sub">Stops alerts to phones subscribed to the old one; subscribe again with the new name.</span></div></div></details>
+        <div class="toolbar" style="margin:0"><button class="primary">Save</button><button type="button" id="ntest">Send test</button></div></form>
+      <div class="sub">On ntfy.sh, anyone who knows the topic name can read these alerts, so keep it private (it's long and random for that reason).</div>
+      ${N.recent.length ? `<details><summary class="sub">Recently sent</summary><ul class="list">${N.recent.map(x => `<li><span>${x.ok ? '<span class="ok">✓</span>' : '<span class="bad">✗</span>'} ${esc(x.title || x.kind)}${x.error ? `<div class="sub">${esc(x.error)}</div>` : ''}</span><span class="sub">${new Date(x.at).toLocaleString()}</span></li>`).join('')}</ul></details>` : ''}</div>
     <div class="card stack" style="margin-top:14px"><h3>AI assistant</h3>
       <div>${AI.configured ? `✅ Anthropic API key saved (${esc(AI.keyHint)})${AI.fromEnv ? ' from the ANTHROPIC_API_KEY variable' : ''}` : 'Not set up'}</div>
       <div class="sub">Claude drafts guest replies (Inbox), writes listing text (Listing), reviews prices (Pricing) and answers questions about your numbers (Analytics).
@@ -220,6 +244,29 @@ async function settingsView() {
   if ($('#cleardemo')) $('#cleardemo').onclick = () => act(() => api('/demo/clear', { method: 'POST' }));
   if ($('#lo')) $('#lo').onclick = async () => { await api('/logout', { method: 'POST' }); showLogin(); };
   if ($('#dc')) $('#dc').onclick = () => act(() => api('/disconnect', { method: 'POST' }));
+  $('#ncopy').onclick = async () => {
+    try { await navigator.clipboard.writeText(NS.topic); $('#ncopy').textContent = 'Copied'; }
+    catch { getSelection().selectAllChildren($('#ntopic')); }
+  };
+  $('#nform').onsubmit = async e => {
+    e.preventDefault();
+    const f = e.target, body = Object.fromEntries(['enabled', 'messages', 'bookings', 'cancellations', 'problems', 'preview'].map(k => [k, f.elements[k].checked]));
+    body.server = f.server.value;
+    if (f.token.value.trim()) body.token = f.token.value.trim();
+    try { await api('/notify', { method: 'POST', body }); await settingsView(); banner(body.enabled ? 'Notifications are on.' : 'Notification settings saved.', 'ok'); }
+    catch (err) { if (err.message !== 'login') banner(err.message, true); }
+  };
+  $('#ntest').onclick = async () => {
+    const b = $('#ntest'); b.disabled = true; b.textContent = 'Sending…';
+    try { await api('/notify/test', { method: 'POST' }); banner('Test sent. It should appear on every phone subscribed to the topic within a few seconds.', 'ok'); }
+    catch (err) { if (err.message !== 'login') banner(err.message, true); }
+    b.disabled = false; b.textContent = 'Send test';
+  };
+  $('#nnew').onclick = async () => {
+    if (!confirm('Make a new topic name? Phones subscribed to the current one will stop getting alerts until they subscribe to the new one.')) return;
+    try { await api('/notify/new-topic', { method: 'POST' }); await settingsView(); banner('New topic created. Subscribe to it in ntfy on each phone.', 'ok'); }
+    catch (err) { if (err.message !== 'login') banner(err.message, true); }
+  };
   $('#aikey').onsubmit = async e => {
     e.preventDefault();
     const key = e.target.key.value.trim();
@@ -1225,7 +1272,9 @@ async function act(fn) {
 
 const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, automations: automationsView, bookings: bookingsView, analytics: analyticsView, listing: listingView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
 async function render() {
-  const r = location.hash.replace(/^#\/?/, '');
+  // #/inbox/123 (from a phone notification) opens that conversation.
+  const [r, arg] = location.hash.replace(/^#\/?/, '').split('/');
+  if (r === 'inbox' && /^\d+$/.test(arg || '')) inbox.booking = +arg;
   clearInterval(pageTimer); pageTimer = null;
   document.querySelectorAll('nav a').forEach(a => a.classList.toggle('on', a.dataset.r === r));
   try {
