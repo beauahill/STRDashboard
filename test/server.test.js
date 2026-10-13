@@ -676,3 +676,37 @@ test('Smart home over HTTP: connect Home Assistant, status without the token, au
   assert.equal((await call('/api/home/disconnect', {})).status, 200);
   assert.equal((await call('/api/home')).json.configured, false);
 });
+
+test('Direct booking site: hidden until switched on, preview for the owner, live page, photos and custom domain', async t => {
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite') });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+  assert.equal((await call('/api/demo', {})).status, 200);
+  const site = (await call('/api/site')).json;
+  const pid = site.site.propertyId, path = `/stay/${site.site.slug}`;
+  assert.equal((await fetch(s.url(path))).status, 404, 'off: not public');
+  const preview = await fetch(s.url(path), { headers: { cookie: sid } });
+  assert.equal(preview.status, 200, 'the signed-in owner sees a preview');
+  assert.match(await preview.text(), /only you can see it/);
+  const up = await call('/api/site/photos', { propertyId: pid, dataUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==' });
+  assert.equal(up.status, 200);
+  assert.equal((await call('/api/site', { propertyId: pid, enabled: true, domain: 'book.example.com', perk: 'Best price here' })).status, 200);
+  const live = await fetch(s.url(path));
+  assert.equal(live.status, 200);
+  const html = await live.text();
+  assert.match(html, /Best price here/);
+  assert.ok(!/only you can see it/.test(html));
+  const av = await (await fetch(s.url(`${path}/availability.json`))).json();
+  assert.ok(Array.isArray(av.nights) && av.nights.length === 365);
+  assert.ok(!JSON.stringify(av).match(/guest|name/i), 'no guest details in the public data');
+  const img = await fetch(s.url(`${path}/photo/${up.json.id}`));
+  assert.equal(img.headers.get('content-type'), 'image/png');
+  assert.equal((await fetch(s.url(`${path}/photo/999`))).status, 404);
+  assert.match(await (await fetch(s.url(`${path}/terms`))).text(), /Rental agreement/);
+  const byDomain = await fetch(s.url('/'), { headers: { 'x-forwarded-host': 'book.example.com' } });
+  assert.match(await byDomain.text(), /Best price here/, 'the custom domain opens the site');
+  assert.match(await (await fetch(s.url('/'))).text(), /STR Dashboard/, 'the app itself is unchanged on its own address');
+});

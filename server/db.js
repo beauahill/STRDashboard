@@ -101,6 +101,11 @@ CREATE TABLE IF NOT EXISTS ha_alerts (entity_id TEXT NOT NULL, rule TEXT NOT NUL
 CREATE TABLE IF NOT EXISTS ha_alert_log (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_id TEXT NOT NULL, rule TEXT NOT NULL, since TEXT NOT NULL, until TEXT, peak REAL);
 CREATE TABLE IF NOT EXISTS ha_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, entity_id TEXT, kind TEXT NOT NULL, detail TEXT, ok INTEGER NOT NULL, notify INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS ha_done (key TEXT PRIMARY KEY, at TEXT NOT NULL);
+-- Photos for the direct booking site (uploaded, or links to Beds24's copies).
+CREATE TABLE IF NOT EXISTS site_photos (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, property_id INTEGER NOT NULL, sort INTEGER DEFAULT 0, caption TEXT,
+  mime TEXT, data BLOB, url TEXT, created_at TEXT
+);
 -- Every change sent to Beds24 from this app, successful or not.
 CREATE TABLE IF NOT EXISTS change_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, room_id INTEGER NOT NULL,

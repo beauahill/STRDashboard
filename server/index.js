@@ -14,6 +14,7 @@ import { SeamClient } from './seam.js';
 import { feedToken, icsForRoom, turnovers } from './cleaning.js';
 import { FIELDS as LISTING_FIELDS, fetchListing, diffListing, saveListing, listingLog } from './listing.js';
 import { analytics } from './analytics.js';
+import { siteSettings, saveSite, siteFor, listPhotos, addPhoto, updatePhotos, importBeds24Photos, photo, availability, renderSite, renderTerms } from './site.js';
 import {
   ROLES as HA_ROLES, haConfigured, haClient, connectHA, disconnectHA, discover, saveEntities, saveHASettings, pollHA, runClimate, homeStatus, homeBrief,
   stayList, stayRecord,
@@ -362,6 +363,25 @@ async function api(req, res, url) {
       return send(res, 200, { ok: true, topic: s.topic });
     }
     case 'POST /api/notify/new-topic': return send(res, 200, { settings: publicNotify(regenerateTopic(db)) });
+    case 'GET /api/site': {
+      const props = db.prepare('SELECT id, name FROM properties WHERE id > 0 ORDER BY name').all();
+      const pid = props.some(p => p.id === Number(q.property)) ? Number(q.property) : props[0]?.id;
+      if (!pid) return send(res, 200, { properties: props });
+      const s = siteSettings(db, pid), origin = appOrigin(db) || rememberOrigin(req) || '';
+      return send(res, 200, { properties: props, site: s, photos: listPhotos(db, pid), url: `${origin}/stay/${s.slug}`, connected: beds24.connected,
+        openNights: availability(db, pid, { days: 90 }).filter(n => n.open).length });
+    }
+    case 'POST /api/site': { const b = await readJson(req); return send(res, 200, { site: saveSite(db, Number(b.propertyId), b) }); }
+    case 'POST /api/site/photos': {
+      const b = await readJson(req, 6e6);
+      return send(res, 200, { id: addPhoto(db, Number(b.propertyId), { dataUrl: b.dataUrl, caption: b.caption }) });
+    }
+    case 'POST /api/site/photos/update': { const b = await readJson(req); return send(res, 200, { photos: updatePhotos(db, Number(b.propertyId), b) }); }
+    case 'POST /api/site/photos/import': {
+      if (!beds24.connected) return send(res, 400, { error: 'Connect Beds24 first.' });
+      const { propertyId } = await readJson(req);
+      return send(res, 200, await importBeds24Photos(db, beds24, Number(propertyId)));
+    }
     case 'GET /api/home':
       return send(res, 200, { ...homeStatus(db), stays: stayList(db, Date.now(), { propertyId: prop }) });
     case 'POST /api/home/connect': {
@@ -582,6 +602,31 @@ const server = createServer(async (req, res) => {
       if (!ics) return send(res, 404, 'Not found', 'text/plain');
       res.writeHead(200, { 'content-type': 'text/calendar; charset=utf-8', 'cache-control': 'no-store' });
       return res.end(ics);
+    }
+    // Direct booking site (public): /stay/<slug>[/...], or the root of its own domain.
+    const host = (req.headers['x-forwarded-host'] || req.headers.host || '').toLowerCase();
+    const stay = url.pathname.match(/^\/stay\/([\w-]+)(\/.*)?$/);
+    const byDomain = !stay && !url.pathname.startsWith('/api/') && siteFor(db, { host });
+    const domainPath = byDomain && (['/', '/terms', '/availability.json'].includes(url.pathname) || /^\/photo\/\d+$/.test(url.pathname));
+    if (stay || domainPath) {
+      const site = stay ? siteFor(db, { slug: stay[1] }) : byDomain;
+      const rest = stay ? stay[2] || '/' : url.pathname;
+      const base = stay ? `/stay/${site?.slug}` : '';
+      const preview = !!site && !site.enabled && (!PASSWORD || validSession(cookie(req).sid));
+      if (!site || (!site.enabled && !preview)) return send(res, 404, 'Not found', 'text/plain');
+      if (rest === '/' || rest === '') {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
+        return res.end(renderSite(db, site, { base, preview: preview || url.searchParams.has('preview'), origin: appOrigin(db) || '' }));
+      }
+      if (rest === '/terms') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); return res.end(renderTerms(db, site, { base: base || '/' })); }
+      if (rest === '/availability.json') {
+        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'public, max-age=120' });
+        return res.end(JSON.stringify({ nights: availability(db, site.propertyId) }));
+      }
+      const ph = rest.match(/^\/photo\/(\d+)$/) && photo(db, site.propertyId, Number(rest.split('/')[2]));
+      if (ph?.url) { res.writeHead(302, { location: ph.url, 'cache-control': 'public, max-age=3600' }); return res.end(); }
+      if (ph?.data) { res.writeHead(200, { 'content-type': ph.mime, 'cache-control': 'public, max-age=86400' }); return res.end(ph.data); }
+      return send(res, 404, 'Not found', 'text/plain');
     }
     if (url.pathname.startsWith('/api/')) return await api(req, res, url);
     const rel = normalize(url.pathname === '/' ? '/index.html' : url.pathname).replace(/^(\.\.[/\\])+/, '');

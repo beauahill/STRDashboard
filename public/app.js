@@ -1428,13 +1428,113 @@ async function renderDevices() {
   };
 }
 
+// ---------- Direct booking site ----------
+const st = { property: null };
+async function shrinkImage(file, max = 2000) {
+  const img = await createImageBitmap(file);
+  const scale = Math.min(1, max / Math.max(img.width, img.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', 0.85);
+}
+
+async function siteView() {
+  const S = await api('/site?' + new URLSearchParams(st.property ? { property: st.property } : {}));
+  if (!S.site) { view.innerHTML = '<div class="card empty">No properties yet. Connect Beds24 in Settings first.</div>'; return; }
+  const s = S.site;
+  st.property = s.propertyId;
+  const base = `/stay/${s.slug}`;
+  const field = (name, label, opts = {}) => opts.area
+    ? `<label class="sub">${label}<textarea name="${name}" rows="${opts.rows || 5}" style="width:100%">${esc(s[name])}</textarea>${opts.hint ? `<span class="sub">${opts.hint}</span>` : ''}</label>`
+    : `<label class="sub">${label}<input name="${name}" value="${esc(s[name])}" ${opts.type ? `type="${opts.type}"` : ''} style="width:${opts.w || '100%'}" ${opts.ph ? `placeholder="${esc(opts.ph)}"` : ''}>${opts.hint ? `<span class="sub">${opts.hint}</span>` : ''}</label>`;
+  view.innerHTML = `
+    <div class="card stack" style="max-width:none;margin-bottom:14px"><div class="toolbar" style="margin:0">
+      ${S.properties.length > 1 ? `<select id="sprop">${S.properties.map(p => `<option value="${p.id}" ${p.id === s.propertyId ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>` : `<h3 style="margin:0">Direct booking site</h3>`}
+      <span style="margin-left:auto"></span><a href="${esc(S.url)}" target="_blank" rel="noopener"><button type="button">Open ${s.enabled ? 'site' : 'preview'} ↗</button></a></div>
+      <div>${s.enabled ? `✅ Live at <a href="${esc(S.url)}" target="_blank" rel="noopener">${esc(S.url)}</a>${s.domain ? ` and <a href="https://${esc(s.domain)}" target="_blank" rel="noopener">${esc(s.domain)}</a>` : ''}` : 'Off: only you can see the preview while signed in.'}</div>
+      <div class="sub">${S.openNights} nights open for booking in the next 90 days. Availability and nightly prices come from Beds24 (set them on the Rates and Pricing pages). Guests pick dates here, then finish and pay on your Beds24 booking page.</div>
+      ${!s.listingCached ? '<div class="sub warn">Open the Listing page once to fill this page from your Beds24 listing text.</div>' : ''}</div>
+    <form id="sform">
+      <div class="cols">
+        <div class="card stack" style="max-width:none"><h3>Setup</h3>
+          <label><input type="checkbox" name="enabled" ${s.enabled ? 'checked' : ''}> <b>Site is live</b></label>
+          ${field('slug', `Web address: ${esc(S.url.replace(/\/stay\/.*$/, ''))}/stay/…`, { w: '16em' })}
+          ${field('bookingUrl', 'Beds24 booking page link', { hint: 'In Beds24: Settings → Booking Engine. Connect Stripe under Settings → Payments → Payment Gateways so guests pay when they book; a security deposit can be held on their card with a payment rule that doesn\'t capture.' })}
+          ${field('domain', 'Your own domain (optional)', { ph: 'book.example.com', hint: 'Add it as a custom domain on the Railway service and point its CNAME record at Railway; the site then opens at that domain.' })}
+          <div class="toolbar" style="margin:0">${field('maxGuests', 'Max guests', { type: 'number', w: '6em' })}${field('cleaningFee', 'Cleaning fee for estimates ($)', { type: 'number', w: '8em' })}</div>
+          ${field('contactEmail', 'Contact email (optional)', { type: 'email' })}${field('contactPhone', 'Contact phone (optional)')}
+        </div>
+        <div class="card stack" style="max-width:none"><h3>Page text</h3>
+          ${field('title', 'Title')}${field('perk', 'Why book direct', { ph: 'Book direct and save 10% compared with Airbnb.' })}
+          ${field('intro', 'Description', { area: true, rows: 7 })}${field('highlights', 'Highlights (one per line)', { area: true, rows: 5 })}
+          ${s.listingCached ? '<div><button type="button" id="sfill">Refill from Beds24 listing text</button></div>' : ''}
+        </div>
+      </div>
+      <div class="cols" style="margin-top:14px">
+        <div class="card stack" style="max-width:none"><h3>Rules and policies</h3>${field('houseRules', 'House rules', { area: true })}${field('neighbourhood', 'The neighbourhood', { area: true })}${field('cancellation', 'Cancellation policy', { area: true })}</div>
+        <div class="card stack" style="max-width:none"><h3>Rental agreement</h3>${field('agreement', 'Agreement text', { area: true, rows: 14,
+          hint: `Shown at <a href="${base}/terms" target="_blank" rel="noopener">${esc(S.url)}/terms</a>. Link it from your Beds24 booking page's terms so guests accept it when they book. Fill-ins: {check_in_time}, {check_out_time}, {property_name}. It's a starting template, not legal advice.` })}</div>
+      </div>
+      <div class="card" style="margin-top:14px;position:sticky;bottom:0;z-index:3"><button class="primary">Save</button> <span class="sub">Changes show on the site straight away.</span></div>
+    </form>
+    <div class="card stack" style="max-width:none;margin-top:14px"><h3>Photos</h3>
+      <div class="toolbar" style="margin:0"><label class="sub">Add photos <input type="file" id="sfiles" accept="image/*" multiple></label>
+        ${S.connected ? '<button type="button" id="simport">Import from Beds24</button>' : ''}<span class="sub" id="sup"></span></div>
+      <div class="sub">The first photo is the big one. Photos are resized to 2000 px before upload.</div>
+      <div class="photos">${S.photos.map((p, i) => `<div class="ph" data-id="${p.id}"><img src="${base}/photo/${p.id}" alt="" loading="lazy">
+        <input value="${esc(p.caption || '')}" placeholder="Caption" data-cap="${p.id}"><div class="toolbar" style="margin:4px 0 0">
+        <button type="button" data-mv="-1" ${i ? '' : 'disabled'}>←</button><button type="button" data-mv="1" ${i < S.photos.length - 1 ? '' : 'disabled'}>→</button><button type="button" data-del>Delete</button></div></div>`).join('') || '<div class="empty">No photos yet.</div>'}</div>
+      ${S.photos.length ? '<div><button type="button" id="scaps">Save captions</button></div>' : ''}
+    </div>`;
+
+  if ($('#sprop')) $('#sprop').onchange = e => { st.property = +e.target.value; siteView(); };
+  const form = $('#sform');
+  form.onsubmit = async e => {
+    e.preventDefault();
+    const body = { propertyId: s.propertyId, enabled: form.enabled.checked };
+    for (const k of ['slug', 'bookingUrl', 'domain', 'maxGuests', 'cleaningFee', 'contactEmail', 'contactPhone', 'title', 'perk', 'intro', 'highlights', 'houseRules', 'neighbourhood', 'cancellation', 'agreement']) body[k] = form.elements[k].value;
+    try { await api('/site', { method: 'POST', body }); await siteView(); banner(body.enabled ? 'Saved. The site is live.' : 'Saved.', 'ok'); }
+    catch (err) { if (err.message !== 'login') banner(err.message, true); }
+  };
+  if ($('#sfill')) $('#sfill').onclick = async () => {
+    if (!confirm('Replace the title, description, house rules, neighbourhood and cancellation text with your Beds24 listing text?')) return;
+    try { await api('/site', { method: 'POST', body: { propertyId: s.propertyId, title: '', intro: '', houseRules: '', neighbourhood: '', cancellation: '' } }); await siteView(); banner('Refilled from your listing.', 'ok'); }
+    catch (err) { if (err.message !== 'login') banner(err.message, true); }
+  };
+  const photosNow = () => [...view.querySelectorAll('.ph')].map(el => +el.dataset.id);
+  const update = async body => { try { await api('/site/photos/update', { method: 'POST', body: { propertyId: s.propertyId, ...body } }); await siteView(); } catch (err) { if (err.message !== 'login') banner(err.message, true); } };
+  view.querySelectorAll('.ph').forEach(el => {
+    const id = +el.dataset.id;
+    el.querySelectorAll('[data-mv]').forEach(b => b.onclick = () => { const ids = photosNow(), i = ids.indexOf(id), j = i + +b.dataset.mv; [ids[i], ids[j]] = [ids[j], ids[i]]; update({ order: ids }); });
+    el.querySelector('[data-del]').onclick = () => confirm('Delete this photo?') && update({ remove: [id] });
+  });
+  if ($('#scaps')) $('#scaps').onclick = () => update({ captions: Object.fromEntries([...view.querySelectorAll('[data-cap]')].map(i => [i.dataset.cap, i.value])) });
+  $('#sfiles').onchange = async e => {
+    const files = [...e.target.files];
+    let done = 0;
+    for (const f of files) {
+      $('#sup').textContent = `Uploading ${done + 1} of ${files.length}…`;
+      try { await api('/site/photos', { method: 'POST', body: { propertyId: s.propertyId, dataUrl: await shrinkImage(f) } }); done++; }
+      catch (err) { if (err.message !== 'login') banner(`${f.name}: ${err.message}`, true); }
+    }
+    await siteView();
+    if (done) banner(`Added ${done} photo${done === 1 ? '' : 's'}.`, 'ok');
+  };
+  if ($('#simport')) $('#simport').onclick = async () => {
+    $('#simport').disabled = true;
+    try { const r = await api('/site/photos/import', { method: 'POST', body: { propertyId: s.propertyId } }); await siteView(); banner(r.found ? `Found ${r.found} photos in Beds24, added ${r.added}.` : 'Beds24 didn\'t return any photos for this property. Upload them here instead.', r.found ? 'ok' : ''); }
+    catch (err) { if (err.message !== 'login') banner(err.message, true); $('#simport').disabled = false; }
+  };
+}
+
 async function act(fn) {
   const btn = $('#sync'); btn.disabled = true; banner('Working…');
   try { await fn(); banner(''); await boot(true); } catch (e) { if (e.message !== 'login') banner(e.message, true); }
   btn.disabled = false;
 }
 
-const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, automations: automationsView, bookings: bookingsView, analytics: analyticsView, home: homeView, listing: listingView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
+const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, automations: automationsView, bookings: bookingsView, analytics: analyticsView, home: homeView, site: siteView, listing: listingView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
 async function render() {
   // #/inbox/123 (from a phone notification) opens that conversation.
   const [r, arg] = location.hash.replace(/^#\/?/, '').split('/');

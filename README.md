@@ -76,6 +76,13 @@ Settings is the gear at the top right. On a phone, "Add to Home Screen" installs
   - *Stay records*: readings saved every 10 minutes (kept 400 days) give each stay's temperature range, humidity,
     worst PM2.5 / CO₂, alerts and lock/leak events, with charts, for smoking or damage claims.
   - Door codes stay with Seam (Home Assistant's Yale integration doesn't manage keypad codes).
+- **Booking site** (direct bookings): a public page per property at `/stay/<name>` (or your own domain) with
+  photos, description, highlights, house rules, neighbourhood, cancellation policy and check-in times; a two-month
+  availability calendar with nightly prices from Beds24 (booked, blocked and unpriced nights closed, minimum stays
+  respected); an estimate with the cleaning fee; and **Book now**, which opens your Beds24 booking page with the dates
+  and guests filled in, where the guest pays (Stripe through Beds24) and gets Beds24's confirmation email. A rental
+  agreement page to link from the booking page's terms. Only availability and prices are public. Off until switched
+  on; while off, you see a preview when signed in. Photos are uploaded (resized in the browser) or imported from Beds24.
 - **Bookings**: searchable/filterable list.
 - **Analytics**: year to date, last 12 months and next 90 days against the same dates last year; revenue,
   occupancy or ADR by month next to the same month last year; pace (on the books now versus what was booked
@@ -136,7 +143,7 @@ Settings is the gear at the top right. On a phone, "Add to Home Screen" installs
 `server/beds24.js` API client + token handling · `server/sync.js` mapping and sync ·
 `server/rates.js` prices, minimum stays and blocks · `server/doors.js` + `server/seam.js` door codes ·
 `server/messages.js` inbox and saved replies · `server/pricing.js` pricing tool · `server/cleaning.js` Turno feed and turnovers · `server/automations.js` automated messages · `server/listing.js` listing editor ·
-`server/analytics.js` analytics · `server/ai.js` AI assistant · `server/notify.js` phone notifications · `server/ha.js` Home Assistant ·
+`server/analytics.js` analytics · `server/ai.js` AI assistant · `server/notify.js` phone notifications · `server/ha.js` Home Assistant · `server/site.js` booking site ·
 `server/guesty.js` Guesty import ·
 `server/stats.js` metrics · `server/demo.js` sample data · `public/` UI · `test/` (`npm test`).
 

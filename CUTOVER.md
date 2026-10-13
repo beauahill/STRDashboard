@@ -115,3 +115,17 @@ Do one channel at a time, and check each before moving on.
 - [ ] Watch the first few days closely: a new booking on each channel should appear in Beds24, the
       dashboard and Turno.
 - [ ] Only then cancel Guesty. Keep the history export.
+
+## Direct booking site (replaces Guesty's)
+
+1. In Beds24: **Settings → Payments → Payment Gateways → Stripe**: connect Stripe and set capture so guests pay
+   when they book. For a damage deposit, add a payment rule that authorises without capturing (a hold).
+2. In Beds24: **Settings → Booking Engine**: check the booking page shows your room and prices, link the rental
+   agreement (the app's **Booking site** page shows its address) in the terms, and make sure the booking
+   confirmation email to guests is switched on (direct guests don't get Airbnb's emails).
+3. In the app: **Booking site** → add photos, check the text, paste your Beds24 booking page link if it differs,
+   preview, then tick **Site is live**.
+4. Optional: add your own domain (e.g. book.yourdomain.com) as a custom domain on the Railway service, point its
+   CNAME at Railway, and enter it on the Booking site page.
+5. Make a test booking for a night far ahead, then cancel it in Beds24. Then point Guesty's direct booking links
+   at the new site before cancelling Guesty.
