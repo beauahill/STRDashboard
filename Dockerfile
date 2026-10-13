@@ -1,7 +1,8 @@
 FROM node:22-slim
 ENV NODE_ENV=production
 WORKDIR /app
-COPY package.json ./
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 COPY server ./server
 COPY public ./public
 EXPOSE 3000

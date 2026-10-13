@@ -60,6 +60,31 @@ CREATE TABLE IF NOT EXISTS pricing_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL,
   pct REAL NOT NULL, min_stay INTEGER, source TEXT
 );
+-- Automated guest messages: when to send (anchor + offset), to whom (filters) and what (template).
+CREATE TABLE IF NOT EXISTS automations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+  anchor TEXT NOT NULL,            -- booked | cancelled | dates_changed | arrival | departure
+  offset_days INTEGER DEFAULT 0, at_time TEXT, delay_minutes INTEGER DEFAULT 0,
+  channels TEXT, min_nights INTEGER, body TEXT NOT NULL,
+  enabled INTEGER DEFAULT 0, enabled_at TEXT, sort INTEGER DEFAULT 0
+);
+-- One row per automation per booking (per date change): what was sent, is waiting, failed or was skipped.
+CREATE TABLE IF NOT EXISTS automation_sends (
+  automation_id INTEGER NOT NULL, booking_id INTEGER NOT NULL, key TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL, scheduled_at TEXT, sent_at TEXT, error TEXT, body TEXT, updated_at TEXT,
+  PRIMARY KEY (automation_id, booking_id, key)
+);
+-- Last known dates per booking, to notice date changes.
+CREATE TABLE IF NOT EXISTS booking_snapshots (booking_id INTEGER PRIMARY KEY, arrival TEXT, departure TEXT);
+-- Listing content saves (property and room texts/details) sent to Beds24.
+CREATE TABLE IF NOT EXISTS listing_changes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, property_id INTEGER NOT NULL, summary TEXT NOT NULL, ok INTEGER NOT NULL, error TEXT
+);
+-- Each AI assistant request, with its token use and estimated cost (US$).
+CREATE TABLE IF NOT EXISTS ai_usage (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, task TEXT NOT NULL, calls INTEGER, input_tokens INTEGER,
+  output_tokens INTEGER, cache_write_tokens INTEGER, cache_read_tokens INTEGER, cost REAL, error TEXT
+);
 -- Every change sent to Beds24 from this app, successful or not.
 CREATE TABLE IF NOT EXISTS change_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, room_id INTEGER NOT NULL,
@@ -72,6 +97,8 @@ CREATE TABLE IF NOT EXISTS change_log (
 const ADDED_COLUMNS = [
   ['bookings', 'source', "TEXT NOT NULL DEFAULT 'beds24'"],  // beds24 | guesty
   ['bookings', 'payout', 'REAL'],                             // what reached the host, when known
+  ['bookings', 'cancelled_at', 'TEXT'],                       // Beds24 cancelTime
+  ['bookings', 'first_seen', 'TEXT'],                         // when this app first saw the booking
 ];
 
 export function openDb(path = ':memory:') {

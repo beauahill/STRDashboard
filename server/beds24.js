@@ -37,10 +37,12 @@ export class Beds24Client {
   }
 
   /** true/false when Beds24 told us the scopes, null when unknown (older connections). */
-  get canWriteInventory() {
+  get canWriteInventory() { return this.#canWrite('inventory'); }
+  get canWriteProperties() { return this.#canWrite('properties'); }
+  #canWrite(area) {
     const s = this.scopes;
     if (!s) return null;
-    return s.some(x => /inventory/i.test(x) && !/^read/i.test(x));
+    return s.some(x => new RegExp(area, 'i').test(x) && !/^read/i.test(x));
   }
 
   #cacheToken(token, expiresIn = 86400) {

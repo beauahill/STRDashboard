@@ -5,6 +5,7 @@ import { createServer } from 'node:http';
 import { mkdtempSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fakeAnthropic } from './fake-anthropic.js';
 
 const SERVER = new URL('../server/index.js', import.meta.url).pathname;
 // PORT=0 lets the OS pick a free port; the server logs the one it got.
@@ -449,4 +450,134 @@ test('Turno feed URL works without login, only with the right secret, and stops 
   assert.equal((await fetch(s.url('/api/cleaning'))).status, 401, 'the cleaning page itself still needs login');
   await fetch(s.url('/api/cleaning/regenerate'), { method: 'POST', headers: { cookie: sid } });
   assert.equal((await fetch(s.url(feedPath))).status, 404, 'old link stops working');
+});
+
+test('Automations: a due message for a newly synced booking is sent through Beds24 once', async t => {
+  const beds = await fakeBeds24Messages();
+  t.after(() => beds.srv.close());
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), BEDS24_BASE: `http://127.0.0.1:${beds.srv.address().port}` });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+
+  const list = (await call('/api/automations')).json;
+  assert.equal(list.automations.length, 8);
+  assert.equal((await call('/api/automations', { name: 'x', body: '', anchor: 'booked' })).status, 400);
+  // Due 4 days before arrival, i.e. already in the past for this booking: it's sent only because the booking
+  // first appears after the automation was switched on (a last-minute booking).
+  const { json: { id } } = await call('/api/automations', { name: 'Hello', anchor: 'arrival', offset_days: -4, at_time: '00:00', body: 'Hi {guest_first_name}, see you soon at {property_name}!' });
+  await call('/api/automations/enable', { id, enabled: true });
+  assert.equal((await call('/api/connect', { inviteCode: 'abc' })).status, 200);   // first sync runs automations
+
+  const posts = beds.calls.filter(c => c.method === 'POST');
+  assert.deepEqual(posts.map(p => p.body), [[{ bookingId: 10, message: 'Hi Jordan, see you soon at Laramie Retreat!' }]]);
+  await call('/api/automations/run', {});
+  assert.equal(beds.calls.filter(c => c.method === 'POST').length, 1, 'not sent twice');
+  const after = (await call('/api/automations')).json;
+  assert.equal(after.history[0].status, 'sent');
+
+  const pv = await call('/api/automations/preview', { body: 'Code {door_code}, Wi-Fi {wifi_password}', bookingId: 10 });
+  assert.deepEqual(pv.json.missing, ['door_code', 'wifi_password']);
+  assert.equal((await call('/api/property-vars', { propertyId: 500, vars: { wifi_password: 'pokes' } })).status, 200);
+  assert.deepEqual((await call('/api/automations/preview', { body: 'Wi-Fi {wifi_password}', bookingId: 10 })).json, { text: 'Wi-Fi pokes', missing: [] });
+});
+
+function fakeBeds24Listing(scopes) {
+  const prop = { id: 500, name: 'Laramie Retreat', propertyType: 'house', texts: [{ language: 'en', headline: 'Cozy house', propertyDescription: 'Three bedrooms.' }],
+    roomTypes: [{ id: 600, name: 'Whole house', qty: 1, maxPeople: 6, texts: [{ language: 'en', roomDescription: 'Sleeps 6' }] }] };
+  const posts = [];
+  const srv = createServer(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    let raw = ''; for await (const c of req) raw += c;
+    const send = (st, b) => { res.writeHead(st, { 'content-type': 'application/json' }); res.end(JSON.stringify(b)); };
+    if (u.pathname.endsWith('/authentication/setup')) return send(200, { token: 't', refreshToken: 'r', expiresIn: 86400 });
+    if (u.pathname.endsWith('/authentication/details')) return send(200, { token: { scopes } });
+    if (u.pathname.endsWith('/properties') && req.method === 'GET') return send(200, { data: [prop], pages: {} });
+    if (u.pathname.endsWith('/properties') && req.method === 'POST') {
+      if (!scopes.some(s => /^(write|all):properties$/.test(s))) return send(403, { success: false, error: 'missing write:properties scope' });
+      const [b] = JSON.parse(raw); posts.push(b);
+      for (const t of b.texts || []) Object.assign(prop.texts[0], t);
+      if (b.name) prop.name = b.name;
+      return send(201, [{ success: true }]);
+    }
+    if (u.pathname.endsWith('/bookings') || u.pathname.endsWith('/calendar') || u.pathname.endsWith('/messages')) return send(200, { data: [], pages: {} });
+    send(404, { error: 'nope' });
+  });
+  return new Promise(ok => srv.listen(0, '127.0.0.1', () => ok({ srv, posts })));
+}
+
+for (const [label, scopes, canSave] of [['write access', ['all:properties', 'all:bookings'], true], ['read-only', ['read:properties', 'read:bookings'], false]]) {
+  test(`Listing editor over HTTP (${label})`, async t => {
+    const beds = await fakeBeds24Listing(scopes);
+    t.after(() => beds.srv.close());
+    const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), BEDS24_BASE: `http://127.0.0.1:${beds.srv.address().port}` });
+    t.after(() => s.child.kill());
+    await s.ready;
+    const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+    const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+      .then(async r => ({ status: r.status, json: await r.json() }));
+    await call('/api/connect', { inviteCode: 'abc' });
+    const L = (await call('/api/listing')).json;
+    assert.equal(L.canWrite, canSave);
+    assert.equal(L.listing.propertyText.headline, 'Cozy house');
+    const edited = { ...L.listing, propertyText: { ...L.listing.propertyText, headline: 'Walk to War Memorial Stadium' } };
+    const pv = await call('/api/listing/preview', { propertyId: 500, edited });
+    assert.deepEqual(pv.json.changes.map(c => [c.label, c.after]), [['Headline', 'Walk to War Memorial Stadium']]);
+    const saved = await call('/api/listing/save', { propertyId: 500, edited });
+    if (canSave) {
+      assert.equal(saved.status, 200, JSON.stringify(saved.json));
+      assert.deepEqual(beds.posts, [{ id: 500, texts: [{ language: 'en', headline: 'Walk to War Memorial Stadium' }] }]);
+      assert.equal((await call('/api/listing')).json.log[0].ok, 1);
+    } else {
+      assert.equal(saved.status, 403);
+      assert.match(saved.json.error, /write access to Properties/);
+      assert.equal(beds.posts.length, 0);
+    }
+  });
+}
+
+test('Analytics and AI assistant over HTTP: key stays on the server, answers come back', async t => {
+  const ai = await fakeAnthropic();
+  t.after(() => ai.close());
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), ANTHROPIC_BASE_URL: ai.url });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (path, method = 'GET', body) => fetch(s.url(path), { method, headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+  assert.equal((await call('/api/demo', 'POST')).status, 200);
+
+  const a = await call('/api/analytics?range=ytd');
+  assert.equal(a.status, 200);
+  assert.equal(a.json.range, 'ytd');
+  assert.ok(a.json.monthly.length > 6 && a.json.channels.length > 0);
+
+  assert.equal((await call('/api/status')).json.ai, false);
+  const notSet = await call('/api/ai/ask', 'POST', { question: 'How was September?' });
+  assert.equal(notSet.status, 400);
+  assert.match(notSet.json.error, /Add your Anthropic API key/);
+
+  const bad = await call('/api/ai/key', 'POST', { apiKey: 'sk-ant-bad-0000000000000000000000' });
+  assert.equal(bad.status, 400, 'a rejected key is a 400, not a 401 that would look like a logged-out session');
+  const key = 'sk-ant-api03-http-test-key-0000000000';
+  const saved = await call('/api/ai/key', 'POST', { apiKey: key });
+  assert.equal(saved.status, 200);
+  assert.equal(saved.json.keyHint, '…0000');
+  for (const path of ['/api/ai', '/api/status', '/api/settings']) {
+    const r = await fetch(s.url(path), { headers: { cookie: sid } }).then(r => r.text());
+    assert.ok(!r.includes(key), `${path} never contains the key`);
+  }
+  assert.equal((await call('/api/status')).json.ai, true);
+
+  const ask = await call('/api/ai/ask', 'POST', { question: 'How was January?', history: [] });
+  assert.equal(ask.status, 200, JSON.stringify(ask.json));
+  assert.match(ask.json.text, /From the data/);
+  const booking = (await call('/api/bookings?status=confirmed')).json[0];
+  const draft = await call('/api/ai/draft', 'POST', { bookingId: booking.id, instructions: 'keep it short' });
+  assert.equal(draft.status, 200, JSON.stringify(draft.json));
+  assert.ok(ai.requests.every(r => r.headers['x-api-key'] === key || r.headers['x-api-key']?.includes('bad')));
+  const usage = (await call('/api/ai')).json;
+  assert.equal(usage.month.requests, 2);
 });

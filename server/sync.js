@@ -29,7 +29,7 @@ export function mapBooking(b) {
     price: Number(b.price) || 0, currency: b.currency || null,
     notes: [b.notes, b.comments].filter(Boolean).join('\n') || null,
     channel_ref: b.apiReference || null,
-    booked_at: b.bookingTime || null, modified_at: b.modifiedTime || null,
+    booked_at: b.bookingTime || null, modified_at: b.modifiedTime || null, cancelled_at: b.cancelTime || null,
   };
 }
 
@@ -50,14 +50,17 @@ export function upsertProperties(db, props) {
 
 export function upsertBookings(db, list) {
   const cols = ['id','property_id','room_id','status','channel','arrival','departure','nights','guest_name','email',
-    'phone','adults','children','price','currency','notes','channel_ref','booked_at','modified_at'];
-  const stmt = db.prepare(`INSERT OR REPLACE INTO bookings(${cols}) VALUES(${cols.map(() => '?')})`);
+    'phone','adults','children','price','currency','notes','channel_ref','booked_at','modified_at','cancelled_at'];
+  // Update only Beds24's fields so app-side columns (first_seen) survive every sync.
+  const stmt = db.prepare(`INSERT INTO bookings(${cols},first_seen) VALUES(${cols.map(() => '?')},?)
+    ON CONFLICT(id) DO UPDATE SET ${cols.filter(c => c !== 'id').map(c => `${c}=excluded.${c}`).join(', ')}`);
+  const now = new Date().toISOString();
   db.exec('BEGIN');
   try {
     for (const b of list) {
       if (!b.id || !b.arrival || !b.departure) continue;
       const m = mapBooking(b);
-      stmt.run(...cols.map(c => m[c]));
+      stmt.run(...cols.map(c => m[c]), now);
     }
     db.exec('COMMIT');
   } catch (e) { db.exec('ROLLBACK'); throw e; }

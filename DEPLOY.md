@@ -45,7 +45,8 @@ when you merge their pull request on GitHub, so nothing goes live until you choo
 2. In Beds24: **Settings → Apps & Integrations → API → generate an invite code**. Give it access to
    **properties**, **bookings with write access, including guest personal details and financial details**
    (otherwise guest names and totals come back blank, and door codes can't be saved on bookings), and
-   **write access to inventory** (to change prices, minimum stays and blocked dates on the Rates page).
+   **write access to inventory** (to change prices, minimum stays and blocked dates on the Rates page), and
+   **write access to properties** (to edit listing content on the Listing page).
 3. In the app: **Settings → paste the invite code → Connect & sync**.
 
 The invite code is single-use: the app exchanges it for a long-lived key stored on the volume. To change
@@ -57,6 +58,19 @@ the old one. Settings shows the permissions currently granted.
 On the app's **Locks** page: paste a Seam API key (from your workspace at seam.co), click **Connect Yale
 account** to sign in to Yale Access through Seam, then choose which property each lock opens. See the
 "Door codes" items in `CUTOVER.md` for turning on automatic guest codes.
+
+## 8. AI assistant (optional)
+
+1. At [console.anthropic.com](https://console.anthropic.com): add a payment method or credits under
+   **Billing**, then **API keys → Create key**. Copy it (it starts with `sk-ant-`).
+2. In the app: **Settings → AI assistant → paste the key → Save key**. The app checks it with Anthropic
+   before saving. (Alternatively, add it as an `ANTHROPIC_API_KEY` variable in Railway; a key pasted in
+   Settings takes priority.)
+3. Set a **monthly spending limit** (default $25) and fill in the **house notes** for each property:
+   parking, pets, check-in policies, local tips, and the name to sign off with. Guest reply drafts use them.
+
+Usage is billed to your Anthropic account, typically one to a few cents per request. Settings shows this
+month's estimate. The key stays on the server; the browser only ever sees its last four characters.
 
 ## Troubleshooting
 

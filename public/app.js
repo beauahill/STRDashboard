@@ -47,6 +47,8 @@ async function dashboard() {
   const max = Math.max(...s.months.map(m => m.revenue), 1);
   const ch = Object.entries(s.thisMonth.byChannel).sort((a, b) => b[1].revenue - a[1].revenue);
   view.innerHTML = `
+    ${s.automationIssues?.length ? `<div class="notice bad-notice"><b>Automated messages need attention</b> <a href="#/automations">Open Automations</a><ul>${s.automationIssues.map(i =>
+      `<li>${esc(i.automation)} to ${esc(i.guest_name || 'a guest')}: ${esc(i.error || i.status)}</li>`).join('')}</ul></div>` : ''}
     ${s.doorAlerts?.length ? `<div class="notice bad-notice"><b>Door codes need attention</b> <a href="#/locks">Open Locks</a><ul>${s.doorAlerts.map(a =>
       `<li>${esc(a.guest || 'Guest')} arriving ${fmtDate(a.arrival)}: ${esc(a.problem)}</li>`).join('')}</ul></div>` : ''}
     <div class="grid">
@@ -185,6 +187,7 @@ async function bookingsView() {
 
 async function settingsView() {
   status = await api('/status');
+  const AI = await api('/ai');
   view.innerHTML = `<div class="card stack"><h3>Beds24 connection</h3>
     <div>${status.connected ? '✅ Connected' : 'Not connected'}${status.demo ? ' · <b>demo data loaded</b>' : ''}</div>
     <div class="sub">Last sync: ${status.lastSync ? new Date(status.lastSync).toLocaleString() : 'never'}${status.lastSyncError ? ' · error: ' + esc(status.lastSyncError) : ''}</div>
@@ -195,6 +198,18 @@ async function settingsView() {
     ${status.demo ? '<hr><button id="cleardemo">Clear demo data</button>'
       : status.connected ? '' : '<hr><button id="demo">Load demo data</button><div class="sub">Fills the app with sample properties and bookings so you can try it before connecting. Connecting to Beds24 removes it automatically.</div>'}
     ${status.auth ? '<hr><button id="lo">Sign out</button>' : ''}</div>
+    <div class="card stack" style="margin-top:14px"><h3>AI assistant</h3>
+      <div>${AI.configured ? `✅ Anthropic API key saved (${esc(AI.keyHint)})${AI.fromEnv ? ' from the ANTHROPIC_API_KEY variable' : ''}` : 'Not set up'}</div>
+      <div class="sub">Claude drafts guest replies (Inbox), writes listing text (Listing), reviews prices (Pricing) and answers questions about your numbers (Analytics).
+        Nothing is sent to a guest or saved to Beds24 until you press Send, Save or Apply. It uses your own key from console.anthropic.com → API keys, and usage is billed to that Anthropic account (typically one to a few cents per request).</div>
+      <form class="toolbar" id="aikey" style="margin:0"><input name="key" type="password" placeholder="sk-ant-…" autocomplete="off" style="flex:1;min-width:0">
+        <button class="primary">${AI.configured ? 'Replace key' : 'Save key'}</button>${AI.configured && !AI.fromEnv ? '<button type="button" id="airm">Remove</button>' : ''}</form>
+      ${AI.configured ? `<div class="sub">This month: ${AI.month.requests} request${AI.month.requests === 1 ? '' : 's'}, about $${AI.month.cost.toFixed(2)} (estimate; your Anthropic console has the exact bill). Model: ${esc(AI.model)}.</div>
+      <form class="stack" id="aiset" style="max-width:none">
+        <label class="sub">Monthly spending limit ($): requests stop once the month's estimate reaches it <input name="budget" type="number" min="0" max="10000" step="1" value="${AI.budget}" style="width:7em"></label>
+        ${AI.properties.map(p => `<label class="sub">House notes for <b>${esc(p.name)}</b>: facts the assistant may use in guest replies, such as parking, pets, quiet hours, early check-in or late checkout policy, local tips, and your name for signing off
+          <textarea name="note_${p.id}" rows="5" maxlength="10000" placeholder="Parking: two spots in the driveway. No pets. Early check-in possible if no one checks out that day; ask me first. Sign off as Sam.">${esc(p.notes)}</textarea></label>`).join('')}
+        <div><button class="primary">Save</button></div></form>` : ''}</div>
     <div class="card stack" style="margin-top:14px"><h3>Import history from Guesty</h3>
       <div class="sub">In Guesty: Reservation report → Columns (turn everything on) → download CSV (it arrives by email). Choose that file here; you'll see a preview before anything is saved.
         Guest addresses, IDs and door key codes in the file are ignored.</div>
@@ -205,6 +220,22 @@ async function settingsView() {
   if ($('#cleardemo')) $('#cleardemo').onclick = () => act(() => api('/demo/clear', { method: 'POST' }));
   if ($('#lo')) $('#lo').onclick = async () => { await api('/logout', { method: 'POST' }); showLogin(); };
   if ($('#dc')) $('#dc').onclick = () => act(() => api('/disconnect', { method: 'POST' }));
+  $('#aikey').onsubmit = async e => {
+    e.preventDefault();
+    const key = e.target.key.value.trim();
+    if (!key) return;
+    const btn = e.target.querySelector('.primary'); btn.disabled = true; btn.textContent = 'Checking…';
+    try { await api('/ai/key', { method: 'POST', body: { apiKey: key } }); await boot(true); banner('Anthropic API key saved. AI features are on.', 'ok'); }
+    catch (err) { if (err.message !== 'login') { banner(err.message, true); btn.disabled = false; btn.textContent = 'Save key'; } }
+  };
+  if ($('#airm')) $('#airm').onclick = () => confirm('Remove the Anthropic API key? AI features will switch off.') && act(() => api('/ai/key', { method: 'POST', body: { apiKey: '' } }));
+  if ($('#aiset')) $('#aiset').onsubmit = async e => {
+    e.preventDefault();
+    const f = e.target;
+    const notes = Object.fromEntries(AI.properties.map(p => [p.id, f.elements[`note_${p.id}`].value]));
+    try { await api('/ai/settings', { method: 'POST', body: { budget: f.budget.value, notes } }); banner('AI settings saved.', 'ok'); }
+    catch (err) { if (err.message !== 'login') banner(err.message, true); }
+  };
   if ($('#rmg')) $('#rmg').onclick = () => confirm('Remove all bookings imported from Guesty?') && act(() => api('/import/guesty/remove', { method: 'POST' }));
   $('#gfile').onchange = async e => {
     const file = e.target.files[0];
@@ -553,6 +584,8 @@ function renderThread(th) {
     ${th.canReply ? `<div class="composer">
       <div class="toolbar" style="margin:0 0 6px"><select id="ireply"><option value="">Insert saved reply…</option>${inbox.replies.map(r => `<option value="${r.id}">${esc(r.title)}</option>`).join('')}</select>
         <a href="#" id="imanage" class="sub">${inbox.manage ? 'Hide saved replies' : 'Edit saved replies'}</a></div>
+      ${status.ai ? `<div class="toolbar" style="margin:0 0 6px"><input id="iaihint" placeholder="Anything the draft should say? (optional)" style="flex:1;min-width:0" maxlength="2000">
+        <button type="button" id="iai">✨ Draft reply</button></div>` : ''}
       <textarea id="itext" rows="4" maxlength="5000" placeholder="Write a reply…">${esc(inbox.drafts[inbox.booking] || '')}</textarea>
       <div class="toolbar" style="margin:6px 0 0"><span class="sub" id="inote">${channelNote}</span>
         <span class="sub" id="icount" style="margin-left:auto"></span><button class="primary" id="isend">Send</button></div>
@@ -572,10 +605,24 @@ function renderThread(th) {
     e.target.value = '';
   };
   ta.onkeydown = e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('#isend').click(); };
+  // AI draft: replaces the reply box (with undo); nothing is sent until Send is pressed.
+  if ($('#iai')) $('#iai').onclick = async () => {
+    const btn = $('#iai'), booking = inbox.booking, before = ta.value;
+    btn.disabled = true; btn.textContent = 'Drafting…';
+    try {
+      const r = await api('/ai/draft', { method: 'POST', body: { bookingId: booking, instructions: $('#iaihint').value } });
+      if (inbox.booking !== booking || !$('#itext')) return;
+      $('#itext').value = r.text; $('#itext').dispatchEvent(new Event('input'));
+      $('#inote').innerHTML = `✨ AI draft${aiCost(r)}. Read it, and fill in anything in [brackets], before sending.${before.trim() ? ' <a href="#" id="iundo">Undo</a>' : ''}`;
+      if ($('#iundo')) $('#iundo').onclick = e => { e.preventDefault(); $('#itext').value = before; $('#itext').dispatchEvent(new Event('input')); $('#inote').textContent = ''; };
+    } catch (err) { if (err.message !== 'login' && $('#inote')) $('#inote').innerHTML = `<span class="bad">${esc(err.message)}</span>`; }
+    finally { if ($('#iai')) { $('#iai').disabled = false; $('#iai').textContent = '✨ Draft reply'; } }
+  };
   $('#isend').onclick = async () => {
     const text = ta.value.trim();
     if (!text) return;
     if (/\{\w+\}/.test(text) && !confirm('The message still has a {placeholder} in it. Send anyway?')) return;
+    if (/\[(confirm|check|add|insert)\b[^\]]*\]/i.test(text) && !confirm('The message still has a [bracketed] note to fill in. Send anyway?')) return;
     $('#isend').disabled = true; $('#isend').textContent = 'Sending…';
     try {
       const t2 = await api('/inbox/send', { method: 'POST', body: { bookingId: inbox.booking, message: text } });
@@ -617,7 +664,7 @@ function renderReplyManager(th) {
 }
 
 // ---------- Pricing tool ----------
-const pr = { month: null, room: null, selected: null, open: { settings: false, events: false } };
+const pr = { month: null, room: null, selected: null, open: { settings: false, events: false }, ai: { html: '', busy: false } };
 const DOWS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'], MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const pctStr = v => `${v > 0 ? '+' : ''}${Math.round(v * 10) / 10}%`;
 
@@ -675,6 +722,11 @@ async function pricingView() {
         <tr><td><b>Recommended</b></td><td style="text-align:right"><b>${money(sel.price)}</b></td></tr>
         <tr><td>In Beds24 now</td><td style="text-align:right">${sel.current != null ? money(sel.current) : '—'}</td></tr>
         <tr><td>Minimum stay</td><td style="text-align:right">${sel.minStay} night${sel.minStay === 1 ? '' : 's'}${sel.currentMinStay != null && sel.currentMinStay !== sel.minStay ? ` <span class="sub">(now ${sel.currentMinStay})</span>` : ''}</td></tr></table></div>` : ''}
+      ${P.needsBase ? '' : `<div class="card"><h3>✨ AI pricing review</h3>${status.ai ? `
+        <div class="toolbar" style="margin:0 0 6px"><button id="paireview" ${pr.ai.busy ? 'disabled' : ''}>Review next 90 days</button>${sel ? `<button id="painight" ${pr.ai.busy ? 'disabled' : ''}>Explain ${fmtDate(sel.date)}</button>` : ''}</div>
+        <form id="paiform" class="toolbar" style="margin:0"><input name="q" placeholder="Or ask, e.g. Is my weekend premium too low?" style="flex:1;min-width:0" maxlength="1000"><button ${pr.ai.busy ? 'disabled' : ''}>Ask</button></form>
+        <div id="paiout" class="aianswer">${pr.ai.html}</div><div class="sub">Advice only: nothing changes in Beds24 unless you apply it.</div>`
+        : aiSetup('Get a second opinion on these prices, or ask why a night is priced the way it is.')}</div>`}
       ${P.pending ? `<div class="card"><h3>Apply to Beds24</h3><table class="pv">
         ${pendRow('Next 30 days', P.pending.d30, 30)}${pendRow('Next 90 days', P.pending.d90, 90)}${pendRow('Next 12 months', P.pending.d365, 365)}</table>
         <label class="sub"><input type="checkbox" id="pmin" checked> Also set minimum stays (events and gap nights)</label>
@@ -722,10 +774,28 @@ async function pricingView() {
   const go = m => { pr.month = m; pricingView(); };
   $('#pprev').onclick = () => go(addMonths(pr.month, -1)); $('#pnext').onclick = () => go(addMonths(pr.month, 1));
   $('#ptoday').onclick = () => go(today.slice(0, 8) + '01');
-  if ($('#proom')) $('#proom').onchange = e => { pr.room = +e.target.value; pr.selected = null; pricingView(); };
+  if ($('#proom')) $('#proom').onchange = e => { pr.room = +e.target.value; pr.selected = null; pr.ai = { busy: false, html: '' }; pricingView(); };
   view.querySelectorAll('[data-pdate]').forEach(el => el.onclick = () => { pr.selected = pr.selected === el.dataset.pdate ? null : el.dataset.pdate; pricingView(); });
   $('#psettings').ontoggle = e => { pr.open.settings = e.target.open; };
   $('#pevents').ontoggle = e => { pr.open.events = e.target.open; };
+  // AI review: the answer is kept in pr.ai so clicking around the calendar doesn't lose it.
+  const aiAsk = async (body, label) => {
+    if (pr.ai.busy) return;
+    pr.ai = { busy: true, html: `<p class="sub">${esc(label)}: thinking…</p>` };
+    view.querySelectorAll('#paireview, #painight, #paiform button').forEach(b => b.disabled = true);
+    $('#paiout').innerHTML = pr.ai.html;
+    const room = pr.room;
+    let html;
+    try {
+      const r = await api('/ai/pricing', { method: 'POST', body: { roomId: room, ...body } });
+      html = `<p class="sub"><b>${esc(label)}</b>${aiCost(r)}</p>${md(r.text)}`;
+    } catch (err) { html = err.message === 'login' ? '' : `<span class="bad">${esc(err.message)}</span>`; }
+    pr.ai = { busy: false, html: pr.room === room ? html : '' };
+    if (location.hash === '#/pricing') pricingView();
+  };
+  if ($('#paireview')) $('#paireview').onclick = () => aiAsk({}, 'Review of the next 90 days');
+  if ($('#painight')) $('#painight').onclick = () => aiAsk({ date: sel.date }, `About ${fmtDate(sel.date)}`);
+  if ($('#paiform')) $('#paiform').onsubmit = e => { e.preventDefault(); const qn = e.target.q.value.trim(); if (qn) aiAsk({ question: qn, ...(sel && { date: sel.date }) }, qn); };
   view.querySelectorAll('[data-apply]').forEach(b => b.onclick = async () => {
     const days = +b.dataset.apply, p = P.pending[days === 30 ? 'd30' : days === 90 ? 'd90' : 'd365'];
     if (!confirm(`Send ${p.nights} night${p.nights === 1 ? '' : 's'} of recommended prices to Beds24?`)) return;
@@ -805,13 +875,355 @@ async function cleaningView() {
   $('#cregen').onclick = e => { e.preventDefault(); if (confirm('Make a new Turno link? The current link stops working until you update it in Turno.')) act(() => api('/cleaning/regenerate', { method: 'POST' })); };
 }
 
+// ---------- Automations: scheduled guest messages ----------
+const am = { editing: null, previewBooking: null };
+const ANCHOR_LABELS = { booked: 'After a booking is made', cancelled: 'After a booking is cancelled', dates_changed: 'After a booking\'s dates change',
+  arrival: 'Before / on / after check-in day', departure: 'Before / on / after checkout day' };
+const CHANNEL_LIST = ['Airbnb', 'Booking.com', 'VRBO', 'Direct', 'Other'];
+
+async function automationsView() {
+  const A = await api('/automations');
+  const statusTag = st => ({ sent: '<span class="ok">✓ sent</span>', failed: '<span class="bad">✗ failed</span>', waiting: '<span class="warn">⏳ waiting</span>',
+    pending: '<span class="sub">pending</span>', skipped: '<span class="sub">skipped</span>', scheduled: '<span class="sub">scheduled</span>' })[st] || esc(st);
+  const vars = [...A.builtins, ...new Set(A.properties.flatMap(p => Object.keys(p.vars)))];
+  const editor = a => {
+    const timed = ['arrival', 'departure'].includes(a.anchor);
+    return `<form class="stack amform" data-form="${a.id || 'new'}" style="max-width:none;margin-top:10px">
+      <input name="name" value="${esc(a.name || '')}" placeholder="Name, e.g. Wi-Fi details">
+      <div class="toolbar" style="margin:0"><select name="anchor">${Object.entries(ANCHOR_LABELS).map(([k, l]) => `<option value="${k}" ${a.anchor === k ? 'selected' : ''}>${l}</option>`).join('')}</select>
+        <span class="timed" ${timed ? '' : 'hidden'}><input type="number" name="days" min="0" max="30" value="${Math.abs(a.offset_days || 0)}" style="width:4em"> day(s)
+          <select name="dir"><option value="-1" ${(a.offset_days || 0) < 0 ? 'selected' : ''}>before</option><option value="1" ${(a.offset_days || 0) > 0 ? 'selected' : ''}>after</option></select>
+          at <input type="time" name="at_time" value="${a.at_time || '10:00'}"></span>
+        <span class="event" ${timed ? 'hidden' : ''}>wait <input type="number" name="delay" min="0" max="1440" value="${a.delay_minutes ?? 5}" style="width:5em"> minutes</span></div>
+      <div class="toolbar" style="margin:0"><span class="sub">Channels:</span>${CHANNEL_LIST.map(c => `<label class="sub"><input type="checkbox" name="ch" value="${c}" ${!a.channels || a.channels.includes(c) ? 'checked' : ''}> ${c}</label>`).join('')}
+        <label class="sub">Only stays of at least <input type="number" name="min_nights" min="1" max="60" value="${a.min_nights || ''}" style="width:4em"> nights</label></div>
+      <textarea name="body" rows="6" maxlength="5000">${esc(a.body || '')}</textarea>
+      <div class="chips">${vars.map(v => `<button type="button" class="chip" data-var="${v}">{${v}}</button>`).join('')}</div>
+      <div class="toolbar" style="margin:0"><select name="pb"><option value="">Preview with a booking…</option>${A.bookings.map(b => `<option value="${b.id}">${esc(b.guest_name || 'Guest')} · ${fmtDate(b.arrival)}</option>`).join('')}</select>
+        <button class="primary">Save</button><button type="button" data-cancel>Cancel</button></div>
+      <div class="pvbox" hidden></div></form>`;
+  };
+  view.innerHTML = `${!A.connected ? '<div class="notice">Connect Beds24 in Settings; messages are sent through it.</div>' : ''}
+    ${A.error ? `<div class="notice">Automations problem: ${esc(A.error)}</div>` : ''}
+    <div class="notice" style="background:var(--bg);color:var(--ink);border:1px solid var(--line)">Turn these on <b>on switch day</b>, after Beds24 is connected to your channels and has synced.
+      Don't also set up the same messages as Beds24 Auto Actions (guests would get them twice). Switching an automation on never sends a backlog: only messages due from then on.</div>
+    <div class="cols">
+      <div class="card"><h3>Automations</h3>
+        ${A.automations.map(a => `<div class="auto ${a.enabled ? 'on' : ''}">
+          <label class="switch"><input type="checkbox" data-toggle="${a.id}" ${a.enabled ? 'checked' : ''}><span></span></label>
+          <div style="flex:1;min-width:0"><b>${esc(a.name)}</b><div class="sub">${esc(a.when)}${a.channels ? ' · ' + a.channels.join(', ') : ''}${a.min_nights ? ` · ${a.min_nights}+ nights` : ''}</div>
+            ${am.editing === a.id ? editor(a) : `<div class="sub snip2">${esc(a.body.slice(0, 120))}${a.body.length > 120 ? '…' : ''}</div>`}</div>
+          ${am.editing === a.id ? '' : `<div><a href="#" data-edit="${a.id}">edit</a> · <a href="#" data-del="${a.id}">delete</a></div>`}</div>`).join('')}
+        ${am.editing === 'new' ? `<div class="auto"><div style="flex:1">${editor({ anchor: 'arrival', offset_days: -1, at_time: '10:00' })}</div></div>` : '<button id="anew" style="margin-top:8px">+ New automation</button>'}
+      </div>
+      <div class="stack" style="max-width:none">
+        <div class="card" style="overflow-x:auto"><h3>Coming up (14 days)</h3>${A.upcoming.length ? `<table class="pv"><tr><th>When</th><th>Message</th><th>Guest</th><th></th></tr>${A.upcoming.map(u => `<tr>
+          <td>${new Date(u.when).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: A.tz })}</td><td>${esc(u.automation)}${u.missing.length ? `<div class="warn sub">needs {${u.missing.join('}, {')}}</div>` : ''}</td>
+          <td>${esc(u.guest || 'Guest')}</td><td><a href="#" data-pv="${encodeURIComponent(u.preview)}">preview</a> · <a href="#" data-skip="${u.automationId}:${u.bookingId}">skip</a></td></tr>`).join('')}</table>`
+          : '<div class="empty">Nothing scheduled. Switch on an automation to see what it will send.</div>'}</div>
+        <div class="card" style="overflow-x:auto"><h3>Recently</h3>${A.history.length ? `<table class="pv"><tr><th>Time</th><th>Message</th><th>Guest</th><th>Status</th></tr>${A.history.slice(0, 25).map(h => `<tr>
+          <td>${h.updated_at ? new Date(h.updated_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: A.tz }) : ''}</td><td>${esc(h.automation)}</td>
+          <td>${esc(h.guest_name || '')}</td><td>${statusTag(h.status)}${h.error ? `<div class="sub">${esc(h.error)}</div>` : ''}</td></tr>`).join('')}</table>` : '<div class="empty">No automated messages yet.</div>'}</div>
+        <div class="card"><h3>Property details</h3><div class="sub">Your own fill-ins for messages, e.g. <code>{wifi_password}</code>. Built in: ${A.builtins.map(b => `<code>{${b}}</code>`).join(' ')}</div>
+          ${A.properties.map(p => `<form class="stack pvars" data-prop="${p.id}" style="max-width:none;margin-top:8px"><b>${esc(p.name)}</b>
+            ${[...Object.entries(p.vars), ['', ''], ['', '']].map(([k, v]) => `<div class="toolbar" style="margin:0"><input name="k" value="${esc(k)}" placeholder="name, e.g. wifi_name" style="width:12em"><input name="v" value="${esc(v)}" placeholder="value" style="flex:1;min-width:120px"></div>`).join('')}
+            <button class="primary">Save details</button></form>`).join('')}</div>
+      </div></div>`;
+
+  view.querySelectorAll('[data-toggle]').forEach(t => t.onchange = () => {
+    const a = A.automations.find(x => x.id === +t.dataset.toggle);
+    if (t.checked && !confirm(`Turn on "${a.name}"? It will send ${a.when} to every matching guest from now on.`)) { t.checked = false; return; }
+    act(() => api('/automations/enable', { method: 'POST', body: { id: a.id, enabled: t.checked } }));
+  });
+  view.querySelectorAll('[data-edit]').forEach(l => l.onclick = e => { e.preventDefault(); am.editing = +l.dataset.edit; automationsView(); });
+  view.querySelectorAll('[data-del]').forEach(l => l.onclick = e => {
+    e.preventDefault(); const a = A.automations.find(x => x.id === +l.dataset.del);
+    if (confirm(`Delete "${a.name}"?`)) act(() => api('/automations/delete', { method: 'POST', body: { id: a.id } }));
+  });
+  if ($('#anew')) $('#anew').onclick = () => { am.editing = 'new'; automationsView(); };
+  view.querySelectorAll('[data-skip]').forEach(l => l.onclick = e => {
+    e.preventDefault(); const [automationId, bookingId] = l.dataset.skip.split(':').map(Number);
+    if (confirm('Skip this message for this guest?')) act(() => api('/automations/skip', { method: 'POST', body: { automationId, bookingId } }));
+  });
+  view.querySelectorAll('[data-pv]').forEach(l => l.onclick = e => { e.preventDefault(); alert(decodeURIComponent(l.dataset.pv)); });
+  view.querySelectorAll('form.amform').forEach(f => {
+    const sync = () => { const timed = ['arrival', 'departure'].includes(f.anchor.value); f.querySelector('.timed').hidden = !timed; f.querySelector('.event').hidden = timed; };
+    f.anchor.onchange = sync;
+    // Insert fill-ins where the cursor last was (clicking a chip takes focus away from the message box).
+    let pos = f.body.value.length;
+    const remember = () => { pos = f.body.selectionStart; };
+    f.body.onkeyup = remember; f.body.onclick = remember; f.body.onblur = remember;
+    f.querySelectorAll('[data-var]').forEach(b => b.onclick = () => {
+      const t = f.body, v = `{${b.dataset.var}}`;
+      t.setRangeText(v, pos, pos, 'end'); pos += v.length; t.focus();
+    });
+    f.querySelector('[data-cancel]').onclick = () => { am.editing = null; automationsView(); };
+    const preview = async () => {
+      const box = f.querySelector('.pvbox');
+      if (!f.pb.value) { box.hidden = true; return; }
+      const r = await api('/automations/preview', { method: 'POST', body: { body: f.body.value, bookingId: +f.pb.value } });
+      box.hidden = false;
+      box.innerHTML = `<div class="bubble" style="white-space:pre-wrap">${esc(r.text)}</div>${r.missing.length ? `<div class="warn sub">Not filled in yet: {${r.missing.join('}, {')}}. A message waits until these are available.</div>` : ''}`;
+    };
+    f.pb.onchange = preview;
+    f.onsubmit = e => {
+      e.preventDefault();
+      const timed = ['arrival', 'departure'].includes(f.anchor.value);
+      const id = f.dataset.form === 'new' ? null : +f.dataset.form;
+      act(async () => {
+        await api('/automations', { method: 'POST', body: { id, name: f.name.value, anchor: f.anchor.value, body: f.body.value,
+          offset_days: timed ? Number(f.days.value) * Number(f.dir.value) : 0, at_time: timed ? f.at_time.value : null, delay_minutes: timed ? 0 : Number(f.delay.value),
+          channels: [...f.querySelectorAll('[name=ch]:checked')].map(x => x.value), min_nights: f.min_nights.value } });
+        am.editing = null;
+      });
+    };
+  });
+  view.querySelectorAll('form.pvars').forEach(f => f.onsubmit = e => {
+    e.preventDefault();
+    const ks = [...f.querySelectorAll('[name=k]')], vs = [...f.querySelectorAll('[name=v]')];
+    const vars = Object.fromEntries(ks.map((k, i) => [k.value.trim(), vs[i].value]).filter(([k, v]) => k || v.trim()));
+    act(() => api('/property-vars', { method: 'POST', body: { propertyId: +f.dataset.prop, vars } }));
+  });
+}
+
+// ---------- Listing editor ----------
+const ls = { property: null, edited: null };
+const fieldInput = (f, val, name) => {
+  const v = val ?? '';
+  if (f.type === 'select') return `<select name="${name}"><option value=""></option>${f.options.map(o => `<option ${o === v ? 'selected' : ''}>${o}</option>`).join('')}</select>`;
+  if (f.type === 'textarea') return `<textarea name="${name}" rows="${f.max > 5000 ? 8 : 4}" maxlength="${f.max}" data-count="${f.max}" data-ai="${f.key}">${esc(v)}</textarea>`;
+  if (f.type === 'int' || f.type === 'money') return `<input name="${name}" type="number" step="${f.type === 'money' ? '0.01' : '1'}" min="${f.min}" max="${f.max}" value="${v}" style="width:9em">`;
+  return `<input name="${name}" value="${esc(v)}" maxlength="${f.max || 200}" data-count="${f.max || 200}" ${f.key === 'headline' || f.key === 'contentHeadline' ? `data-ai="${f.key}"` : ''}>`;
+};
+const fieldRow = (f, val, name) => `<label class="lfield"><span class="sub">${esc(f.label)}${f.hint ? ` <span class="hint">· ${esc(f.hint)}</span>` : ''}</span>${fieldInput(f, val, name)}<span class="sub count"></span></label>`;
+
+async function listingView() {
+  const L = await api('/listing?' + new URLSearchParams(ls.property ? { property: ls.property } : {}));
+  if (!L.connected) { view.innerHTML = '<div class="card empty">Connect Beds24 in Settings to edit your listing.</div>'; return; }
+  if (!L.listing) { view.innerHTML = '<div class="card empty">No properties found in Beds24 yet.</div>'; return; }
+  ls.property = L.listing.id;
+  const x = L.listing, F = L.fields;
+  view.innerHTML = `${L.canWrite === false ? '<div class="notice">Your Beds24 invite code can read but not change listing content. Create one with write access to <b>Properties</b> and paste it in Settings.</div>' : ''}
+    <div class="notice" style="background:var(--bg);color:var(--ink);border:1px solid var(--line)">This edits your listing content in Beds24. Whether a change reaches Airbnb, VRBO or Booking.com depends on each channel's content settings in Beds24 (Booking.com content is usually managed in its own extranet). Photos and amenities are managed in Beds24.</div>
+    <form id="lform">
+      <div class="card stack" style="max-width:none"><div class="toolbar" style="margin:0">
+        ${L.properties.length > 1 ? `<select id="lprop">${L.properties.map(p => `<option value="${p.id}" ${p.id === x.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>` : `<h3 style="margin:0">${esc(x.property.name)}</h3>`}
+        <span class="sub" style="margin-left:auto">Changes are previewed before anything is sent.</span></div>
+        <h3>Listing text</h3>${F.propertyText.map(f => fieldRow(f, x.propertyText[f.key], `pt.${f.key}`)).join('')}
+        <h3>Property details</h3><div class="lgrid">${F.property.map(f => fieldRow(f, x.property[f.key], `p.${f.key}`)).join('')}</div></div>
+      ${x.rooms.map((r, i) => `<div class="card stack" style="max-width:none;margin-top:14px"><h3>Room: ${esc(r.name || r.id)}</h3>
+        <div class="lgrid">${F.room.map(f => fieldRow(f, r[f.key], `r${i}.${f.key}`)).join('')}</div>
+        ${F.roomText.map(f => fieldRow(f, r.text[f.key], `rt${i}.${f.key}`)).join('')}</div>`).join('')}
+      <div class="card stack" style="max-width:none;margin-top:14px;position:sticky;bottom:0;z-index:3">
+        <div class="toolbar" style="margin:0"><button type="button" id="lpreview" class="primary">Preview changes</button><span class="sub" id="lstatus"></span></div>
+        <div id="ldiff"></div></div>
+    </form>
+    <div class="card" style="margin-top:14px"><h3>Recent listing changes</h3>${L.log.length ? `<ul class="list">${L.log.map(c => `<li><span>${c.ok ? '<span class="ok">✓</span>' : '<span class="bad">✗</span>'} ${esc(c.summary)}${c.error ? `<div class="sub">${esc(c.error)}</div>` : ''}</span><span class="sub">${new Date(c.at).toLocaleString()}</span></li>`).join('')}</ul>` : '<div class="empty">No listing changes from this app yet.</div>'}</div>`;
+
+  const form = $('#lform');
+  const counters = () => form.querySelectorAll('[data-count]').forEach(el => {
+    const c = el.parentElement.querySelector('.count'), n = el.value.length, max = +el.dataset.count;
+    c.textContent = n > max * 0.6 || el.dataset.ai === 'headline' ? `${n}/${max}` : '';
+    c.classList.toggle('warn', el.dataset.ai === 'headline' && n > 50);
+  });
+  form.oninput = counters; counters();
+  if ($('#lprop')) $('#lprop').onchange = e => { ls.property = +e.target.value; listingView(); };
+  const collect = () => {
+    const val = n => form.elements[n]?.value;
+    return { lang: x.lang,
+      property: Object.fromEntries(F.property.map(f => [f.key, val(`p.${f.key}`)])),
+      propertyText: Object.fromEntries(F.propertyText.map(f => [f.key, val(`pt.${f.key}`)])),
+      rooms: x.rooms.map((r, i) => ({ id: r.id, ...Object.fromEntries(F.room.map(f => [f.key, val(`r${i}.${f.key}`)])),
+        text: Object.fromEntries(F.roomText.map(f => [f.key, val(`rt${i}.${f.key}`)])) })) };
+  };
+  ls.collect = collect;
+  // AI writing help on each text field: suggest, then "Use this" puts it in the field (still previewed before saving).
+  form.querySelectorAll('[data-ai]').forEach(el => {
+    const wrap = document.createElement('div');
+    wrap.className = 'aiw';
+    wrap.innerHTML = L.ai ? `<button type="button" class="linkbtn">✨ ${el.value.trim() ? 'Improve' : 'Write'} with AI</button>
+      <div class="aipanel" hidden><div class="toolbar" style="margin:4px 0"><input placeholder="Optional: what should it say or change? e.g. shorter, mention the fenced yard" style="flex:1;min-width:0" maxlength="1000">
+        <button type="button" class="aigo">Suggest</button></div><div class="aiout"></div></div>` : '';
+    if (!L.ai) return;
+    el.closest('label').after(wrap);
+    const panel = wrap.querySelector('.aipanel'), out = wrap.querySelector('.aiout'), go = wrap.querySelector('.aigo');
+    wrap.querySelector('.linkbtn').onclick = () => { panel.hidden = !panel.hidden; if (!panel.hidden) wrap.querySelector('input').focus(); };
+    wrap.querySelector('input').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); go.click(); } };
+    go.onclick = async () => {
+      const [, kind, idx] = el.name.match(/^(pt|rt)(\d*)\./);
+      go.disabled = true; go.textContent = 'Writing…'; out.innerHTML = '';
+      try {
+        const r = await api('/ai/listing', { method: 'POST', body: { propertyId: x.id, section: kind === 'pt' ? 'propertyText' : 'roomText', field: el.dataset.ai,
+          roomId: kind === 'rt' ? x.rooms[+idx].id : null, listing: collect(), instruction: wrap.querySelector('input').value } });
+        out.innerHTML = `<div class="aisugg">${esc(r.text)}</div><div class="toolbar" style="margin:6px 0 0"><button type="button" class="primary aiuse">Use this</button>
+          <span class="sub ${r.length > r.limit ? 'warn' : ''}">${r.length}/${r.limit} characters${aiCost(r)}</span></div>`;
+        out.querySelector('.aiuse').onclick = () => {
+          el.value = r.text; el.dispatchEvent(new Event('input', { bubbles: true }));
+          out.innerHTML = '<span class="sub ok">Added. Press Preview changes, then Save, to send it to Beds24.</span>';
+        };
+      } catch (err) { if (err.message !== 'login') out.innerHTML = `<span class="bad">${esc(err.message)}</span>`; }
+      go.disabled = false; go.textContent = out.querySelector('.aisugg') ? 'Try again' : 'Suggest';
+    };
+  });
+  if (!L.ai) form.querySelector('.lfield')?.insertAdjacentHTML('beforebegin', aiSetup('✨ The AI assistant can write and improve this text.'));
+  const short = v => { const t = v == null || v === '' ? '(empty)' : String(v); return esc(t.length > 140 ? t.slice(0, 140) + '…' : t); };
+  $('#lpreview').onclick = async () => {
+    try {
+      const edited = collect();
+      const { changes } = await api('/listing/preview', { method: 'POST', body: { propertyId: x.id, edited } });
+      $('#ldiff').innerHTML = changes.length ? `<table class="pv"><tr><th>Where</th><th>Field</th><th>Now</th><th>New</th></tr>${changes.map(c => `<tr><td>${esc(c.where)}</td><td>${esc(c.label)}</td><td class="sub">${short(c.before)}</td><td>${short(c.after)}</td></tr>`).join('')}</table>
+        <button type="button" class="primary" id="lsave" ${L.canWrite === false ? 'disabled' : ''}>Save ${changes.length} change${changes.length === 1 ? '' : 's'} to Beds24</button>` : '<span class="sub">No changes yet.</span>';
+      if ($('#lsave')) $('#lsave').onclick = async () => {
+        $('#lsave').disabled = true; $('#lsave').textContent = 'Saving…';
+        try {
+          const r = await api('/listing/save', { method: 'POST', body: { propertyId: x.id, edited } });
+          banner(`Saved ${r.applied} change${r.applied === 1 ? '' : 's'} to Beds24.${r.warnings.length ? ' ' + r.warnings.join(' ') : ''}`, r.warnings.length ? '' : 'ok');
+          await listingView();
+        } catch (err) { if (err.message !== 'login') { $('#lstatus').innerHTML = `<span class="bad">${esc(err.message)}</span>`; $('#lsave').disabled = false; $('#lsave').textContent = 'Try again'; } }
+      };
+    } catch (err) { if (err.message !== 'login') $('#ldiff').innerHTML = `<span class="bad">${esc(err.message)}</span>`; }
+  };
+}
+
+// ---------- AI helpers ----------
+// Minimal, safe markdown for AI answers: everything is escaped first, then **bold**, *italic*, `code`,
+// headings, bullet/numbered lists and pipe tables are allowed.
+function md(src) {
+  const inline = s => esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, '$1<i>$2</i>').replace(/`([^`]+)`/g, '<code>$1</code>');
+  const isRow = l => /^\s*\|.*\|\s*$/.test(l), isSep = l => /^\s*\|[\s:|-]+\|\s*$/.test(l), isItem = l => /^\s*([-*•]|\d+[.)])\s+/.test(l);
+  const lines = String(src || '').replace(/\r/g, '').split('\n');
+  let out = '', i = 0;
+  while (i < lines.length) {
+    const l = lines[i];
+    if (!l.trim()) { i++; continue; }
+    if (isRow(l)) {
+      const rows = []; while (i < lines.length && isRow(lines[i])) rows.push(lines[i++]);
+      const head = rows.length > 1 && isSep(rows[1]);
+      const cells = r => r.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+      out += `<div class="mdt"><table class="pv">${rows.filter(r => !isSep(r)).map((r, n) => `<tr>${cells(r).map(c => head && n === 0 ? `<th>${inline(c)}</th>` : `<td>${inline(c)}</td>`).join('')}</tr>`).join('')}</table></div>`;
+      continue;
+    }
+    if (isItem(l)) {
+      const ordered = /^\s*\d/.test(l), items = [];
+      while (i < lines.length && isItem(lines[i])) items.push(lines[i++].replace(/^\s*([-*•]|\d+[.)])\s+/, ''));
+      out += `<${ordered ? 'ol' : 'ul'}>${items.map(x => `<li>${inline(x)}</li>`).join('')}</${ordered ? 'ol' : 'ul'}>`;
+      continue;
+    }
+    const h = l.match(/^#{1,4}\s+(.*)/);
+    if (h) { out += `<p><b>${inline(h[1])}</b></p>`; i++; continue; }
+    const para = [lines[i++]];
+    while (i < lines.length && lines[i].trim() && !isRow(lines[i]) && !isItem(lines[i]) && !/^#{1,4}\s/.test(lines[i])) para.push(lines[i++]);
+    out += `<p>${para.map(inline).join('<br>')}</p>`;
+  }
+  return out;
+}
+const aiCost = r => r.cost != null ? ` · about $${r.cost < 0.01 ? '0.01' : r.cost.toFixed(2)}` : '';
+const aiSetup = what => `<div class="sub">${what} <a href="#/settings">Add an Anthropic API key in Settings</a> to turn it on.</div>`;
+
+// ---------- Analytics ----------
+const an = { range: '12m', metric: 'revenue', history: [], busy: false };
+const delta = (cur, ly, points = false) => {
+  if (ly == null) return '';
+  if (points) { const d = Math.round((cur - ly) * 100); return d ? `<span class="${d > 0 ? 'ok' : 'bad'}">${d > 0 ? '▲' : '▼'}${Math.abs(d)} pts</span>` : '<span class="sub">=</span>'; }
+  if (!ly) return cur ? '<span class="ok">new</span>' : '';
+  const d = Math.round((cur - ly) / ly * 100);
+  return d ? `<span class="${d > 0 ? 'ok' : 'bad'}">${d > 0 ? '▲' : '▼'}${Math.abs(d)}%</span>` : '<span class="sub">=</span>';
+};
+const ASK_EXAMPLES = ['How did last month compare with the same month last year?', 'Which channel earns the most per night?', 'How far ahead do guests book in summer?', 'Am I ahead or behind last year for the next three months?'];
+
+async function analyticsView() {
+  const A = await api('/analytics?' + q({ range: an.range }));
+  const H = A.headline, M = A.monthly;
+  const val = (m, k) => m ? (k === 'occupancy' ? m.occupancy : k === 'adr' ? m.adr : m.revenue) : 0;
+  const fmt = (v, k) => k === 'occupancy' ? pct(v) : money(v);
+  const max = Math.max(...M.flatMap(m => [val(m, an.metric), val(m.lastYear, an.metric)]), 1e-9);
+  const head = (h, extra = '') => `<div class="card"><h3>${esc(h.label)}</h3><div class="big">${money(h.current.revenue)} ${delta(h.current.revenue, h.lastYear?.revenue)}</div>
+    <div class="sub">${h.lastYear ? `Last year ${money(h.lastYear.revenue)}` : 'No bookings from last year to compare'}${extra}</div>
+    <div class="kv"><span>Occupancy <b>${pct(h.current.occupancy)}</b> ${delta(h.current.occupancy, h.lastYear?.occupancy, true)}</span>
+      <span>ADR <b>${money(h.current.adr)}</b> ${delta(h.current.adr, h.lastYear?.adr)}</span></div></div>`;
+  const hbars = (rows, valueOf, label) => { const top = Math.max(...rows.map(valueOf), 1); return `<div class="hbars">${rows.map(r =>
+    `<div class="hrow"><span>${esc(r.label)}</span><span class="track"><i style="width:${valueOf(r) / top * 100}%"></i></span><span class="sub">${label(r)}</span></div>`).join('')}</div>`; };
+  const W = A.window, C = A.cancellations;
+  const paceCell = p => p ? `${pct(p.occupancy)} <span class="sub">${money(p.revenue)}</span>` : '<span class="sub">no history</span>';
+  const sources = A.sources.map(s => `${s.source === 'guesty' ? 'Guesty import' : s.source === 'beds24' ? 'Beds24' : esc(s.source)}: ${s.n} bookings since ${fmtDate(s.first)}`).join(' · ');
+
+  view.innerHTML = `
+    <div class="card ask" id="ask"><h3>✨ Ask about your numbers</h3>${status.ai ? `
+      <div id="anlog">${an.history.length ? '' : `<div class="chips">${ASK_EXAMPLES.map(x => `<button type="button" class="chip-btn" data-ex="${esc(x)}">${esc(x)}</button>`).join('')}</div>`}</div>
+      <form id="anform" class="toolbar" style="margin:8px 0 0"><input name="q" placeholder="Ask anything about your bookings, revenue or pace" style="flex:1;min-width:0" autocomplete="off" ${an.busy ? 'disabled' : ''}>
+        <button class="primary" ${an.busy ? 'disabled' : ''}>Ask</button>${an.history.length ? '<button type="button" id="anclear">Clear</button>' : ''}</form>`
+      : aiSetup('Ask questions in plain English (e.g. "How did October compare with last year?") and get answers from your own booking data.')}</div>
+    <div class="grid">${head(H.ytd)}${head(H.trailing12)}${head(H.next90, ' (same dates)')}</div>
+    <div class="card"><div class="toolbar"><h3 style="margin:0">By month</h3>
+      <select id="anmetric">${[['revenue', 'Revenue'], ['occupancy', 'Occupancy'], ['adr', 'ADR']].map(([v, l]) => `<option value="${v}" ${an.metric === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      <span class="legend" style="margin:0"><span><span class="sw cy"></span>This year</span><span><span class="sw ly"></span>Same month last year</span><span class="sub">faded = on the books so far</span></span></div>
+      <div class="gbars">${M.map(m => `<div class="gbar ${m.future ? 'future' : ''} ${m.current ? 'cur' : ''}" title="${esc(`${MONTHS[+m.month.slice(5) - 1]} ${m.month.slice(0, 4)}: ${fmt(val(m, an.metric), an.metric)}${m.lastYear ? ` (last year ${fmt(val(m.lastYear, an.metric), an.metric)})` : ''}`)}">
+        <div class="pair"><i class="ly" style="height:${val(m.lastYear, an.metric) / max * 100}%"></i><i class="cy" style="height:${val(m, an.metric) / max * 100}%"></i></div>
+        <span>${MONTHS[+m.month.slice(5) - 1][0]}${m.month.endsWith('-01') ? `<br>’${m.month.slice(2, 4)}` : ''}</span></div>`).join('')}</div>
+      <details style="margin-top:10px"><summary class="sub">Month-by-month table</summary><div class="tscroll"><table class="pv">
+        <tr><th>Month</th><th>Nights</th><th>Occupancy</th><th>ADR</th><th>Revenue</th><th>Last year</th><th>Change</th></tr>
+        ${[...M].reverse().map(m => `<tr><td>${MONTHS[+m.month.slice(5) - 1]} ${m.month.slice(0, 4)}${m.future ? ' <span class="sub">(so far)</span>' : ''}</td><td>${m.nights}</td><td>${pct(m.occupancy)}</td><td>${money(m.adr)}</td>
+          <td>${money(m.revenue)}</td><td>${m.lastYear ? money(m.lastYear.revenue) : '<span class="sub">—</span>'}</td><td>${m.lastYear ? delta(m.revenue, m.lastYear.revenue) : ''}</td></tr>`).join('')}</table></div></details></div>
+    <div class="cols" style="margin-top:14px">
+      <div class="card"><h3>Pace: on the books vs last year</h3><div class="tscroll"><table class="pv"><tr><th>Month</th><th>Now</th><th>Last year, same day</th><th>Last year, final</th></tr>
+        ${A.pace.map(p => `<tr><td>${MONTHS[+p.month.slice(5) - 1]}${p.fromToday ? ' <span class="sub">(rest)</span>' : ''}</td><td>${paceCell(p.now)}</td><td>${paceCell(p.lastYearAtThisPoint)}</td><td>${paceCell(p.lastYearFinal)}</td></tr>`).join('')}</table></div>
+        <div class="sub">"Same day" counts what had been booked by this date last year, so it's a fair comparison for months still filling up.</div></div>
+      <div class="card"><div class="toolbar" style="margin-bottom:6px"><h3 style="margin:0">Stays arriving</h3>
+        <select id="anrange">${Object.entries(A.ranges).map(([v, l]) => `<option value="${v}" ${A.range === v ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
+        <span class="sub">${fmtDate(A.from)} – ${fmtDate(addDaysISO(A.to, -1))}</span></div>
+        <div class="kv"><span>Stays <b>${W.bookings}</b></span><span>Avg stay <b>${W.stay.average ?? '—'}</b> nights</span><span>Booked <b>${W.lead.median ?? '—'}</b> days ahead (median)</span><span>Party <b>${W.guests.average ?? '—'}</b> guests</span></div>
+        <div class="sub" style="margin-top:6px">The sections below use stays arriving in this range.</div></div>
+    </div>
+    <div class="card" style="margin-top:14px"><h3>Channels</h3><div class="tscroll"><table class="pv"><tr><th>Channel</th><th>Stays</th><th>Nights</th><th>Revenue</th><th>Share</th><th>ADR</th><th>Booked ahead</th><th>Avg stay</th></tr>
+      ${A.channels.map(c => `<tr><td>${tag(c.channel)}</td><td>${c.bookings}</td><td>${c.nights} <span class="sub">${pct(c.nightShare)}</span></td><td>${money(c.revenue)}</td><td>${pct(c.revenueShare)}</td><td>${money(c.adr)}</td>
+        <td>${c.avgLead != null ? c.avgLead + ' days' : '—'}</td><td>${c.avgStay ?? '—'} nights</td></tr>`).join('') || '<tr><td colspan="8" class="empty">No stays in this range</td></tr>'}</table></div></div>
+    <div class="cols" style="margin-top:14px">
+      <div class="card"><h3>How far ahead guests book</h3>${W.withBookingDate ? hbars(W.lead.buckets, r => r.bookings, r => `${r.bookings}${r.nights ? ' · ' + money(r.adr) + '/night' : ''}`) : '<div class="empty">No booking dates in this range</div>'}
+        ${W.withBookingDate < W.bookings ? `<div class="sub">${W.bookings - W.withBookingDate} stays have no booking date.</div>` : ''}</div>
+      <div class="card"><h3>Length of stay</h3>${W.bookings ? hbars(W.stay.buckets, r => r.bookings, r => `${r.bookings}${r.bookings ? ' · ' + money(r.adr) + '/night' : ''}`) : '<div class="empty">No stays in this range</div>'}</div>
+      <div class="card"><h3>Night of the week</h3><div class="bars wk">${A.weekdays.map(d => `<div class="bar" title="${d.day}: ${pct(d.occupancy)} booked, ADR ${money(d.adr)}"><i style="height:${d.occupancy * 100}%"></i>${d.day}<span class="sub">${pct(d.occupancy)}</span></div>`).join('')}</div>
+        <div class="sub">Occupancy of each night of the week (Friday = Friday night). Hover for ADR.</div></div>
+      <div class="card"><h3>Cancellations</h3><div class="big">${pct(C.rate)} <span class="sub">${C.cancelled} of ${C.bookings} bookings</span></div>
+        <div class="sub">${money(C.lostRevenue)} in cancelled bookings${C.medianNoticeDays != null ? ` · typically ${C.medianNoticeDays} days before arrival` : ''}</div>
+        ${C.byChannel.length ? `<ul class="list" style="margin-top:6px">${C.byChannel.map(c => `<li><span>${tag(c.channel)}</span><span>${pct(c.rate)} <span class="sub">${c.cancelled}/${c.bookings}</span></span></li>`).join('')}</ul>` : ''}</div>
+    </div>
+    <div class="sub" style="margin-top:10px">Revenue is each booking's total spread over its nights, as on the Dashboard. Data: ${sources || 'none yet'}.</div>`;
+
+  $('#anmetric').onchange = e => { an.metric = e.target.value; analyticsView(); };
+  $('#anrange').onchange = e => { an.range = e.target.value; analyticsView(); };
+  if (!status.ai) return;
+  const log = $('#anlog');
+  const renderLog = (pending) => {
+    if (!an.history.length && !pending) return;
+    log.innerHTML = an.history.map(h => h.role === 'user' ? `<div class="q">${esc(h.content)}</div>` : `<div class="a">${md(h.content)}${h.meta ? `<div class="sub">${esc(h.meta)}</div>` : ''}</div>`).join('')
+      + (pending ? `<div class="q">${esc(pending)}</div><div class="a sub">Looking at your data…</div>` : '');
+  };
+  renderLog();
+  const ask = async question => {
+    if (!question.trim() || an.busy) return;
+    an.busy = true; renderLog(question);
+    const form = $('#anform'); form.q.value = ''; form.q.disabled = true; form.querySelector('.primary').disabled = true;
+    try {
+      const r = await api('/ai/ask?' + q(), { method: 'POST', body: { question, history: an.history.map(({ role, content }) => ({ role, content })) } });
+      an.history.push({ role: 'user', content: question }, { role: 'assistant', content: r.text, meta: aiCost(r).replace(/^ · /, '') });
+    } catch (err) {
+      if (err.message === 'login') return;
+      an.history.push({ role: 'user', content: question }, { role: 'assistant', content: `**Couldn't answer:** ${err.message}` });
+    } finally { an.busy = false; }
+    if (location.hash === '#/analytics') { await analyticsView(); $('#anform')?.q.focus(); }
+  };
+  $('#anform').onsubmit = e => { e.preventDefault(); ask(e.target.q.value); };
+  log.querySelectorAll('[data-ex]').forEach(b => b.onclick = () => ask(b.dataset.ex));
+  if ($('#anclear')) $('#anclear').onclick = () => { an.history = []; analyticsView(); };
+}
+
 async function act(fn) {
   const btn = $('#sync'); btn.disabled = true; banner('Working…');
   try { await fn(); banner(''); await boot(true); } catch (e) { if (e.message !== 'login') banner(e.message, true); }
   btn.disabled = false;
 }
 
-const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, bookings: bookingsView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
+const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, automations: automationsView, bookings: bookingsView, analytics: analyticsView, listing: listingView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
 async function render() {
   const r = location.hash.replace(/^#\/?/, '');
   clearInterval(pageTimer); pageTimer = null;
