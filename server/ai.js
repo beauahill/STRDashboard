@@ -6,7 +6,7 @@ import { betaTool } from '@anthropic-ai/sdk/helpers/beta/json-schema';
 import { getSetting, setSetting } from './db.js';
 import { thread, savedReplies, fmtTime } from './messages.js';
 import { recommend, listEvents } from './pricing.js';
-import { FIELDS } from './listing.js';
+import { FIELDS, fetchListing } from './listing.js';
 import { doorSettings, localToday } from './doors.js';
 import { periodStats } from './stats.js';
 import { addDays, diffDays } from './sync.js';
@@ -126,10 +126,17 @@ async function ask(db, task, { system, messages, tools = null, effort = 'medium'
 const longDate = d => new Date(d + 'T00:00:00Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
 const property = (db, id) => db.prepare('SELECT * FROM properties WHERE id = ?').get(id);
 
-/** The last listing text read from Beds24 (saved whenever the Listing page loads). */
-export const cacheListing = (db, listing) => setSetting(db, `listing_cache_${listing.id}`, JSON.stringify(listing));
+/** The last listing text read from Beds24 (saved whenever the Listing page loads, or a draft needs it). */
+export const cacheListing = (db, listing) => setSetting(db, `listing_cache_${listing.id}`, JSON.stringify({ ...listing, cachedAt: new Date().toISOString() }));
 function cachedListing(db, propertyId) {
   try { return JSON.parse(getSetting(db, `listing_cache_${propertyId}`) || 'null'); } catch { return null; }
+}
+/** The cached listing, re-read from Beds24 when there's no copy or it's over a day old. Never fails a draft. */
+async function listingFor(db, client, propertyId) {
+  const cached = cachedListing(db, propertyId);
+  if (!client || !(propertyId > 0) || (cached && Date.now() - Date.parse(cached.cachedAt || 0) < 86400e3)) return cached;
+  try { const fresh = await fetchListing(client, propertyId); cacheListing(db, fresh); return fresh; }
+  catch { return cached; }
 }
 function listingText(listing, { access = true } = {}) {
   if (!listing) return '';
@@ -158,7 +165,7 @@ const DRAFT_SYSTEM = `You draft replies to short-term-rental guests for the host
 - Greet the guest by first name. Sign off simply; add a name only if the house notes give one.
 - Return only the message text.`;
 
-export async function draftReply(db, bookingId, { instructions = '' } = {}) {
+export async function draftReply(db, bookingId, { instructions = '', client = null } = {}) {
   const t = thread(db, bookingId);
   const b = t.booking;
   if (!b) throw err('This conversation has no booking details to draft from.');
@@ -181,6 +188,7 @@ export async function draftReply(db, bookingId, { instructions = '' } = {}) {
       if (v && !['guest_first_name', 'guest_name', 'check_in_date', 'check_out_date', 'check_in_time', 'check_out_time', 'nights', 'guests', 'property_name', 'door_code'].includes(k)) stay.push(`${k.replace(/_/g, ' ')}: ${v}`);
     }
   }
+  const listing = await listingFor(db, client, b.property_id);
   const replies = savedReplies(db).map(r => `### ${r.title}\n${r.body}`).join('\n\n');
   const convo = t.messages.slice(-40).map(m => {
     const who = { guest: 'Guest', host: 'Host', internalNote: 'Host\'s private note (the guest can\'t see this)', system: 'Channel notice' }[m.source] || m.source;
@@ -189,7 +197,7 @@ export async function draftReply(db, bookingId, { instructions = '' } = {}) {
   const content = [
     `<stay>\n${stay.join('\n')}\n</stay>`,
     notes && `<house_notes>\n${notes}\n</house_notes>`,
-    cachedListing(db, b.property_id) && `<listing>\n${listingText(cachedListing(db, b.property_id), { access: confirmed })}\n</listing>`,
+    listing && `<listing>\n${listingText(listing, { access: confirmed })}\n</listing>`,
     replies && `<saved_replies>\nThe host's saved replies, with {fill-ins}. Use them for tone and facts.\n\n${replies}\n</saved_replies>`,
     `<conversation>\n${convo || '(no messages yet)'}\n</conversation>`,
     instructions.trim() && `<host_instructions>\n${instructions.trim().slice(0, 2000)}\n</host_instructions>`,

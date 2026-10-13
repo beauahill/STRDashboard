@@ -172,3 +172,28 @@ test('data tools validate input and respect the property filter', async () => {
   const other = Object.fromEntries(dataTools(db, 99, '2026-10-12').map(x => [x.name, x]));
   assert.deepEqual(JSON.parse(await other.list_bookings.run({ from: '2026-01-01', to: '2027-01-01', status: 'all', channel: 'any', limit: 10 })), []);
 });
+
+test('draft reply reads the listing from Beds24 when there is no recent copy, and survives Beds24 errors', async t => {
+  const f = await withFake(t);
+  const db = setup();
+  await saveKey(db, KEY);
+  let gets = 0, fail = false;
+  const client = { get: async (path, query) => {
+    gets++;
+    if (fail) throw new Error('Beds24 is down');
+    assert.equal(path, '/properties'); assert.deepEqual(query.id, [1]);
+    return { data: [{ id: 1, name: 'Laramie House', texts: [{ language: 'en', houseRules: 'No parties after 10pm' }], roomTypes: [] }] };
+  } };
+  await draftReply(db, 1, { client });
+  assert.equal(gets, 1);
+  assert.match(messagesCalls(f)[0].body.messages[0].content, /No parties after 10pm/);
+  await draftReply(db, 1, { client });
+  assert.equal(gets, 1, 'a copy under a day old is reused');
+  // Make the copy stale, then have Beds24 fail: the old copy is still used and the draft still works.
+  const cached = JSON.parse(db.prepare("SELECT value FROM settings WHERE key = 'listing_cache_1'").get().value);
+  setSetting(db, 'listing_cache_1', JSON.stringify({ ...cached, cachedAt: '2026-01-01T00:00:00Z' }));
+  fail = true;
+  await draftReply(db, 1, { client });
+  assert.equal(gets, 2);
+  assert.match(messagesCalls(f)[2].body.messages[0].content, /No parties after 10pm/);
+});
