@@ -65,6 +65,11 @@ async function dashboard() {
       <div class="card"><h3>Same-day turnovers (${s.turnovers.length})</h3>${s.turnovers.length ? `<ul class="list">${s.turnovers.map(personRow).join('')}</ul>` : '<div class="empty">None today</div>'}</div>
       <div class="card"><h3>Revenue by month (faded = forecast)</h3><div class="bars">${s.months.map(m =>
         `<div class="bar ${m.future ? 'future' : ''}" title="${m.month}: ${money(m.revenue)}, ${pct(m.occupancy)} occ"><i style="height:${(m.revenue / max) * 100}%"></i>${m.month.slice(5)}</div>`).join('')}</div></div>
+      ${s.home ? `<a class="card kpi-link home-card" href="#/home"><h3>Smart home</h3>${s.home.alerts.length ? `<ul class="list bad">${s.home.alerts.map(a => `<li>${esc(a)}</li>`).join('')}</ul>` : '<div class="ok sub">No alerts</div>'}
+        ${s.home.error ? `<div class="sub bad">${esc(s.home.error)}</div>` : ''}
+        <ul class="list">${s.home.thermostats.map(t => `<li><span>${esc(t.name)}</span><span>${t.current != null ? Math.round(t.current) + '°F' : '—'} <span class="sub">set ${t.target != null ? Math.round(t.target) + '°' : t.low != null ? `${Math.round(t.low)}–${Math.round(t.high)}°` : esc(t.state)}</span></span></li>`).join('')}
+        ${s.home.temps.map(t => `<li><span>${esc(t.name)}</span><span>${t.value != null ? Math.round(t.value) + '°F' : '—'}</span></li>`).join('')}
+        ${s.home.locks.map(l => `<li><span>${esc(l.name)}</span><span class="chip ${l.state === 'locked' ? 'set' : 'error'}">${esc(l.state || '—')}</span></li>`).join('')}</ul></a>` : ''}
       <div class="card"><h3>This month by channel</h3>${ch.length ? `<ul class="list">${ch.map(([c, v]) =>
         `<li><span>${tag(c)}</span><span>${money(v.revenue)} <span class="sub">· ${v.nights} nights</span></span></li>`).join('')}</ul>` : '<div class="empty">No bookings</div>'}</div>
     </div>`;
@@ -214,6 +219,7 @@ async function settingsView() {
         <label class="sub"><input type="checkbox" name="bookings" ${NS.bookings ? 'checked' : ''}> New bookings and booking requests</label>
         <label class="sub"><input type="checkbox" name="cancellations" ${NS.cancellations ? 'checked' : ''}> Cancellations</label>
         <label class="sub"><input type="checkbox" name="problems" ${NS.problems ? 'checked' : ''}> Problems: a failed automated message, a door code not working before arrival, Beds24 not syncing</label>
+        ${status.home ? `<label class="sub"><input type="checkbox" name="home" ${NS.home ? 'checked' : ''}> Home Assistant: leaks, alarms, freeze risk, air quality, doors left unlocked, low batteries, offline devices</label>` : ''}
         <label class="sub"><input type="checkbox" name="preview" ${NS.preview ? 'checked' : ''}> Include the guest's message text (otherwise just "New message from …")</label>
         <details><summary class="sub">Advanced</summary><div class="stack" style="max-width:none;margin-top:8px">
           <label class="sub">ntfy server <input name="server" value="${esc(NS.server)}" style="width:100%"></label>
@@ -250,7 +256,7 @@ async function settingsView() {
   };
   $('#nform').onsubmit = async e => {
     e.preventDefault();
-    const f = e.target, body = Object.fromEntries(['enabled', 'messages', 'bookings', 'cancellations', 'problems', 'preview'].map(k => [k, f.elements[k].checked]));
+    const f = e.target, body = Object.fromEntries(['enabled', 'messages', 'bookings', 'cancellations', 'problems', 'home', 'preview'].filter(k => f.elements[k]).map(k => [k, f.elements[k].checked]));
     body.server = f.server.value;
     if (f.token.value.trim()) body.token = f.token.value.trim();
     try { await api('/notify', { method: 'POST', body }); await settingsView(); banner(body.enabled ? 'Notifications are on.' : 'Notification settings saved.', 'ok'); }
@@ -1264,13 +1270,170 @@ async function analyticsView() {
   if ($('#anclear')) $('#anclear').onclick = () => { an.history = []; analyticsView(); };
 }
 
+// ---------- Smart home (Home Assistant) ----------
+const hs = { devices: false, stay: null };
+const BAD_STATES = ['unavailable', 'unknown'];
+function sparkline(points, unit) {
+  if (points.length < 2) return '<span class="sub">Not enough readings</span>';
+  const xs = points.map(p => p[0]), ys = points.map(p => p[1]);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys), h = y1 - y0 || 1;
+  const pts = points.map(([x, y]) => `${((x - x0) / (x1 - x0 || 1) * 600).toFixed(1)},${(76 - (y - y0) / h * 70).toFixed(1)}`).join(' ');
+  return `<div class="spark"><svg viewBox="0 0 600 80" preserveAspectRatio="none"><polyline points="${pts}" fill="none" stroke="var(--acc)" stroke-width="2" vector-effect="non-scaling-stroke"/></svg>
+    <span class="sub">low ${y0}${unit} · high ${y1}${unit}</span></div>`;
+}
+
+async function homeView() {
+  const H = await api('/home?' + q());
+  if (!H.configured) {
+    view.innerHTML = `<div class="card stack"><h3>Connect Home Assistant</h3>
+      <div class="sub">Shows your thermostats, locks, leak, air-quality and temperature sensors here, alerts your phones about problems, adjusts the thermostat around bookings, locks up after checkout, and keeps a record of conditions during each stay.</div>
+      <ol class="sub steps"><li>In Home Assistant, open your profile (bottom left), then the <b>Security</b> tab, then <b>Long-lived access tokens → Create token</b>. Name it "STR Dashboard" and copy it.</li>
+        <li>Paste the address you use to reach Home Assistant from outside the house, and the token.</li></ol>
+      <form id="haform" class="stack"><input name="url" placeholder="https://home.example.com" value="${esc(H.url || '')}" autocomplete="off">
+        <input name="token" type="password" placeholder="Long-lived access token" autocomplete="off"><button class="primary">Connect</button></form>
+      <div class="sub">The token stays on the server. Thermostat and lock automations stay off until you switch them on.</div></div>`;
+    $('#haform').onsubmit = async e => {
+      e.preventDefault();
+      const b = e.target.querySelector('button'); b.disabled = true; b.textContent = 'Connecting…';
+      try { const r = await api('/home/connect', { method: 'POST', body: { url: e.target.url.value, token: e.target.token.value } }); await boot(true); banner(`Connected. Following ${r.devices} devices.`, 'ok'); }
+      catch (err) { if (err.message !== 'login') { banner(err.message, true); b.disabled = false; b.textContent = 'Connect'; } }
+    };
+    return;
+  }
+  const when = ms => new Date(ms).toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: H.tz });
+  const byRole = r => H.devices.filter(d => d.role === r);
+  const A = H.alertSettings;
+  const deg = v => v == null ? '—' : `${Math.round(v)}°F`;
+  const stateTag = (d, good, label) => BAD_STATES.includes(d.state) ? '<span class="chip error">offline</span>' : `<span class="chip ${good ? 'set' : 'error'}">${esc(label)}</span>`;
+  const rows = (list, fmt) => list.length ? `<ul class="list">${list.map(d => `<li><span>${esc(d.name)}</span><span>${fmt(d)}</span></li>`).join('')}</ul>` : '<div class="empty">None followed</div>';
+  const airLimit = { pm25: A.pm25Above, co2: A.co2Above, aqi: A.aqiAbove, voc: A.vocAbove, co: A.coAbove };
+  const air = H.devices.filter(d => ['pm25', 'pm10', 'co2', 'voc', 'aqi', 'co'].includes(d.role));
+  const climateRows = byRole('humidity');
+  const props = H.properties.filter(p => H.devices.some(d => d.propertyId === p.id) || H.properties.length === 1);
+  const thermostats = byRole('thermostat'), locks = byRole('lock');
+  const checks = (list, name, chosen) => list.length ? list.map(d => `<label class="sub"><input type="checkbox" name="${name}" value="${esc(d.id)}" ${chosen.includes(d.id) ? 'checked' : ''}> ${esc(d.name)}</label>`).join('')
+    : `<span class="sub">No ${name === 'thermostats' ? 'thermostats' : 'locks'} followed.</span>`;
+  const num = (name, label, v, extra = '') => `<label class="sub">${label}<br><input name="${name}" type="number" value="${v ?? ''}" style="width:6em" ${extra}></label>`;
+
+  view.innerHTML = `
+    <div class="toolbar"><span class="sub">Home Assistant${H.name ? ` · ${esc(H.name)}` : ''} · updated ${H.lastPoll ? timeAgo(H.lastPoll) : 'never'}</span>
+      ${H.error ? `<span class="bad sub">${esc(H.error)}</span>` : ''}
+      <span style="margin-left:auto"></span><button id="harefresh">↻ Refresh</button><button id="hadev">${hs.devices ? 'Hide devices' : 'Choose devices'}</button></div>
+    ${H.alerts.length ? `<div class="notice bad-notice"><b>Needs attention</b><ul>${H.alerts.map(a => `<li>${esc(a.title)}${a.message ? ` · <span>${esc(a.message)}</span>` : ''}</li>`).join('')}</ul></div>` : ''}
+    <div id="hadevices"></div>
+    ${props.map(p => `<div class="card" style="margin-bottom:14px"><h3>${H.properties.length > 1 ? esc(p.name) + ' · ' : ''}Right now</h3>
+      <div>${p.occupancy.current ? `<b>Guest staying:</b> ${esc(p.occupancy.current.guest || 'guest')} until ${when(p.occupancy.current.checkOutAt)}` : '<b>No guests staying</b>'}
+      ${p.occupancy.next ? `<div class="sub">Next check-in: ${esc(p.occupancy.next.guest || 'guest')}, ${when(p.occupancy.next.checkInAt)}${p.climate.enabled && p.preheatAt ? ` · thermostat warms up from ${when(p.preheatAt)}` : ''}</div>` : '<div class="sub">No upcoming check-ins in the next 60 days.</div>'}</div></div>`).join('')}
+    <div class="cols">
+      <div class="card"><h3>Thermostats</h3>${thermostats.length ? thermostats.map(d => `<div class="therm"><div><b>${esc(d.name)}</b><div class="sub">${BAD_STATES.includes(d.state) ? '<span class="bad">offline</span>'
+        : `${esc(d.state)}${d.action ? ` · ${esc(d.action)}` : ''} · set to ${d.low != null && d.high != null && d.target == null ? `${deg(d.low)}–${deg(d.high)}` : deg(d.target)}`}</div></div><div class="big">${deg(d.current)}</div></div>`).join('') : '<div class="empty">None followed</div>'}</div>
+      <div class="card"><h3>Temperature &amp; humidity</h3>${rows([...byRole('temperature'), ...byRole('outdoor'), ...climateRows], d => BAD_STATES.includes(d.state) ? '<span class="chip error">offline</span>'
+        : d.role === 'humidity' ? `<span class="${A.humidityAbove != null && d.value > A.humidityAbove ? 'bad' : ''}">${d.value ?? '—'}%</span>`
+        : `<span class="${d.role !== 'outdoor' && A.freezeBelow != null && d.value < A.freezeBelow ? 'bad' : ''}">${deg(d.value)}</span>${d.role === 'outdoor' ? ' <span class="sub">outside</span>' : ''}`)}</div>
+      <div class="card"><h3>Air quality</h3>${rows(air, d => BAD_STATES.includes(d.state) ? '<span class="chip error">offline</span>'
+        : `<span class="${airLimit[d.role] != null && d.value > airLimit[d.role] ? 'bad' : ''}">${d.value ?? '—'} <span class="sub">${esc(d.unit)}</span></span>`)}</div>
+      <div class="card"><h3>Leaks &amp; alarms</h3>${rows([...byRole('leak'), ...byRole('safety')], d => d.role === 'leak' ? stateTag(d, d.state === 'off', d.state === 'on' ? 'WET' : 'Dry') : stateTag(d, d.state === 'off', d.state === 'on' ? 'ALARM' : 'Clear'))}</div>
+      <div class="card"><h3>Locks</h3>${rows(locks, d => stateTag(d, d.state === 'locked', d.state || '—'))}</div>
+      <div class="card"><h3>Batteries</h3>${rows(byRole('battery').sort((a, b) => (a.value ?? 999) - (b.value ?? 999)), d => BAD_STATES.includes(d.state) ? '<span class="chip error">offline</span>'
+        : `<span class="${A.batteryBelow != null && d.value < A.batteryBelow ? 'bad' : ''}">${d.value ?? '—'}%</span>`)}</div>
+    </div>
+    ${props.map(p => `<div class="cols" style="margin-top:14px">
+      <form class="card stack hclimate" data-pid="${p.id}" style="max-width:none"><h3>${H.properties.length > 1 ? esc(p.name) + ' · ' : ''}Thermostat around bookings</h3>
+        <label><input type="checkbox" name="enabled" ${p.climate.enabled ? 'checked' : ''}> <b>Adjust the thermostat for bookings</b></label>
+        <div class="sub">Set once at each change, so guests can still adjust it during their stay. Now: <b>${p.phase === 'occupied' ? 'guest temperatures' : 'eco (no guests)'}</b>.</div>
+        <div class="chips">${checks(thermostats, 'thermostats', p.climate.thermostats)}</div>
+        <div class="toolbar" style="margin:0">${num('occupiedHeat', 'Guests: heat to', p.climate.occupiedHeat)}${num('occupiedCool', 'Guests: cool to', p.climate.occupiedCool)}
+          ${num('vacantHeat', 'Empty: heat to', p.climate.vacantHeat)}${num('vacantCool', 'Empty: cool to', p.climate.vacantCool)}</div>
+        <div class="toolbar" style="margin:0">${num('preconditionHours', 'Hours before check-in', p.climate.preconditionHours, 'min="0" max="24" step="0.5"')}
+          ${num('setbackMinutes', 'Minutes after checkout', p.climate.setbackMinutes, 'min="0" max="720"')}${num('freezeFloor', 'Never below (°F)', p.climate.freezeFloor, 'min="35" max="65"')}
+          <label class="sub">If it's switched off<br><select name="offMode">${[['heat', 'Turn on heat'], ['cool', 'Turn on cooling'], ['heat_cool', 'Turn on heat/cool'], ['leave', 'Leave it off']].map(([v, l]) => `<option value="${v}" ${p.climate.offMode === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label></div>
+        <div class="sub">Freeze protection: if the house gets within 2° of "never below" while the heat is off or set lower, the heat is turned on (and your phones are told).</div>
+        <div class="toolbar" style="margin:0"><button class="primary">Save</button>${p.climate.enabled ? '<button type="button" class="happly">Apply now</button>' : ''}</div></form>
+      <form class="card stack hlock" data-pid="${p.id}" style="max-width:none"><h3>${H.properties.length > 1 ? esc(p.name) + ' · ' : ''}Lock up after checkout</h3>
+        <label><input type="checkbox" name="enabled" ${p.checkoutLock.enabled ? 'checked' : ''}> <b>Lock the doors after checkout if they're unlocked</b></label>
+        <div class="chips">${checks(locks, 'locks', p.checkoutLock.locks)}</div>
+        ${num('minutes', 'Minutes after checkout time', p.checkoutLock.minutes, 'min="0" max="240"')}
+        <div class="sub">Once per stay. A door that won't lock (jammed or offline) is reported to your phones.</div>
+        <div><button class="primary">Save</button></div></form></div>`).join('')}
+    <form class="card stack" id="halerts" style="max-width:none;margin-top:14px"><h3>Alert thresholds</h3>
+      <div class="toolbar" style="margin:0">${num('freezeBelow', 'Freeze risk below (°F)', A.freezeBelow)}${num('hotAbove', 'Too hot above (°F)', A.hotAbove)}${num('humidityAbove', 'Humidity above (%)', A.humidityAbove)}
+        ${num('pm25Above', 'PM2.5 above', A.pm25Above)}${num('co2Above', 'CO₂ above (ppm)', A.co2Above)}${num('aqiAbove', 'AQI above', A.aqiAbove)}${num('vocAbove', 'VOC above', A.vocAbove, 'placeholder="off"')}
+        ${num('coAbove', 'CO above (ppm)', A.coAbove)}${num('batteryBelow', 'Battery below (%)', A.batteryBelow)}${num('offlineMinutes', 'Offline after (min)', A.offlineMinutes)}${num('unlockedMinutes', 'Unlocked with no guest (min)', A.unlockedMinutes)}</div>
+      <div class="sub">Leaks and smoke/CO alarms always alert straight away. Leave a box empty to turn that alert off. Alerts reach your phones if phone notifications are on (Settings).</div>
+      <div><button class="primary">Save</button></div></form>
+    <div class="card" style="margin-top:14px"><h3>Stay records</h3>${H.stays.length ? `<div class="tscroll"><table class="pv"><tr><th>Guest</th><th>Stay</th><th>Inside temp</th><th>Humidity</th><th>PM2.5 max</th><th>CO₂ max</th><th>Alerts</th><th></th></tr>
+      ${H.stays.map(s => `<tr><td>${esc(s.guest_name || 'Guest')} ${tag(s.channel)}${s.current ? ' <span class="chip set">now</span>' : ''}</td><td>${fmtDate(s.arrival)} → ${fmtDate(s.departure)}</td>
+        <td>${s.summary.temperature ? `${Math.round(s.summary.temperature.min)}–${Math.round(s.summary.temperature.max)}°F` : '—'}</td><td>${s.summary.humidity ? `${Math.round(s.summary.humidity.max)}%` : '—'}</td>
+        <td class="${s.summary.pm25 && A.pm25Above != null && s.summary.pm25.max > A.pm25Above ? 'bad' : ''}">${s.summary.pm25 ? s.summary.pm25.max : '—'}</td><td>${s.summary.co2 ? Math.round(s.summary.co2.max) : '—'}</td>
+        <td>${s.alerts ? `<span class="bad">${s.alerts}</span>` : '0'}</td><td><button type="button" data-stay="${s.id}">Details</button></td></tr>`).join('')}</table></div>`
+      : '<div class="empty">Records start with the next stay: readings are saved every 10 minutes from now on.</div>'}<div id="hstay"></div></div>
+    <div class="card" style="margin-top:14px"><h3>Recent automatic changes</h3>${H.actions.length ? `<ul class="list">${H.actions.map(a => `<li><span>${a.ok ? '<span class="ok">✓</span>' : '<span class="bad">✗</span>'} ${esc(a.name)}: ${esc(a.detail)}</span><span class="sub">${new Date(a.at).toLocaleString()}</span></li>`).join('')}</ul>` : '<div class="empty">None yet</div>'}
+      <hr><button id="hadisc">Disconnect Home Assistant</button></div>`;
+
+  const save = async (body, msg) => {
+    try { await api('/home/settings', { method: 'POST', body }); await homeView(); banner(msg, 'ok'); }
+    catch (err) { if (err.message !== 'login') banner(err.message, true); }
+  };
+  const vals = (f, names) => Object.fromEntries(names.map(n => [n, f.elements[n].value]));
+  view.querySelectorAll('.hclimate').forEach(f => {
+    f.onsubmit = e => { e.preventDefault(); save({ climate: { propertyId: +f.dataset.pid, enabled: f.enabled.checked, thermostats: [...f.querySelectorAll('[name=thermostats]:checked')].map(x => x.value),
+      ...vals(f, ['occupiedHeat', 'occupiedCool', 'vacantHeat', 'vacantCool', 'preconditionHours', 'setbackMinutes', 'freezeFloor', 'offMode']) } }, 'Thermostat schedule saved.'); };
+    const ap = f.querySelector('.happly');
+    if (ap) ap.onclick = async () => {
+      ap.disabled = true;
+      try { const r = await api('/home/climate/apply', { method: 'POST', body: { propertyId: +f.dataset.pid } }); await homeView(); banner(r.applied.length ? r.applied.map(x => x.detail).join('; ') : 'Nothing changed (see Recent automatic changes).', 'ok'); }
+      catch (err) { if (err.message !== 'login') banner(err.message, true); ap.disabled = false; }
+    };
+  });
+  view.querySelectorAll('.hlock').forEach(f => f.onsubmit = e => { e.preventDefault();
+    save({ checkoutLock: { propertyId: +f.dataset.pid, enabled: f.enabled.checked, locks: [...f.querySelectorAll('[name=locks]:checked')].map(x => x.value), minutes: f.minutes.value } }, 'Checkout locking saved.'); });
+  $('#halerts').onsubmit = e => { e.preventDefault();
+    save({ alerts: vals(e.target, ['freezeBelow', 'hotAbove', 'humidityAbove', 'pm25Above', 'co2Above', 'aqiAbove', 'vocAbove', 'coAbove', 'batteryBelow', 'offlineMinutes', 'unlockedMinutes']) }, 'Alert thresholds saved.'); };
+  $('#harefresh').onclick = async () => { try { await api('/home/refresh', { method: 'POST' }); await homeView(); } catch (err) { if (err.message !== 'login') banner(err.message, true); } };
+  $('#hadisc').onclick = () => confirm('Disconnect Home Assistant? Thermostat and lock automations switch off; stay records are kept.') && act(() => api('/home/disconnect', { method: 'POST' }));
+  $('#hadev').onclick = () => { hs.devices = !hs.devices; homeView(); };
+  view.querySelectorAll('[data-stay]').forEach(b => b.onclick = async () => {
+    hs.stay = +b.dataset.stay;
+    const r = await api('/home/stay?booking=' + hs.stay);
+    $('#hstay').innerHTML = `<div class="stay"><h3>${esc(r.booking.guest_name || 'Guest')} · ${fmtDate(r.booking.arrival)} → ${fmtDate(r.booking.departure)}</h3>
+      ${r.series.map(x => `<div class="sub"><b>${esc(x.name)}</b> (${esc(x.unit)})</div>${sparkline(x.points, x.unit)}`).join('') || '<div class="empty">No readings for this stay.</div>'}
+      ${r.alerts.length ? `<div class="sub" style="margin-top:8px"><b>Alerts</b></div><ul class="list">${r.alerts.map(a => `<li><span>${esc(a.name)}: ${esc(a.rule)}${a.peak != null ? ` (worst ${a.peak})` : ''}</span><span class="sub">${new Date(a.since).toLocaleString()}</span></li>`).join('')}</ul>` : ''}
+      ${r.events.length ? `<div class="sub" style="margin-top:8px"><b>Lock and sensor events</b></div><ul class="list">${r.events.map(ev => `<li><span>${esc(ev.name)}: ${esc(ev.from_state)} → ${esc(ev.to_state)}</span><span class="sub">${new Date(ev.at).toLocaleString()}</span></li>`).join('')}</ul>` : ''}</div>`;
+  });
+  if (hs.devices) await renderDevices();
+}
+
+async function renderDevices() {
+  const D = await api('/home/devices');
+  const box = $('#hadevices');
+  if (!box) return;
+  box.innerHTML = `<form class="card stack" id="hdform" style="max-width:none;margin-bottom:14px"><h3>Devices to follow</h3>
+    <div class="sub">Everything Home Assistant has that this app understands. Untick anything that isn't part of the rental (a phone's battery, for example).</div>
+    <div class="tscroll"><table class="pv"><tr><th>Follow</th><th>Device</th><th>Type</th>${D.properties.length > 1 ? '<th>Property</th>' : ''}<th>Now</th></tr>
+    ${D.devices.map(d => `<tr data-id="${esc(d.id)}"><td><input type="checkbox" name="follow" ${d.role ? 'checked' : ''}></td><td>${esc(d.name)}<div class="sub">${esc(d.id)}</div></td>
+      <td><select name="role">${Object.entries(D.roles).map(([k, l]) => `<option value="${k}" ${(d.role || d.suggested) === k ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></td>
+      ${D.properties.length > 1 ? `<td><select name="pid">${D.properties.map(p => `<option value="${p.id}" ${d.propertyId === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></td>` : ''}
+      <td class="sub">${esc(d.state)} ${esc(d.unit)}</td></tr>`).join('')}</table></div>
+    <div><button class="primary">Save devices</button></div></form>`;
+  $('#hdform').onsubmit = async e => {
+    e.preventDefault();
+    const entities = {};
+    for (const tr of box.querySelectorAll('tr[data-id]')) {
+      if (!tr.querySelector('[name=follow]').checked) continue;
+      entities[tr.dataset.id] = { role: tr.querySelector('[name=role]').value, propertyId: tr.querySelector('[name=pid]')?.value ?? D.properties[0]?.id ?? null };
+    }
+    try { await api('/home/devices', { method: 'POST', body: { entities } }); hs.devices = false; await homeView(); banner(`Following ${Object.keys(entities).length} devices.`, 'ok'); }
+    catch (err) { if (err.message !== 'login') banner(err.message, true); }
+  };
+}
+
 async function act(fn) {
   const btn = $('#sync'); btn.disabled = true; banner('Working…');
   try { await fn(); banner(''); await boot(true); } catch (e) { if (e.message !== 'login') banner(e.message, true); }
   btn.disabled = false;
 }
 
-const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, automations: automationsView, bookings: bookingsView, analytics: analyticsView, listing: listingView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
+const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, automations: automationsView, bookings: bookingsView, analytics: analyticsView, home: homeView, listing: listingView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
 async function render() {
   // #/inbox/123 (from a phone notification) opens that conversation.
   const [r, arg] = location.hash.replace(/^#\/?/, '').split('/');

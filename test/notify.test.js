@@ -148,4 +148,9 @@ test('messages for bookings not synced yet: the booking is fetched so the alert 
   assert.deepEqual(asked, [['/bookings', [77]]]);
   assert.equal(collect(db, NOW)[0].title, 'Inquiry from New Guest (Airbnb)');
   assert.equal(await fillMissingBookings(db, client), 0, 'nothing to fetch once it is known');
+  addMessage(db, 2, 88, 'From a booking Beds24 no longer has', ago(1));
+  const none = { getAll: async (path, q) => { asked.push([path, q.id]); return []; } };
+  await fillMissingBookings(db, none);
+  await fillMissingBookings(db, none);
+  assert.deepEqual(asked.slice(1), [['/bookings', [88]]], 'asked once, not every minute');
 });

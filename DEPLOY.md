@@ -70,7 +70,21 @@ Anyone who knows the topic name can read the alerts on ntfy.sh, so keep it priva
 Advanced) replaces it if it leaks. Email alerts aren't built in: Railway blocks outgoing email (SMTP) below the
 Pro plan, so they'd need an email service such as Resend.
 
-## 9. AI assistant (optional)
+## 9. Home Assistant (optional)
+
+Home Assistant must be reachable from the internet (Home Assistant Cloud, or your own address through DuckDNS,
+a Cloudflare Tunnel or a reverse proxy), because the app runs on Railway, not in the house.
+
+1. In Home Assistant: your profile (bottom left) → **Security** → **Long-lived access tokens → Create token**.
+2. In the app: **Smart home** → paste the address and token → **Connect**. Everything relevant is followed;
+   **Choose devices** lets you untick anything that isn't part of the rental and fix a device's type.
+3. Review **Alert thresholds**, then switch on **Thermostat around bookings** and **Lock up after checkout** if
+   you want them. Phone notifications include Home Assistant alerts (Settings → Phone notifications).
+
+The token gives full control of Home Assistant, so it stays on the server; you can revoke it in Home Assistant at
+any time. If you use Home Assistant's own automations for the same thermostat, switch one of them off.
+
+## 10. AI assistant (optional)
 
 1. At [console.anthropic.com](https://console.anthropic.com): add a payment method or credits under
    **Billing**, then **API keys → Create key**. Copy it (it starts with `sk-ant-`).

@@ -90,6 +90,17 @@ CREATE TABLE IF NOT EXISTS notification_log (
   kind TEXT NOT NULL, ref TEXT NOT NULL, at TEXT NOT NULL, title TEXT, ok INTEGER NOT NULL, error TEXT, attempts INTEGER DEFAULT 0,
   PRIMARY KEY (kind, ref)
 );
+-- Home Assistant: latest reading per followed device, 10-minute samples (for stay records), lock/leak events,
+-- conditions currently breaking an alert rule, every alert episode, and automatic actions taken.
+CREATE TABLE IF NOT EXISTS ha_states (entity_id TEXT PRIMARY KEY, state TEXT, attributes TEXT, last_changed TEXT, updated_at TEXT);
+CREATE TABLE IF NOT EXISTS ha_samples (entity_id TEXT NOT NULL, at TEXT NOT NULL, value REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_ha_samples ON ha_samples(at, entity_id);
+CREATE TABLE IF NOT EXISTS ha_events (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_id TEXT NOT NULL, at TEXT NOT NULL, from_state TEXT, to_state TEXT);
+CREATE INDEX IF NOT EXISTS idx_ha_events ON ha_events(at);
+CREATE TABLE IF NOT EXISTS ha_alerts (entity_id TEXT NOT NULL, rule TEXT NOT NULL, since TEXT NOT NULL, value REAL, log_id INTEGER, PRIMARY KEY (entity_id, rule));
+CREATE TABLE IF NOT EXISTS ha_alert_log (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_id TEXT NOT NULL, rule TEXT NOT NULL, since TEXT NOT NULL, until TEXT, peak REAL);
+CREATE TABLE IF NOT EXISTS ha_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, entity_id TEXT, kind TEXT NOT NULL, detail TEXT, ok INTEGER NOT NULL, notify INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS ha_done (key TEXT PRIMARY KEY, at TEXT NOT NULL);
 -- Every change sent to Beds24 from this app, successful or not.
 CREATE TABLE IF NOT EXISTS change_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, room_id INTEGER NOT NULL,

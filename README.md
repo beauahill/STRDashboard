@@ -56,6 +56,23 @@ Settings). Failed logins are rate-limited (10 per IP per 15 minutes).
   event is sent once, nothing from before notifications were switched on is sent, the message text can be left out,
   and the topic is long and random because on ntfy.sh it's what keeps the alerts private. Settings has a test
   button and the recent sends.
+- **Smart home** (Home Assistant, through its API with a long-lived access token; checked every minute):
+  - *Status*: thermostats (temperature, setpoint, mode), inside/outside temperatures, humidity, air quality, leak
+    sensors and smoke/CO alarms, locks, batteries and offline devices, plus whether a guest is staying and when the
+    next check-in is. A summary card on the Dashboard.
+  - *Alerts* (to phones through notifications): leak and alarm at once; freeze risk, too hot, high humidity, poor air
+    (PM2.5, CO₂, AQI, VOC, CO; "possible smoking or vaping" during a stay), a door left unlocked with no guest
+    staying, jammed locks, low batteries, offline devices and Home Assistant unreachable. Thresholds are editable;
+    a condition must clear (with a margin) before it can alert again.
+  - *Thermostat around bookings* (off until switched on): guest temperatures from N hours before check-in, eco
+    temperatures from N minutes after checkout, set once per change so guests can still adjust it; handles
+    heat, cool and heat/cool modes and thermostats that are switched off; °C installs are converted. Freeze
+    protection turns the heat on if the house nears a floor temperature while the heat is off.
+  - *Lock up after checkout* (off until switched on): locks chosen doors N minutes after checkout if unlocked,
+    once per stay; failures are reported.
+  - *Stay records*: readings saved every 10 minutes (kept 400 days) give each stay's temperature range, humidity,
+    worst PM2.5 / CO₂, alerts and lock/leak events, with charts, for smoking or damage claims.
+  - Door codes stay with Seam (Home Assistant's Yale integration doesn't manage keypad codes).
 - **Bookings**: searchable/filterable list.
 - **Analytics**: year to date, last 12 months and next 90 days against the same dates last year; revenue,
   occupancy or ADR by month next to the same month last year; pace (on the books now versus what was booked
@@ -116,7 +133,7 @@ Settings). Failed logins are rate-limited (10 per IP per 15 minutes).
 `server/beds24.js` API client + token handling · `server/sync.js` mapping and sync ·
 `server/rates.js` prices, minimum stays and blocks · `server/doors.js` + `server/seam.js` door codes ·
 `server/messages.js` inbox and saved replies · `server/pricing.js` pricing tool · `server/cleaning.js` Turno feed and turnovers · `server/automations.js` automated messages · `server/listing.js` listing editor ·
-`server/analytics.js` analytics · `server/ai.js` AI assistant · `server/notify.js` phone notifications ·
+`server/analytics.js` analytics · `server/ai.js` AI assistant · `server/notify.js` phone notifications · `server/ha.js` Home Assistant ·
 `server/guesty.js` Guesty import ·
 `server/stats.js` metrics · `server/demo.js` sample data · `public/` UI · `test/` (`npm test`).
 

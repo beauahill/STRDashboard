@@ -626,3 +626,53 @@ test('Phone notifications: test message, then a new guest message is pushed to n
   assert.equal((await call('/api/sync', {})).status, 200);
   assert.equal(pushes.length, 2, 'not sent twice');
 });
+
+test('Smart home over HTTP: connect Home Assistant, status without the token, automations, refresh', async t => {
+  const devices = [
+    { entity_id: 'climate.living_room', state: 'heat', attributes: { friendly_name: 'Living room', current_temperature: 64, temperature: 62, hvac_modes: ['off', 'heat'] } },
+    { entity_id: 'lock.front_door', state: 'locked', attributes: { friendly_name: 'Front door' } },
+    { entity_id: 'binary_sensor.kitchen_leak', state: 'off', attributes: { friendly_name: 'Kitchen leak', device_class: 'moisture' } },
+  ];
+  const calls = [];
+  const ha = createServer((req, res) => {
+    let b = ''; req.on('data', c => b += c); req.on('end', () => {
+      if (req.headers.authorization !== 'Bearer ha-token') { res.writeHead(401); return res.end('{"message":"Unauthorized"}'); }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      if (req.url === '/api/config') return res.end(JSON.stringify({ unit_system: { temperature: '°F' }, location_name: 'Rental' }));
+      if (req.url === '/api/states') return res.end(JSON.stringify(devices));
+      calls.push([req.url, JSON.parse(b)]); res.end('[]');
+    });
+  });
+  await new Promise(ok => ha.listen(0, '127.0.0.1', ok));
+  t.after(() => ha.close());
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite') });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+  assert.equal((await call('/api/demo', {})).status, 200);
+  assert.equal((await call('/api/home')).json.configured, false);
+  const url = `http://127.0.0.1:${ha.address().port}`;
+  assert.equal((await call('/api/home/connect', { url, token: 'nope' })).status, 400);
+  const c = await call('/api/home/connect', { url, token: 'ha-token' });
+  assert.equal(c.status, 200, JSON.stringify(c.json));
+  assert.equal(c.json.devices, 3);
+  assert.equal((await call('/api/status')).json.home, true);
+  const raw = await fetch(s.url('/api/home'), { headers: { cookie: sid } }).then(r => r.text());
+  assert.ok(!raw.includes('ha-token'), 'the token is never sent to the browser');
+  const home = JSON.parse(raw);
+  assert.equal(home.devices.find(d => d.id === 'climate.living_room').current, 64);
+  const pid = home.properties[0].id;
+  const saved = await call('/api/home/settings', { climate: { propertyId: pid, enabled: true, thermostats: ['climate.living_room'] } });
+  assert.equal(saved.status, 200, JSON.stringify(saved.json));
+  assert.ok(calls.some(([u]) => u === '/api/services/climate/set_temperature'), 'the thermostat is set as soon as the schedule is switched on');
+  assert.equal((await call('/api/home/refresh', {})).status, 200);
+  const dev = (await call('/api/home/devices')).json;
+  assert.equal(dev.devices.length, 3);
+  assert.equal((await call('/api/home/devices', { entities: { 'lock.front_door': { role: 'lock', propertyId: pid } } })).status, 200);
+  assert.deepEqual((await call('/api/home')).json.devices.map(d => d.id), ['lock.front_door']);
+  assert.ok((await call('/api/summary')).json.home.locks.length === 1);
+  assert.equal((await call('/api/home/disconnect', {})).status, 200);
+  assert.equal((await call('/api/home')).json.configured, false);
+});
