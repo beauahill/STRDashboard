@@ -218,3 +218,8 @@ ol.steps { margin:0; padding-left:20px; } ol.steps li { margin:3px 0; } #ntopic 
 .photos { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:12px; }
 .ph img { width:100%; aspect-ratio:3/2; object-fit:cover; border-radius:8px; display:block; background:var(--bg); }
 .ph input { width:100%; margin-top:4px; }
+
+/* Guidebook editor */
+.rep { display:grid; gap:6px; grid-template-columns:minmax(0,1fr); padding:8px 0; border-top:1px solid var(--line); }
+.rep.place { grid-template-columns:repeat(auto-fit,minmax(min(160px,100%),1fr)); }
+.rep textarea { width:100%; } .rep .rm { justify-self:start; }

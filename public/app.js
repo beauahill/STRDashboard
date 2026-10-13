@@ -1528,13 +1528,75 @@ async function siteView() {
   };
 }
 
+// ---------- Guest guidebook ----------
+const gb = { property: null };
+async function guideView() {
+  const G = await api('/guide?' + new URLSearchParams(gb.property ? { property: gb.property } : {}));
+  if (!G.guide) { view.innerHTML = '<div class="card empty">No properties yet. Connect Beds24 in Settings first.</div>'; return; }
+  const g = G.guide;
+  gb.property = g.propertyId;
+  const area = (name, label, rows = 4, hint = '') => `<label class="sub">${label}<textarea name="${name}" rows="${rows}" style="width:100%">${esc(g[name])}</textarea>${hint ? `<span class="sub">${hint}</span>` : ''}</label>`;
+  const input = (name, label, w = '100%', type = 'text') => `<label class="sub">${label}<input name="${name}" type="${type}" value="${esc(g[name])}" style="width:${w}"></label>`;
+  const secRow = s => `<div class="rep sec"><input placeholder="Title, e.g. Heating" value="${esc(s.title)}" data-k="title"><textarea rows="3" placeholder="How it works" data-k="body">${esc(s.body)}</textarea><button type="button" class="rm">Remove</button></div>`;
+  const placeRow = p => `<div class="rep place"><input placeholder="Name" value="${esc(p.name)}" data-k="name"><input placeholder="Category, e.g. Coffee" value="${esc(p.category)}" data-k="category">
+    <input placeholder="Why you like it" value="${esc(p.note)}" data-k="note"><input placeholder="https://… (map or website)" value="${esc(p.url)}" data-k="url"><button type="button" class="rm">Remove</button></div>`;
+  const first = G.stays.find(s => s.url);
+  view.innerHTML = `
+    <div class="card stack" style="max-width:none;margin-bottom:14px"><div class="toolbar" style="margin:0">
+      ${G.properties.length > 1 ? `<select id="gprop">${G.properties.map(p => `<option value="${p.id}" ${p.id === g.propertyId ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>` : '<h3 style="margin:0">Guest guidebook</h3>'}
+      <span style="margin-left:auto"></span>${first ? `<a href="${esc(first.url)}" target="_blank" rel="noopener"><button type="button">Preview (${esc(first.guest_name || 'next guest')}) ↗</button></a>` : ''}</div>
+      <div class="sub">Each booking gets its own private link. Send it with the <code>{guidebook_link}</code> fill-in in an automated message (e.g. check-in instructions) or a saved reply.
+        The door code and address only appear from ${g.codeDaysBefore} day${g.codeDaysBefore === 1 ? '' : 's'} before check-in until checkout.</div></div>
+    <form id="gform">
+      <div class="cols">
+        <div class="card stack" style="max-width:none"><h3>Arriving</h3>${area('welcome', 'Welcome message')}${area('arrival', 'Check-in steps', 5, 'Which door, where the keypad is, anything tricky. The door code and address are added automatically.')}
+          ${area('parking', 'Parking', 2)}<div class="toolbar" style="margin:0">${input('wifiName', 'Wi-Fi network', '12em')}${input('wifiPassword', 'Wi-Fi password', '12em')}</div></div>
+        <div class="card stack" style="max-width:none"><h3>Leaving and help</h3>${area('checkout', 'Checkout checklist (one step per line)', 5)}
+          ${input('phone', 'Phone for guests (optional)', '14em')}${area('emergency', 'Emergency information', 3)}
+          <div class="toolbar" style="margin:0">${input('codeDaysBefore', 'Show door code from (days before check-in)', '6em', 'number')}</div></div>
+      </div>
+      <div class="card stack" style="max-width:none;margin-top:14px"><h3>House guide</h3><div class="sub">How things work: heating, TV, kitchen, laundry, trash days, hot tub…</div>
+        <div id="gsecs">${g.sections.map(secRow).join('')}</div><div><button type="button" id="gaddsec">Add section</button></div></div>
+      <div class="card stack" style="max-width:none;margin-top:14px"><h3>Local tips</h3><div class="sub">Your favourite places in Laramie, grouped by category.</div>
+        <div id="gplaces">${g.places.map(placeRow).join('')}</div><div><button type="button" id="gaddplace">Add place</button></div></div>
+      <div class="card stack" style="max-width:none;margin-top:14px"><h3>Direct bookings</h3>
+        <label><input type="checkbox" name="requireDirect" ${g.requireDirect ? 'checked' : ''}> <b>Direct guests check in online first</b>: they type their name to accept the rental agreement and upload a photo ID before the door code and address appear</label>
+        <div class="toolbar" style="margin:0">${input('idRetentionDays', 'Delete ID photos this many days after checkout', '6em', 'number')}</div>
+        <div class="sub">The agreement is the one on your Booking site page. Airbnb, VRBO and Booking.com guests are never asked.</div></div>
+      <div class="card" style="margin-top:14px;position:sticky;bottom:0;z-index:3"><button class="primary">Save</button></div>
+    </form>
+    <div class="card" style="margin-top:14px"><h3>Upcoming stays</h3>${G.stays.length ? `<div class="tscroll"><table class="pv"><tr><th>Guest</th><th>Stay</th><th>Link</th><th>Online check-in</th></tr>
+      ${G.stays.map(s => `<tr><td>${esc(s.guest_name || 'Guest')} ${tag(s.channel)}</td><td>${fmtDate(s.arrival)} → ${fmtDate(s.departure)}</td>
+        <td>${s.url ? `<a href="${esc(s.url)}" target="_blank" rel="noopener">Open</a> · <a href="#" data-copy="${esc(s.url)}">Copy</a>` : '<span class="sub">—</span>'}</td>
+        <td>${s.checkin?.signed_at ? `<span class="ok">✓</span> ${esc(s.checkin.name)}${s.checkin.has_id ? ` · <a href="/api/guide/id?booking=${s.id}" target="_blank" rel="noopener">View ID</a>` : s.checkin.id_deleted_at ? ' · ID deleted' : ''}` : s.channel === 'Direct' && g.requireDirect ? '<span class="warn">Not yet</span>' : '<span class="sub">Not needed</span>'}</td></tr>`).join('')}</table></div>`
+      : '<div class="empty">No upcoming stays.</div>'}
+      ${G.stays.length && !first ? '<div class="sub warn">Links appear once the app knows its own address: open the app once from its Railway address.</div>' : ''}
+      <hr><button type="button" id="gregen">Make new links for everyone</button> <span class="sub">Old links stop working (use this if one was shared by mistake).</span></div>`;
+
+  if ($('#gprop')) $('#gprop').onchange = e => { gb.property = +e.target.value; guideView(); };
+  const wireRemove = () => view.querySelectorAll('.rep .rm').forEach(b => b.onclick = () => b.closest('.rep').remove());
+  wireRemove();
+  $('#gaddsec').onclick = () => { $('#gsecs').insertAdjacentHTML('beforeend', secRow({ title: '', body: '' })); wireRemove(); };
+  $('#gaddplace').onclick = () => { $('#gplaces').insertAdjacentHTML('beforeend', placeRow({ name: '', category: '', note: '', url: '' })); wireRemove(); };
+  const rows = sel => [...view.querySelectorAll(sel)].map(r => Object.fromEntries([...r.querySelectorAll('[data-k]')].map(i => [i.dataset.k, i.value])));
+  $('#gform').onsubmit = async e => {
+    e.preventDefault();
+    const f = e.target, body = { propertyId: g.propertyId, requireDirect: f.requireDirect.checked, sections: rows('.rep.sec'), places: rows('.rep.place') };
+    for (const k of ['welcome', 'arrival', 'parking', 'wifiName', 'wifiPassword', 'checkout', 'phone', 'emergency', 'codeDaysBefore', 'idRetentionDays']) body[k] = f.elements[k].value;
+    try { await api('/guide', { method: 'POST', body }); await guideView(); banner('Guidebook saved.', 'ok'); }
+    catch (err) { if (err.message !== 'login') banner(err.message, true); }
+  };
+  view.querySelectorAll('[data-copy]').forEach(a => a.onclick = async e => { e.preventDefault(); try { await navigator.clipboard.writeText(a.dataset.copy); a.textContent = 'Copied'; } catch { prompt('Copy this link', a.dataset.copy); } });
+  $('#gregen').onclick = () => confirm('Make new guidebook links for every booking? Links already sent will stop working.') && act(() => api('/guide/regenerate', { method: 'POST' }));
+}
+
 async function act(fn) {
   const btn = $('#sync'); btn.disabled = true; banner('Working…');
   try { await fn(); banner(''); await boot(true); } catch (e) { if (e.message !== 'login') banner(e.message, true); }
   btn.disabled = false;
 }
 
-const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, automations: automationsView, bookings: bookingsView, analytics: analyticsView, home: homeView, site: siteView, listing: listingView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
+const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, automations: automationsView, bookings: bookingsView, analytics: analyticsView, home: homeView, site: siteView, guide: guideView, listing: listingView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
 async function render() {
   // #/inbox/123 (from a phone notification) opens that conversation.
   const [r, arg] = location.hash.replace(/^#\/?/, '').split('/');

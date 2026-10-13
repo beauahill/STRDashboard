@@ -106,6 +106,11 @@ CREATE TABLE IF NOT EXISTS site_photos (
   id INTEGER PRIMARY KEY AUTOINCREMENT, property_id INTEGER NOT NULL, sort INTEGER DEFAULT 0, caption TEXT,
   mime TEXT, data BLOB, url TEXT, created_at TEXT
 );
+-- Direct guests' online check-in from the guidebook: typed-name signature of the rental agreement and an ID photo
+-- (the photo is deleted a set number of days after checkout).
+CREATE TABLE IF NOT EXISTS guide_checkins (
+  booking_id INTEGER PRIMARY KEY, name TEXT, signed_at TEXT, ip TEXT, user_agent TEXT, id_mime TEXT, id_data BLOB, id_deleted_at TEXT
+);
 -- Every change sent to Beds24 from this app, successful or not.
 CREATE TABLE IF NOT EXISTS change_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, room_id INTEGER NOT NULL,

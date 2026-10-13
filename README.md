@@ -43,7 +43,7 @@ Settings is the gear at the top right. On a phone, "Add to Home Screen" installs
   inquiries. One conversation per booking (unread first; filters for unread, current/upcoming stays and
   inquiries), chat-style thread with the stay details and door code, replies sent to the guest's channel
   thread, attachments, and saved replies with fill-ins (`{guest_first_name}`, `{door_code}`,
-  `{check_in_time}`, …). Unread count in the menu and on the Dashboard. Checks for new messages every
+  `{check_in_time}`, `{guidebook_link}`, …). Unread count in the menu and on the Dashboard. Checks for new messages every
   minute while the inbox is open (at most twice a minute against Beds24), otherwise with each 15-minute sync.
 - **Automations**: scheduled guest messages sent through Beds24: after a booking is made, cancelled or its
   dates change, or N days before/after check-in or checkout at a set time; filtered by channel and minimum
@@ -83,6 +83,12 @@ Settings is the gear at the top right. On a phone, "Add to Home Screen" installs
   and guests filled in, where the guest pays (Stripe through Beds24) and gets Beds24's confirmation email. A rental
   agreement page to link from the booking page's terms. Only availability and prices are public. Off until switched
   on; while off, you see a preview when signed in. Photos are uploaded (resized in the browser) or imported from Beds24.
+- **Guidebook**: a private page per booking (`/guide/<link>`, sent with the `{guidebook_link}` fill-in) with a welcome,
+  check-in steps, the door code and address (only from N days before check-in until checkout), Wi-Fi with a copy
+  button, house rules, a house guide (heating, TV, trash…), local tips by category, a tickable checkout checklist
+  and help/emergency details. Optional for direct guests: online check-in (typed-name acceptance of the rental
+  agreement and an ID photo) before the code and address appear; ID photos are deleted N days after checkout and
+  only the signed-in owner can view them. Links are signed per booking and can all be revoked at once.
 - **Bookings**: searchable/filterable list.
 - **Analytics**: year to date, last 12 months and next 90 days against the same dates last year; revenue,
   occupancy or ADR by month next to the same month last year; pace (on the books now versus what was booked
@@ -143,7 +149,7 @@ Settings is the gear at the top right. On a phone, "Add to Home Screen" installs
 `server/beds24.js` API client + token handling · `server/sync.js` mapping and sync ·
 `server/rates.js` prices, minimum stays and blocks · `server/doors.js` + `server/seam.js` door codes ·
 `server/messages.js` inbox and saved replies · `server/pricing.js` pricing tool · `server/cleaning.js` Turno feed and turnovers · `server/automations.js` automated messages · `server/listing.js` listing editor ·
-`server/analytics.js` analytics · `server/ai.js` AI assistant · `server/notify.js` phone notifications · `server/ha.js` Home Assistant · `server/site.js` booking site ·
+`server/analytics.js` analytics · `server/ai.js` AI assistant · `server/notify.js` phone notifications · `server/ha.js` Home Assistant · `server/site.js` booking site · `server/guide.js` guidebook ·
 `server/guesty.js` Guesty import ·
 `server/stats.js` metrics · `server/demo.js` sample data · `public/` UI · `test/` (`npm test`).
 

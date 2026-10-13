@@ -710,3 +710,38 @@ test('Direct booking site: hidden until switched on, preview for the owner, live
   assert.match(await byDomain.text(), /Best price here/, 'the custom domain opens the site');
   assert.match(await (await fetch(s.url('/'))).text(), /STR Dashboard/, 'the app itself is unchanged on its own address');
 });
+
+test('Guidebook over HTTP: private link, online check-in for direct guests, ID only for the signed-in owner', async t => {
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), RAILWAY_PUBLIC_DOMAIN: 'str.example.app' });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+  assert.equal((await call('/api/demo', {})).status, 200);
+  const g = (await call('/api/guide')).json;
+  const pid = g.guide.propertyId;
+  assert.equal((await call('/api/guide', { propertyId: pid, requireDirect: true, welcome: 'Howdy from Laramie' })).status, 200);
+  const stays = (await call(`/api/guide?property=${pid}`)).json.stays;
+  const direct = stays.find(x => x.channel === 'Direct');
+  assert.ok(direct, 'the demo data has an upcoming direct booking');
+  assert.match(direct.url, /^https:\/\/str\.example\.app\/guide\/\d+-[\w-]{22}$/);
+  const path = new URL(direct.url).pathname;
+  const page = await fetch(s.url(path));
+  assert.equal(page.status, 200, 'no login needed for the guest');
+  assert.match(await page.text(), /Howdy from Laramie/);
+  assert.equal((await fetch(s.url(path.replace(/-[\w-]{22}$/, '-' + 'x'.repeat(22))))).status, 404, 'a guessed link fails');
+  {
+    const bad = await fetch(s.url(path + '/checkin'), { method: 'POST', body: JSON.stringify({ name: 'Dee', agree: false }) });
+    assert.equal(bad.status, 400);
+    const ok = await fetch(s.url(path + '/checkin'), { method: 'POST', body: JSON.stringify({ name: 'Dee Direct', agree: true,
+      idDataUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==' }) });
+    assert.equal(ok.status, 200);
+    assert.equal((await fetch(s.url(`/api/guide/id?booking=${direct.id}`))).status, 401, 'IDs are never public');
+    const id = await fetch(s.url(`/api/guide/id?booking=${direct.id}`), { headers: { cookie: sid } });
+    assert.equal(id.headers.get('content-type'), 'image/png');
+  }
+  const vars = await call(`/api/inbox/thread?booking=${direct.id}`);
+  assert.equal(vars.status, 200);
+  assert.equal(vars.json.vars.guidebook_link, direct.url, '{guidebook_link} fill-in');
+});

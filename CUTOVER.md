@@ -129,3 +129,11 @@ Do one channel at a time, and check each before moving on.
    CNAME at Railway, and enter it on the Booking site page.
 5. Make a test booking for a night far ahead, then cancel it in Beds24. Then point Guesty's direct booking links
    at the new site before cancelling Guesty.
+
+## Guidebook (replaces TouchStay)
+
+1. In the app: **Guidebook** → fill in check-in steps, Wi-Fi, the house guide, local tips and the checkout list.
+   Use **Preview** to see it as your next guest will.
+2. Add `{guidebook_link}` to the "Check-in instructions" automation (and any saved replies). The door code also
+   shows in the guidebook from the chosen number of days before check-in.
+3. For direct bookings, tick **Direct guests check in online first** to collect the agreement signature and an ID.

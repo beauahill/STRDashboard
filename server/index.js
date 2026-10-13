@@ -14,6 +14,7 @@ import { SeamClient } from './seam.js';
 import { feedToken, icsForRoom, turnovers } from './cleaning.js';
 import { FIELDS as LISTING_FIELDS, fetchListing, diffListing, saveListing, listingLog } from './listing.js';
 import { analytics } from './analytics.js';
+import { guideSettings, saveGuide, guideFor, renderGuide, bookingForToken, saveCheckin, checkinId, pruneCheckins, regenerateLinks, guideOverview } from './guide.js';
 import { siteSettings, saveSite, siteFor, listPhotos, addPhoto, updatePhotos, importBeds24Photos, photo, availability, renderSite, renderTerms } from './site.js';
 import {
   ROLES as HA_ROLES, haConfigured, haClient, connectHA, disconnectHA, discover, saveEntities, saveHASettings, pollHA, runClimate, homeStatus, homeBrief,
@@ -99,6 +100,7 @@ async function runSync() {
     catch (e) { setSetting(db, 'messages_error', e.message); }
     await runAutomationsSafely();
     await runNotificationsSafely();
+    try { pruneCheckins(db, localToday(doorSettings(db).tz)); } catch (e) { console.error('ID cleanup failed:', e.message); }
     return r;
   }
   catch (e) { setSetting(db, 'last_sync_error', e.message); throw e; }
@@ -382,6 +384,21 @@ async function api(req, res, url) {
       const { propertyId } = await readJson(req);
       return send(res, 200, await importBeds24Photos(db, beds24, Number(propertyId)));
     }
+    case 'GET /api/guide': {
+      rememberOrigin(req);
+      const props = db.prepare('SELECT id, name FROM properties WHERE id > 0 ORDER BY name').all();
+      const pid = props.some(p => p.id === Number(q.property)) ? Number(q.property) : props[0]?.id;
+      if (!pid) return send(res, 200, { properties: props });
+      return send(res, 200, { properties: props, guide: guideSettings(db, pid), stays: guideOverview(db, pid) });
+    }
+    case 'POST /api/guide': { const b = await readJson(req); return send(res, 200, { guide: saveGuide(db, Number(b.propertyId), b) }); }
+    case 'POST /api/guide/regenerate': regenerateLinks(db); return send(res, 200, { ok: true });
+    case 'GET /api/guide/id': {
+      const id = checkinId(db, Number(q.booking));
+      if (!id) return send(res, 404, { error: 'No ID on file for this booking.' });
+      res.writeHead(200, { 'content-type': id.id_mime, 'cache-control': 'no-store', 'content-disposition': 'inline' });
+      return res.end(id.id_data);
+    }
     case 'GET /api/home':
       return send(res, 200, { ...homeStatus(db), stays: stayList(db, Date.now(), { propertyId: prop }) });
     case 'POST /api/home/connect': {
@@ -602,6 +619,21 @@ const server = createServer(async (req, res) => {
       if (!ics) return send(res, 404, 'Not found', 'text/plain');
       res.writeHead(200, { 'content-type': 'text/calendar; charset=utf-8', 'cache-control': 'no-store' });
       return res.end(ics);
+    }
+    // Guest guidebook (public, private link per booking).
+    const gm = url.pathname.match(/^\/guide\/([\w-]+?)(\/checkin)?\/?$/);
+    if (gm) {
+      const bookingId = bookingForToken(db, gm[1]);
+      if (bookingId == null) return send(res, 404, 'Not found', 'text/plain');
+      if (gm[2] && req.method === 'POST') {
+        const body = await readJson(req, 8e6);
+        saveCheckin(db, bookingId, body, { ip: clientIp(req), userAgent: req.headers['user-agent'] });
+        return send(res, 200, { ok: true });
+      }
+      const html = renderGuide(guideFor(db, bookingId), { token: gm[1] });
+      if (!html) return send(res, 404, 'Not found', 'text/plain');
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' });
+      return res.end(html);
     }
     // Direct booking site (public): /stay/<slug>[/...], or the root of its own domain.
     const host = (req.headers['x-forwarded-host'] || req.headers.host || '').toLowerCase();
