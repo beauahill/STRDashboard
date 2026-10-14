@@ -73,18 +73,27 @@ function validSession(tok = '') {
   return safeEqual(mac, sign(exp));
 }
 const cookie = req => Object.fromEntries((req.headers.cookie || '').split(';').map(c => c.trim().split('=')).filter(p => p[0]));
-const clientIp = req => req.headers['x-real-ip'] || (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress;
+// The client's address as seen by the proxy in front of the app (Railway adds it as the LAST X-Forwarded-For
+// entry). Earlier entries, and X-Real-IP, can be set by the client, so they can't be trusted for the login guard.
+const clientIp = req => {
+  const hops = String(req.headers['x-forwarded-for'] || '').split(',').map(h => h.trim()).filter(Boolean);
+  return (hops.at(-1) || req.socket.remoteAddress || '').slice(0, 64);
+};
 
-// Brute-force guard: 10 failed logins per IP per 15 minutes.
+// Brute-force guard: 10 failed logins per address per 15 minutes, and 100 from everywhere together (so a spread-out
+// guess still runs into a wall).
 const failures = new Map();
+const FAIL_WINDOW = 15 * 60000;
 function loginBlocked(ip) {
-  const f = failures.get(ip);
-  if (f && f.until < Date.now()) failures.delete(ip);
-  return (failures.get(ip)?.count || 0) >= 10;
+  const now = Date.now();
+  for (const [k, f] of failures) if (f.until < now) failures.delete(k);
+  return (failures.get(ip)?.count || 0) >= 10 || (failures.get('*')?.count || 0) >= 100;
 }
 function recordFailure(ip) {
-  const f = failures.get(ip) || { count: 0, until: Date.now() + 15 * 60000 };
-  f.count++; failures.set(ip, f);
+  for (const k of [ip, '*']) {
+    const f = failures.get(k) || { count: 0, until: Date.now() + FAIL_WINDOW };
+    f.count++; failures.set(k, f);
+  }
 }
 
 let syncing = false;
@@ -106,7 +115,6 @@ async function runSync() {
     catch (e) { setSetting(db, 'messages_error', e.message); }
     await runAutomationsSafely();
     await runNotificationsSafely();
-    try { pruneCheckins(db, localToday(doorSettings(db).tz)); } catch (e) { console.error('ID cleanup failed:', e.message); }
     return r;
   }
   catch (e) { setSetting(db, 'last_sync_error', e.message); throw e; }
@@ -154,11 +162,17 @@ async function runHASafely() {
   finally { haRunning = false; runNotificationsSafely(); }
 }
 
-// Door codes run after every sync and after lock changes. Failures are recorded, never thrown, so a
-// Seam outage can't stop bookings from syncing.
-async function runDoorCodes() {
-  try { const r = await reconcileDoorCodes(db, seam(), beds24); setSetting(db, 'door_error', null); return r; }
-  catch (e) { setSetting(db, 'door_error', e.message); return { error: e.message }; }
+// Door codes run after every sync, after lock changes, and on their own timer. Failures are recorded, never thrown,
+// so a Seam outage can't stop bookings from syncing. One run at a time: two overlapping runs would both create a
+// code on the lock and track only one of them.
+let doorChain = Promise.resolve();
+function runDoorCodes() {
+  // Each run waits for the one before it (runs never reject, so the chain can't break).
+  doorChain = doorChain.then(async () => {
+    try { const r = await reconcileDoorCodes(db, seam(), beds24); setSetting(db, 'door_error', null); return r; }
+    catch (e) { setSetting(db, 'door_error', e.message); return { error: e.message }; }
+  });
+  return doorChain;
 }
 
 // Lock-code entries sent back from the Locks page must point at locks we know about.
@@ -184,12 +198,15 @@ const send = (res, code, body, type = 'application/json') => {
   res.writeHead(code, { 'content-type': type, 'cache-control': 'no-store' });
   res.end(type === 'application/json' ? JSON.stringify(body) : body);
 };
-// Oversized bodies are drained and discarded (not kept in memory) so the client still gets a clean 413.
+// Oversized bodies are drained and discarded (not kept in memory) so the client still gets a clean 413. The body
+// is decoded once at the end: decoding chunk by chunk would break characters split across two chunks.
 const readJson = (req, limit = 1e6) => new Promise((ok, no) => {
-  let s = '', tooBig = false;
-  req.on('data', c => { if (tooBig) return; s += c; if (s.length > limit) { tooBig = true; s = ''; } });
+  let parts = [], size = 0, tooBig = false;
+  req.on('data', c => { if (tooBig) return; size += c.length; if (size > limit) { tooBig = true; parts = []; } else parts.push(c); });
+  req.on('error', no);
   req.on('end', () => {
     if (tooBig) return no(Object.assign(new Error('Upload too large'), { status: 413 }));
+    const s = Buffer.concat(parts).toString('utf8');
     try { ok(s ? JSON.parse(s) : {}); } catch { no(Object.assign(new Error('Invalid JSON'), { status: 400 })); }
   });
 });
@@ -227,7 +244,7 @@ async function api(req, res, url) {
         lastSync: getSetting(db, 'last_sync'), lastSyncError: getSetting(db, 'last_sync_error'),
         empty: db.prepare('SELECT COUNT(*) n FROM bookings').get().n === 0,
         guestyImported: db.prepare("SELECT COUNT(*) n FROM bookings WHERE source = 'guesty'").get().n,
-        unreadMessages: unreadCount(db), ai: aiStatus(db).configured, home: haConfigured(db),
+        unreadMessages: unreadCount(db), ai: aiStatus(db).configured, home: haConfigured(db), tz: doorSettings(db).tz,
       });
     case 'POST /api/connect': {
       const { inviteCode } = await readJson(req);
@@ -263,7 +280,7 @@ async function api(req, res, url) {
       return send(res, 200, {
         rooms, room, connected: beds24.connected, canWrite: beds24.canWriteInventory,
         calendarError: getSetting(db, 'calendar_error'), lastSync: getSetting(db, 'last_sync'),
-        days: room ? readDays(db, room.id, q.start || iso(Date.now()), Math.min(Number(q.days) || 62, 120)) : [],
+        days: room ? readDays(db, room.id, q.start || localToday(doorSettings(db).tz), Math.min(Number(q.days) || 62, 120)) : [],
         changes: recentChanges(db),
       });
     }
@@ -340,7 +357,7 @@ async function api(req, res, url) {
     case 'GET /api/automations': {
       const props = db.prepare('SELECT id, name FROM properties ORDER BY name').all();
       const soon = db.prepare(`SELECT id, guest_name, arrival, departure, channel FROM bookings WHERE source = 'beds24' AND id > 0
-        AND status IN ('confirmed','new') AND departure >= ? ORDER BY arrival LIMIT 30`).all(iso(Date.now()));
+        AND status IN ('confirmed','new') AND departure >= ? ORDER BY arrival LIMIT 30`).all(localToday(doorSettings(db).tz));
       return send(res, 200, {
         automations: listAutomations(db).map(a => ({ ...a, when: describe(a) })), upcoming: upcoming(db), history: history(db),
         properties: props.map(p => ({ ...p, vars: propertyVars(db, p.id) })), builtins: BUILTIN_VARS, bookings: soon,
@@ -423,7 +440,7 @@ async function api(req, res, url) {
     case 'GET /api/money/receipt': {
       const r = receiptOf(db, Number(q.id));
       if (!r) return send(res, 404, { error: 'No receipt.' });
-      res.writeHead(200, { 'content-type': r.receipt_mime, 'cache-control': 'private, max-age=3600', 'content-disposition': 'inline' });
+      res.writeHead(200, { 'content-type': r.receipt_mime, 'cache-control': 'private, no-store', 'content-disposition': 'inline' });
       return res.end(r.receipt_data);
     }
     case 'POST /api/money/payout': { const b = await readJson(req); return send(res, 200, { payout: markPayout(db, Number(b.bookingId), b) }); }
@@ -527,8 +544,13 @@ async function api(req, res, url) {
       return send(res, 200, thread(db, Number(bookingId)));
     }
     case 'GET /api/inbox/attachment': {
+      // A guest chooses the file and its type. Only photos and PDFs open in the browser; anything else (HTML, SVG...)
+      // downloads, and the sandbox stops a file from running script with the owner's session either way.
       const a = await attachment(db, beds24, Number(q.id));
-      res.writeHead(200, { 'content-type': a.mime, 'content-disposition': `inline; filename="${a.name.replace(/[^\w.\- ]/g, '_')}"`, 'cache-control': 'private, max-age=3600' });
+      const viewable = /^(image\/(jpeg|png|gif|webp)|application\/pdf)$/i.test(a.mime || '');
+      res.writeHead(200, { 'content-type': viewable ? a.mime : 'application/octet-stream', 'cache-control': 'private, no-store',
+        'content-disposition': `${viewable ? 'inline' : 'attachment'}; filename="${String(a.name || 'file').replace(/[^\w.\- ]/g, '_')}"`,
+        'content-security-policy': 'sandbox; default-src \'none\'; img-src \'self\'; style-src \'unsafe-inline\'' });
       return res.end(a.data);
     }
     case 'GET /api/replies': return send(res, 200, savedReplies(db));
@@ -606,7 +628,7 @@ async function api(req, res, url) {
       return send(res, 200, db.prepare('SELECT * FROM properties ORDER BY name').all().map(p => ({
         ...p, rooms: db.prepare('SELECT * FROM rooms WHERE property_id=? ORDER BY name').all(p.id) })));
     case 'GET /api/summary': {
-      const sum = summary(db, iso(Date.now()), prop);
+      const sum = summary(db, localToday(doorSettings(db).tz), prop);
       sum.home = homeBrief(db);
       // Automated messages that failed recently, or are stuck waiting past their send time, need a look.
       sum.automationIssues = db.prepare(`SELECT s.status, s.error, a.name automation, b.guest_name FROM automation_sends s
@@ -627,7 +649,7 @@ async function api(req, res, url) {
       return send(res, 200, sum);
     }
     case 'GET /api/calendar': {
-      const cal = calendar(db, q.start || iso(Date.now()), Math.min(Number(q.days) || 42, 120), prop);
+      const cal = calendar(db, q.start || localToday(doorSettings(db).tz), Math.min(Number(q.days) || 42, 120), prop);
       if (doorSettings(db).auto) cal.doors = doorCodesFor(db, cal.bookings.map(b => b.id));
       return send(res, 200, cal);
     }
@@ -651,7 +673,9 @@ async function api(req, res, url) {
 }
 
 const server = createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://x');
+  // A malformed request target (e.g. "//a:b") makes URL throw; that must be a 400, not an unhandled rejection.
+  let url;
+  try { url = new URL(req.url, 'http://x'); } catch { res.writeHead(400, { 'content-type': 'text/plain' }); return res.end('Bad request'); }
   res.setHeader('x-content-type-options', 'nosniff');
   res.setHeader('x-frame-options', 'DENY');
   res.setHeader('referrer-policy', 'same-origin');
@@ -690,7 +714,8 @@ const server = createServer(async (req, res) => {
       const rest = stay ? stay[2] || '/' : url.pathname;
       const base = stay ? `/stay/${site?.slug}` : '';
       const preview = !!site && !site.enabled && (!PASSWORD || validSession(cookie(req).sid));
-      if (!site || (!site.enabled && !preview)) return send(res, 404, 'Not found', 'text/plain');
+      // The rental agreement stays readable while the site is off: the guidebook's online check-in links to it.
+      if (!site || (!site.enabled && !preview && rest !== '/terms')) return send(res, 404, 'Not found', 'text/plain');
       if (rest === '/' || rest === '') {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
         return res.end(renderSite(db, site, { base, preview: preview || url.searchParams.has('preview'), origin: appOrigin(db) || '' }));
@@ -711,11 +736,14 @@ const server = createServer(async (req, res) => {
     if (!file.startsWith(PUBLIC)) return send(res, 403, 'Forbidden', 'text/plain');
     send(res, 200, await readFile(file), MIME[extname(file)] || 'application/octet-stream');
   } catch (e) {
+    if (!e.status && e.code !== 'ENOENT') console.error(e);
+    if (res.headersSent) return res.end();
     if (e.code === 'ENOENT') return send(res, 404, 'Not found', 'text/plain');
-    if (!e.status) console.error(e);
     send(res, e.status || 500, { error: e.message });
   }
 });
+// Anything that still slips through is logged rather than taking the dashboard (and door codes) down.
+process.on('unhandledRejection', e => console.error('unhandled rejection:', e));
 
 if (process.env.STR_DEMO && getSetting(db, 'demo') !== '1' && !beds24.connected) loadDemo(db);
 // Demo data must never sit alongside real bookings (it skews every metric).
@@ -734,6 +762,12 @@ setInterval(() => runSync().catch(e => console.error('sync failed:', e.message))
 setInterval(() => runAutomationsSafely(), 5 * 60000).unref();
 setInterval(() => { if (notifySettings(db).enabled) runNotificationsSafely({ pollMessages: true }); }, 60000).unref();
 setInterval(() => runHASafely(), 60000).unref();
+// Guests' ID photos are deleted on schedule whether or not Beds24 is connected or syncing.
+const pruneIds = () => { try { pruneCheckins(db, localToday(doorSettings(db).tz)); } catch (e) { console.error('ID cleanup failed:', e.message); } };
+pruneIds();
+setInterval(pruneIds, 3600e3).unref();
+// Door codes also run every 10 minutes on their own (a failing Beds24 sync mustn't stall them), when locks are set up.
+setInterval(() => { if (getSetting(db, 'seam_api_key')) runDoorCodes(); }, 10 * 60000).unref();
 // Event scout: weekly when switched on (checked hourly; a failed run is retried the next day).
 setInterval(async () => {
   if (scouting) return;

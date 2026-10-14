@@ -5,7 +5,7 @@
 import { createServer } from 'node:http';
 
 export function fakeAnthropic({ reply = req => `Draft for: ${JSON.stringify(req.messages.at(-1).content).slice(0, 80)}`, refuse = false,
-  toolCall = null, pauseFirst = false, searches = 0 } = {}) {
+  toolCall = null, pauseFirst = false, searches = 0, alwaysTool = false } = {}) {
   const requests = [];
   const server = createServer((req, res) => {
     let body = '';
@@ -27,7 +27,7 @@ export function fakeAnthropic({ reply = req => `Draft for: ${JSON.stringify(req.
         return send(200, { ...base, content: [{ type: 'server_tool_use', id: 'srvtoolu_1', name: 'web_search', input: { query: 'events' } }], stop_reason: 'pause_turn' });
       }
       const clientTools = (json.tools || []).filter(x => !x.type || x.type === 'custom');
-      if (toolCall && clientTools.length && !hasResult) {
+      if (toolCall && clientTools.length && (!hasResult || alwaysTool)) {
         const c = toolCall(json);
         if (c) return send(200, { ...base, content: [{ type: 'tool_use', id: 'tu_' + requests.length, name: c.name, input: c.input }], stop_reason: 'tool_use' });
       }

@@ -213,3 +213,33 @@ test('re-syncing a booking keeps when it was first seen, and records the cancell
   assert.equal(after.cancelled_at, '2026-11-02T10:00:00Z');
   assert.equal(after.status, 'cancelled');
 });
+
+test('a confirmation goes out for a stay months away, and late departure messages still send', async () => {
+  const { db, sent, send } = setup();
+  enable(db, 'Booking confirmation', new Date('2026-10-01T00:00:00Z'));
+  // Booked on Oct 14 for Dec 20: far outside the window of stays near today.
+  book(db, { id: 70, arrival: '2026-12-20', departure: '2026-12-23', bookingTime: '2026-10-14T15:00:00Z' }, new Date('2026-10-14T15:00:00Z'));
+  await runAutomations(db, null, new Date('2026-10-14T15:10:00Z'), send);
+  assert.deepEqual(sent.map(s => s.bookingId), [70], 'sent within minutes of the booking');
+
+  // A departure message a week after checkout (offsets go up to +30 days).
+  saveAutomation(db, { name: 'One week later', anchor: 'departure', offset_days: 7, at_time: '10:00', body: 'Hope you made it home, {guest_first_name}!' });
+  enable(db, 'One week later', new Date('2026-09-01T00:00:00Z'));
+  book(db, { id: 71, arrival: '2026-09-28', departure: '2026-10-01', bookingTime: '2026-09-01T00:00:00Z' });
+  await runAutomations(db, null, mt('2026-10-08', '10:05'), send);
+  assert.ok(sent.some(s => s.bookingId === 71 && /made it home, Pat/.test(s.text)));
+});
+
+test('a message Beds24 accepted is not sent again when reading the thread back fails', async () => {
+  const { db } = setup();
+  enable(db, 'Booking confirmation', new Date('2026-10-01T00:00:00Z'));
+  book(db, { id: 72, arrival: '2026-11-20', departure: '2026-11-22', bookingTime: '2026-10-14T15:00:00Z' }, new Date('2026-10-14T15:00:00Z'));
+  let posts = 0;
+  const client = {
+    post: async () => { posts++; return [{ success: true }]; },
+    getAll: async () => { throw Object.assign(new Error('Beds24: too many requests'), { status: 429 }); },
+  };
+  for (const at of ['2026-10-14T15:10:00Z', '2026-10-14T15:15:00Z', '2026-10-14T15:20:00Z']) await runAutomations(db, client, new Date(at));
+  assert.equal(posts, 1, 'sent once');
+  assert.equal(db.prepare("SELECT status FROM automation_sends WHERE booking_id = 72").get().status, 'sent');
+});

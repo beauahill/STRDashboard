@@ -104,3 +104,23 @@ test('settings validation and the page itself', () => {
   assert.ok(!early.includes('0142') && !early.includes('1234 Grand'), 'nothing secret before the window');
   assert.match(early, /appear here on Monday, October 19/);
 });
+
+test('an inquiry or pending request never sees the address or door code', () => {
+  const db = setup();
+  db.prepare(`INSERT INTO bookings(id,property_id,room_id,status,channel,arrival,departure,nights,guest_name,adults,source) VALUES(4,500,600,'inquiry','Airbnb','2026-10-20','2026-10-22',2,'Ivy Inquirer',2,'beds24')`).run();
+  db.prepare(`INSERT INTO bookings(id,property_id,room_id,status,channel,arrival,departure,nights,guest_name,adults,source) VALUES(5,500,600,'request','VRBO','2026-10-20','2026-10-22',2,'Rex Request',2,'beds24')`).run();
+  db.exec("INSERT INTO door_codes(booking_id, code) VALUES(5, '5555')");
+  for (const id of [4, 5]) {
+    const g = guideFor(db, id, T('2026-10-20T20:00:00Z'));   // check-in day
+    assert.deepEqual([g.phase, g.address, g.doorCode], ['before', null, null], `booking ${id}`);
+  }
+  assert.equal(guideFor(db, 1, T('2026-10-20T20:00:00Z')).address, '1234 Grand Ave, Laramie, WY', 'a confirmed stay does');
+});
+
+test('a signed check-in can\'t be replaced through the link, and none is taken after the stay', () => {
+  const db = setup();
+  saveCheckin(db, 2, { name: 'Dee Direct', agree: true, idDataUrl: PNG }, { ip: '1.2.3.4' }, T('2026-10-18T12:00:00Z'));
+  assert.throws(() => saveCheckin(db, 2, { name: 'Someone Else', agree: true, idDataUrl: PNG }, {}, T('2026-10-19T12:00:00Z')), /already checked in/);
+  assert.equal(checkinFor(db, 2).name, 'Dee Direct');
+  assert.throws(() => saveCheckin(db, 1, { name: 'Sam Rivers', agree: true, idDataUrl: PNG }, {}, T('2026-10-23T12:00:00Z')), /stay is over/);
+});

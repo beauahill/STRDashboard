@@ -106,3 +106,13 @@ test('lodging tax: only on channels that don\'t collect it, at your rates', () =
   assert.equal(taxReport(db, 2026).total.due, 0);
   assert.throws(() => saveMoneySettings(db, { cleaningPerStay: -1 }), /Cleaning cost/);
 });
+
+test('a checkout on January 1 is counted in that year\'s estimated cleaning', () => {
+  const db = setup();
+  saveMoneySettings(db, { cleaningPerStay: 60 });
+  upsertBookings(db, [{ id: 40, propertyId: 500, roomId: 600, status: 'confirmed', channel: 'airbnb', arrival: '2026-12-28', departure: '2027-01-01', price: 800, firstName: 'Nye' }]);
+  const y27 = pnl(db, 2027, { today: '2027-12-31' }), y26 = pnl(db, 2026, { today: '2026-12-31' });
+  assert.equal(y27.months[0].expenses, 60, 'cleaned on Jan 1, 2027');
+  assert.equal(y27.months[0].gross, 0, 'no nights in 2027');
+  assert.equal(y26.months[11].gross, 800, 'all four nights in December');
+});

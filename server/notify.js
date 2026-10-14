@@ -16,6 +16,7 @@ const MAX_AGE = 24 * 3600e3;   // never send about anything older than this (e.g
 const MAX_ATTEMPTS = 5;        // a notification that fails this often is given up on
 const PER_RUN = 10;            // the rest wait for the next minute
 const EVENTS = ['messages', 'bookings', 'cancellations', 'problems', 'home', 'pricing'];
+const URGENT = ['home', 'door'];
 
 // The topic is the only thing protecting a ntfy.sh topic, so it's long and random.
 export const newTopic = () => 'str-' + randomBytes(15).toString('base64url');
@@ -93,8 +94,16 @@ export function collect(db, now = Date.now()) {
   const since = Math.max(at(s.enabledAt) || now, now - MAX_AGE);
   const origin = appOrigin(db);
   const link = path => (origin ? origin + path : undefined);
-  const logged = db.prepare('SELECT ok, attempts FROM notification_log WHERE kind = ? AND ref = ?');
-  const pending = (kind, ref) => { const r = logged.get(kind, String(ref)); return !r || (!r.ok && r.attempts < MAX_ATTEMPTS); };
+  const logged = db.prepare('SELECT ok, attempts, at FROM notification_log WHERE kind = ? AND ref = ?');
+  // Most notifications give up after a few failed tries. Leak, alarm, freeze and door-code alerts keep trying every
+  // five minutes for about a day while they're still active: an ntfy outage mustn't swallow a leak.
+  const pending = (kind, ref) => {
+    const r = logged.get(kind, String(ref));
+    if (!r) return true;
+    if (r.ok) return false;
+    if (r.attempts < MAX_ATTEMPTS) return true;
+    return URGENT.includes(kind) && r.attempts < 300 && now - Date.parse(r.at) >= 5 * 60e3;
+  };
   const out = [];
 
   if (s.messages) {
@@ -193,6 +202,7 @@ export async function runNotifications(db, { now = Date.now(), fetchImpl = fetch
     catch (e) { mark(db, n, false, e.message, now); failed++; setSetting(db, 'notify_error', e.message); }
   }
   if (sent && !failed) setSetting(db, 'notify_error', null);
+  db.prepare('DELETE FROM notification_log WHERE at < ?').run(new Date(now - 180 * 86400e3).toISOString());
   return { sent, failed };
 }
 

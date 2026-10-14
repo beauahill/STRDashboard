@@ -5,7 +5,7 @@ import { upsertProperties, upsertBookings, addDays } from '../server/sync.js';
 import { syncCalendar } from '../server/rates.js';
 import {
   nthWeekday, recurringEvents, seedEvents, listEvents, saveEvent, deleteEvent, savePricingSettings, pricingSettings,
-  recommend, monthlyPace, pendingChanges, applyNightly, autoPrice, suggestFromHistory,
+  recommend, monthlyPace, pendingChanges, applyNightly, autoPrice, suggestFromHistory, limitPrice,
 } from '../server/pricing.js';
 
 const TODAY = '2026-10-12';  // a Monday
@@ -193,7 +193,7 @@ test('auto-pricing runs once a day, only when switched on', async () => {
   savePricingSettings(db, 600, { auto: true, autoHorizon: 10, autoThreshold: 5, autoMaxChangePct: 25 });
   const r = await autoPrice(db, cal, TODAY);
   assert.equal(r[0].applied, 10);
-  assert.ok(cal.posts[0][0].calendar.every(c => c.price1 === 188), 'capped at +25% of $150 in one day');
+  assert.ok(cal.posts[0][0].calendar.every(c => c.price1 === 187), 'capped at +25% of $150 in one day ($187.50, rounded down so the cap holds)');
   assert.deepEqual(await autoPrice(db, cal, TODAY), [], 'not again the same day');
 });
 
@@ -212,4 +212,40 @@ test('suggestions from history: base from weekday nights, monthly and weekday ad
   assert.ok(s.season[6] > 20 && s.season[0] < 0, 'July above average, January below');
   assert.equal(s.monthAdr[6], 260);
   assert.equal(suggestFromHistory(openDb(':memory:'), 600, TODAY).enough, false);
+});
+
+test('rounding never takes a price past the floor or ceiling', () => {
+  assert.equal(limitPrice(199.4, { rounding: 5, max: 199 }), 195, 'not $200 over a $199 ceiling');
+  assert.equal(limitPrice(98, { rounding: 5, min: 101 }), 105, 'not $100 under a $101 floor');
+  assert.equal(limitPrice(150, { rounding: 10, min: 101, max: 109 }), 109, 'floor and ceiling closer than a step: the ceiling');
+  const db = setup({ rounding: 5, max: 199, base: 250 });
+  assert.ok(recommend(db, 600, { start: d(10), days: 5, today: TODAY }).nights.every(n => n.price === 195));
+});
+
+test('pace: a stay on the books a year ago still counts even if it was cancelled later', () => {
+  const db = setup();
+  const ly = (id, arr, dep, status, cancelled) => db.prepare(`INSERT INTO bookings(id,property_id,room_id,status,channel,arrival,departure,nights,price,booked_at,cancelled_at,source)
+    VALUES(?,500,600,?,'Airbnb',?,?,?,300,?,?,'beds24')`).run(id, status, arr, dep, (Date.parse(dep) - Date.parse(arr)) / 864e5, '2025-09-01T00:00:00Z', cancelled);
+  ly(1, '2025-11-05', '2025-11-10', 'cancelled', '2025-10-20T00:00:00Z');   // on the books on Oct 12, 2025; cancelled later
+  ly(2, '2025-11-15', '2025-11-17', 'confirmed', null);
+  ly(3, '2025-11-20', '2025-11-22', 'cancelled', '2025-10-01T00:00:00Z');   // already cancelled by then: doesn't count
+  const pace = monthlyPace(db, 600, TODAY, 3)['2026-11'];
+  assert.equal(Math.round(pace.lastYear * 30), 7, '5 + 2 nights were on the books this time last year');
+});
+
+test('auto-pricing: one room failing doesn\'t stop the others, and it waits before retrying', async () => {
+  const db = setup({ auto: true, autoHorizon: 7, autoThreshold: 1 });
+  upsertProperties(db, [{ id: 500, name: 'Laramie Retreat', roomTypes: [{ id: 600, name: 'Unit 1', qty: 1 }, { id: 601, name: 'Unit 2', qty: 1 }] }]);
+  savePricingSettings(db, 601, { base: 200, rounding: 1, lastMinuteDays: 0, farOutPct: 0, pacing: false, gapPct: 0, auto: true, autoHorizon: 7, autoThreshold: 1 });
+  const cal = new FakeCal();
+  const post = cal.post.bind(cal);
+  cal.post = async (path, body) => { if (body[0].roomId === 600) throw new Error('Beds24 rejected the change'); return post(path, body); };
+  const now = Date.parse('2026-10-12T15:00:00Z');
+  await assert.rejects(autoPrice(db, cal, TODAY, now), /Unit 1: .*rejected/);
+  assert.ok(cal.days.size > 0, 'Unit 2 was still priced');
+  const calls = cal.posts.length;
+  assert.deepEqual(await autoPrice(db, cal, TODAY, now + 15 * 60e3), [], 'the failed room waits; the done room is done for today');
+  assert.equal(cal.posts.length, calls);
+  await assert.rejects(autoPrice(db, cal, TODAY, now + 4 * 3600e3), /Unit 1/, 'tried again after 3 hours');
+  assert.deepEqual(await autoPrice(db, { ...cal, canWriteInventory: false }, '2026-10-13', now + 30 * 3600e3), [], 'a read-only code never tries');
 });
