@@ -106,7 +106,9 @@ because its login page is then on the internet.)
    Leave **Reusable** off. The key is only used the first time; after that the dashboard's Tailscale identity is
    kept on the volume, so redeploys stay the same machine.
 4. **Add it to Railway.** Service → **Variables** → `TS_AUTHKEY` = the key. Railway redeploys, and the dashboard
-   appears on the Machines page as `str-dashboard`. Leave the variable in place.
+   appears on the Machines page as `str-dashboard`. Leave the variable in place. The dashboard's Tailscale traffic
+   goes through Tailscale's relay servers (still encrypted end to end), because direct connections from Railway
+   stall on large replies; `TS_DIRECT=1` lets it try direct connections instead.
 5. **Connect.** In Home Assistant: your profile (bottom left) → **Security** → **Long-lived access tokens → Create
    token**. In the app: **Smart home** → paste Home Assistant's address and the token → **Connect**. With
    Tailscale, the page says "Tailscale connected as str-dashboard… Home Assistant is reached privately."

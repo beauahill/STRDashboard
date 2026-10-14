@@ -120,10 +120,14 @@ const realCli = (bin, socket) => args => new Promise((resolve, reject) =>
 
 /**
  * Start Tailscale (once) and keep it connected. Returns a controller (for tests and shutdown).
+ * Traffic goes through Tailscale's relay (DERP) servers over TCP rather than direct UDP: from Railway, direct
+ * connections passed small packets but stalled on the first large reply (the TLS certificate), the classic sign of a
+ * path dropping full-size packets. It's still end-to-end encrypted; TS_DIRECT=1 allows direct connections.
  * Options are for tests: `spawn` starts the daemon, `cli(args)` runs the tailscale command and resolves its stdout.
  */
 export function startTailnet({ authKey = process.env.TS_AUTHKEY, hostname = process.env.TS_HOSTNAME || 'str-dashboard', dataDir,
-  bin = '/usr/local/bin', socket = join(tmpdir(), 'tailscaled.sock'), proxyPort = 1055, spawn = nodeSpawn, cli, checkEvery = 30000, restartAfter = 15000 } = {}) {
+  direct = process.env.TS_DIRECT === '1', bin = '/usr/local/bin', socket = join(tmpdir(), 'tailscaled.sock'), proxyPort = 1055,
+  spawn = nodeSpawn, cli, checkEvery = 30000, restartAfter = 15000 } = {}) {
   if (ctl || !authKey) return ctl;
   PROXY.port = proxyPort;
   cli ||= realCli(bin, socket);
@@ -134,8 +138,10 @@ export function startTailnet({ authKey = process.env.TS_AUTHKEY, hostname = proc
 
   const launch = () => {
     lastLog = '';
+    const { TS_AUTHKEY, ...env } = process.env;   // the daemon doesn't need the key
+    if (!direct) env.TS_DEBUG_ALWAYS_USE_DERP = 'true';
     child = spawn(join(bin, 'tailscaled'), ['--tun=userspace-networking', `--statedir=${stateDir}`, `--socket=${socket}`,
-      `--outbound-http-proxy-listen=${PROXY.host}:${PROXY.port}`], { stdio: ['ignore', 'ignore', 'pipe'] });
+      `--outbound-http-proxy-listen=${PROXY.host}:${PROXY.port}`], { stdio: ['ignore', 'ignore', 'pipe'], env });
     // tailscaled logs a lot; keep only the last line so a crash can be explained.
     child.stderr?.on('data', d => { const l = String(d).trim().split('\n').pop(); if (l) lastLog = l.replace(/^\S+ \S+ /, ''); });
     child.on('error', e => { t.state = 'off'; t.error = `couldn't start Tailscale (${e.code || e.message})`; });

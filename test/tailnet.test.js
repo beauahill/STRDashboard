@@ -110,11 +110,11 @@ test('a Tailscale address without Tailscale explains what to do', async () => {
 // Fakes for the daemon and the tailscale command.
 function fakeTailscale({ statuses, upFails } = {}) {
   const calls = [], children = [];
-  const spawn = (cmd, args) => {
+  const spawn = (cmd, args, opts) => {
     const child = new EventEmitter();
     child.stderr = new EventEmitter();
     child.kill = () => child.emit('exit', null);
-    children.push({ cmd, args, child });
+    children.push({ cmd, args, env: opts?.env, child });
     return child;
   };
   let i = 0;
@@ -139,8 +139,10 @@ test('Tailscale: starts in userspace mode, signs in once with the key from a tem
   t.after(() => ctl?.stop());
   assert.equal(startTailnet({ authKey: 'tskey-again', dataDir }), ctl, 'only one Tailscale');
 
-  const [{ cmd, args }] = fake.children;
+  const [{ cmd, args, env }] = fake.children;
   assert.equal(cmd, '/usr/local/bin/tailscaled');
+  assert.equal(env.TS_DEBUG_ALWAYS_USE_DERP, 'true', 'relay (DERP over TCP) by default: direct UDP from Railway stalls on large packets');
+  assert.ok(!('TS_AUTHKEY' in env), 'the daemon never gets the key');
   assert.deepEqual(args, ['--tun=userspace-networking', `--statedir=${join(dataDir, 'tailscale')}`, '--socket=/tmp/x.sock', `--outbound-http-proxy-listen=127.0.0.1:${proxyPort}`]);
   assert.equal(tailnetStatus().state, 'starting');
   await assert.rejects(haFetch(`http://homeassistant.tail1ebd8f.ts.net:${haPort}/api/`), /Tailscale isn't connected yet: starting/);
@@ -187,8 +189,9 @@ test('Tailscale: starts in userspace mode, signs in once with the key from a tem
 
 test('Tailscale: a refused key is explained', async t => {
   const fake = fakeTailscale({ statuses: [{ BackendState: 'NeedsLogin' }], upFails: 'backend error: invalid key: unable to validate API key' });
-  const ctl = startTailnet({ authKey: 'tskey-old', dataDir: mkdtempSync(join(tmpdir(), 'tailnet-')), spawn: fake.spawn, cli: fake.cli, checkEvery: 60000 });
+  const ctl = startTailnet({ authKey: 'tskey-old', dataDir: mkdtempSync(join(tmpdir(), 'tailnet-')), direct: true, spawn: fake.spawn, cli: fake.cli, checkEvery: 60000 });
   t.after(() => ctl.stop());
+  assert.ok(!('TS_DEBUG_ALWAYS_USE_DERP' in fake.children[0].env), 'TS_DIRECT=1 allows direct connections');
   await ctl.check();
   assert.equal(tailnetStatus().state, 'NeedsLogin');
   assert.match(tailnetStatus().error, /auth key was refused.*update TS_AUTHKEY/);
