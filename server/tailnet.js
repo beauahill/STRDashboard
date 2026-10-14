@@ -15,6 +15,10 @@ import { randomBytes } from 'node:crypto';
 const PROXY = { host: '127.0.0.1', port: 1055 };   // Tailscale's outbound proxy (port changeable for tests)
 const t = { enabled: false, state: 'off', name: null, ip: null, tailnet: null, health: [], error: null, checkedAt: null };
 let ctl = null;   // the running manager (see startTailnet)
+// Tailnet machines by MagicDNS name (full and short) -> Tailscale IP, from `tailscale status`. Requests connect to the
+// IP, because Tailscale's proxy falls back to public DNS for names it doesn't know; the name is still used for the
+// certificate check and the Host header.
+let peers = new Map();
 
 /** Addresses that only exist inside a tailnet. */
 export function isTailnetHost(hostname) {
@@ -37,7 +41,8 @@ export function haFetch(url, opts) {
   if (t.state !== 'Running') {
     return Promise.reject(new Error(`Tailscale isn't connected yet: ${describeState()}`));
   }
-  return proxyFetch(PROXY, url, opts);
+  const name = new URL(url).hostname.toLowerCase().replace(/\.$/, '');
+  return proxyFetch(PROXY, url, { ...opts, via: peers.get(name) });
 }
 
 function describeState() {
@@ -49,26 +54,29 @@ function describeState() {
 /**
  * A minimal fetch() through an HTTP CONNECT proxy (Tailscale's outbound proxy), returning a standard Response.
  * Node's built-in fetch can't use a proxy for one request only, and this keeps the app free of extra packages.
- * `ca` is only for tests.
+ * `via` is the address to connect to instead of the URL's host (which is still used for TLS and Host). A timeout
+ * says which step stalled. `ca` is only for tests.
  */
-export function proxyFetch(proxy, url, { method = 'GET', headers = {}, body, signal, ca } = {}) {
+export function proxyFetch(proxy, url, { method = 'GET', headers = {}, body, signal, ca, via } = {}) {
   const u = new URL(url);
   const secure = u.protocol === 'https:';
   const port = Number(u.port) || (secure ? 443 : 80);
   const host = u.hostname.replace(/^\[|\]$/g, '');
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(signal.reason);
-    let done = false, sock = null, req = null;
+    let done = false, sock = null, req = null, phase = 'connecting through Tailscale';
     const finish = (fn, v) => {
       if (done) return;
       done = true; signal?.removeEventListener('abort', onAbort);
       if (fn === reject) { tunnel.destroy(); req?.destroy(); sock?.destroy(); }
       fn(v);
     };
-    const onAbort = () => finish(reject, signal.reason);
+    const onAbort = () => finish(reject, signal.reason?.name === 'TimeoutError'
+      ? Object.assign(new Error(`Timed out ${phase}`), { name: 'TimeoutError', phase }) : signal.reason);
     signal?.addEventListener('abort', onAbort, { once: true });
 
-    const tunnel = httpRequest({ host: proxy.host, port: proxy.port, method: 'CONNECT', path: `${u.hostname}:${port}`, headers: { host: `${u.hostname}:${port}` } });
+    const target = `${via ? (isIP(via) === 6 ? `[${via}]` : via) : u.hostname}:${port}`;
+    const tunnel = httpRequest({ host: proxy.host, port: proxy.port, method: 'CONNECT', path: target, headers: { host: target } });
     tunnel.on('error', e => finish(reject, new Error(`Tailscale's proxy isn't answering (${e.code || e.message})`)));
     tunnel.on('connect', (res, socket, head) => {
       if (res.statusCode !== 200) {
@@ -76,7 +84,9 @@ export function proxyFetch(proxy, url, { method = 'GET', headers = {}, body, sig
         const why = head?.length ? head.toString().trim().slice(0, 200) : `proxy answered ${res.statusCode}`;
         return finish(reject, new Error(`Tailscale couldn't reach ${u.host} (${why})`));
       }
+      phase = secure ? 'during the secure (TLS) handshake' : 'waiting for Home Assistant to answer';
       sock = secure ? tlsConnect({ socket, servername: isIP(host) ? undefined : host, ca }) : socket;
+      if (secure) sock.once('secureConnect', () => { phase = 'waiting for Home Assistant to answer'; });
       const payload = body == null ? null : Buffer.from(body);
       req = httpRequest({
         method, path: u.pathname + u.search, createConnection: () => sock,
@@ -84,6 +94,7 @@ export function proxyFetch(proxy, url, { method = 'GET', headers = {}, body, sig
       });
       req.on('error', e => finish(reject, new Error(e.code || e.message, { cause: e })));
       req.on('response', r => {
+        phase = 'reading the answer';
         const chunks = [];
         r.on('data', c => chunks.push(c));
         r.on('error', e => finish(reject, e));
@@ -148,6 +159,15 @@ export function startTailnet({ authKey = process.env.TS_AUTHKEY, hostname = proc
     t.ip = s.Self?.TailscaleIPs?.find(ip => isIP(ip) === 4) || s.Self?.TailscaleIPs?.[0] || null;
     t.tailnet = s.CurrentTailnet?.Name || null;
     t.health = Array.isArray(s.Health) ? s.Health.slice(0, 5) : [];
+    const known = new Map();
+    for (const p of Object.values(s.Peer || {})) {
+      const ip = p.TailscaleIPs?.find(a => isIP(a) === 4) || p.TailscaleIPs?.[0];
+      const full = String(p.DNSName || '').toLowerCase().replace(/\.$/, '');
+      if (!ip || !full) continue;
+      known.set(full, ip);
+      if (!known.has(full.split('.')[0])) known.set(full.split('.')[0], ip);
+    }
+    peers = known;
     if (t.state === 'Running') { t.error = null; backoff = restartAfter; return; }
     if (['NeedsLogin', 'Stopped'].includes(t.state) && Date.now() - lastLogin > 5 * 60000) {
       lastLogin = Date.now();
@@ -182,7 +202,7 @@ export function startTailnet({ authKey = process.env.TS_AUTHKEY, hostname = proc
 
   ctl = {
     check,
-    stop() { stopped = true; clearInterval(timer); clearTimeout(first); child?.kill('SIGTERM'); ctl = null; Object.assign(t, { enabled: false, state: 'off' }); },
+    stop() { stopped = true; clearInterval(timer); clearTimeout(first); child?.kill('SIGTERM'); ctl = null; peers = new Map(); Object.assign(t, { enabled: false, state: 'off' }); },
   };
   return ctl;
 }
