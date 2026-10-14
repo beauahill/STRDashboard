@@ -221,6 +221,7 @@ async function settingsView() {
         <label class="sub"><input type="checkbox" name="cancellations" ${NS.cancellations ? 'checked' : ''}> Cancellations</label>
         <label class="sub"><input type="checkbox" name="problems" ${NS.problems ? 'checked' : ''}> Problems: a failed automated message, a door code not working before arrival, Beds24 not syncing</label>
         ${status.home ? `<label class="sub"><input type="checkbox" name="home" ${NS.home ? 'checked' : ''}> Home Assistant: leaks, alarms, freeze risk, air quality, doors left unlocked, low batteries, offline devices</label>` : ''}
+        <label class="sub"><input type="checkbox" name="pricing" ${NS.pricing ? 'checked' : ''}> Event scout: new local events that may raise prices</label>
         <label class="sub"><input type="checkbox" name="preview" ${NS.preview ? 'checked' : ''}> Include the guest's message text (otherwise just "New message from …")</label>
         <details><summary class="sub">Advanced</summary><div class="stack" style="max-width:none;margin-top:8px">
           <label class="sub">ntfy server <input name="server" value="${esc(NS.server)}" style="width:100%"></label>
@@ -257,7 +258,7 @@ async function settingsView() {
   };
   $('#nform').onsubmit = async e => {
     e.preventDefault();
-    const f = e.target, body = Object.fromEntries(['enabled', 'messages', 'bookings', 'cancellations', 'problems', 'home', 'preview'].filter(k => f.elements[k]).map(k => [k, f.elements[k].checked]));
+    const f = e.target, body = Object.fromEntries(['enabled', 'messages', 'bookings', 'cancellations', 'problems', 'home', 'pricing', 'preview'].filter(k => f.elements[k]).map(k => [k, f.elements[k].checked]));
     body.server = f.server.value;
     if (f.token.value.trim()) body.token = f.token.value.trim();
     try { await api('/notify', { method: 'POST', body }); await settingsView(); banner(body.enabled ? 'Notifications are on.' : 'Notification settings saved.', 'ok'); }
@@ -718,9 +719,157 @@ function renderReplyManager(th) {
 }
 
 // ---------- Pricing tool ----------
-const pr = { month: null, room: null, selected: null, open: { settings: false, events: false }, ai: { html: '', busy: false } };
+// Laid out like a market dashboard: forward numbers, a demand calendar, the next 90 days of prices against demand,
+// upcoming events (with the event scout's finds) and the demand signals behind the recommendations.
+const pr = { month: null, room: null, selected: null, win: 30, open: { settings: false, events: false, table: false }, ai: { html: '', busy: false }, scanning: false };
 const DOWS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'], MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const pctStr = v => `${v > 0 ? '+' : ''}${Math.round(v * 10) / 10}%`;
+const LEVEL_LABEL = { low: 'Low', mid: 'Moderate', high: 'High', vhigh: 'Very high' };
+const IMPACT_LABEL = { low: 'Low', medium: 'Medium', high: 'High', very_high: 'Very high' };
+const IMPACT_LEVEL = { low: 'low', medium: 'mid', high: 'high', very_high: 'vhigh' };
+const dayLabel = d => new Date(d + 'T00:00:00Z').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' });
+const nightsLabel = (a, b) => a === b ? fmtDate(a) : `${fmtDate(a)} – ${fmtDate(b)}`;
+
+// One tooltip for the page's chart and calendar. Text goes in with textContent (event names come from the web).
+function showTip(x, y, rows) {
+  let tip = $('#ptip');
+  if (!tip) { tip = document.createElement('div'); tip.id = 'ptip'; tip.className = 'ptip'; tip.setAttribute('role', 'tooltip'); document.body.appendChild(tip); }
+  tip.replaceChildren(...rows.map(([value, label, key]) => {
+    const r = document.createElement('div'); r.className = 'tr';
+    if (key) { const k = document.createElement('span'); k.className = 'tk ' + key; r.append(k); }
+    const v = document.createElement('b'); v.textContent = value; r.append(v);
+    if (label) { const l = document.createElement('span'); l.textContent = ' ' + label; r.append(l); }
+    return r;
+  }));
+  tip.hidden = false;
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  tip.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, x + 14)) + 'px';
+  tip.style.top = Math.max(8, y - h - 12 < 8 ? y + 18 : y - h - 12) + window.scrollY + 'px';
+}
+const hideTip = () => { const t = $('#ptip'); if (t) t.hidden = true; };
+
+/** The next 90 nights: recommended price and Beds24's price (one $ axis), with a demand strip underneath. */
+function priceChart(box, nights) {
+  const W = Math.max(300, box.clientWidth), H = 250, padL = 44, padR = 12, top = 12, plotH = 160, stripY = top + plotH + 14, stripH = 14;
+  const prices = nights.flatMap(n => (n.booked || n.blocked ? [] : [n.price, n.current])).filter(v => v != null);
+  if (!prices.length) { box.innerHTML = '<div class="empty">No open nights in the next 90 days.</div>'; return; }
+  const step = v => [5, 10, 20, 25, 50, 100, 200, 250, 500].find(s => v / s <= 5) || 1000;
+  const lo0 = Math.min(...prices), hi0 = Math.max(...prices), st = step((hi0 - lo0) || hi0 / 2 || 50);
+  const lo = Math.max(0, Math.floor((lo0 - st * 0.3) / st) * st), hi = Math.ceil((hi0 + st * 0.3) / st) * st;
+  const xw = (W - padL - padR) / nights.length, x = i => padL + xw * (i + 0.5), y = v => top + plotH - (v - lo) / (hi - lo) * plotH;
+  // Runs of open nights become lines; a single open night between bookings becomes a dot.
+  const series = key => {
+    const runs = []; let run = [];
+    nights.forEach((n, i) => {
+      const v = n.booked || n.blocked ? null : n[key];
+      if (v == null) { if (run.length) runs.push(run); run = []; } else run.push([x(i), y(v)]);
+    });
+    if (run.length) runs.push(run);
+    return `<path d="${runs.filter(r => r.length > 1).map(r => r.map(([px, py], j) => `${j ? 'L' : 'M'}${px.toFixed(1)},${py.toFixed(1)}`).join('')).join('')}" class="ln ${key === 'price' ? 'rec' : 'now'}"/>`
+      + runs.filter(r => r.length === 1).map(([[px, py]]) => `<circle cx="${px.toFixed(1)}" cy="${py.toFixed(1)}" r="4" class="dot ${key === 'price' ? 'rec' : 'now'}"/>`).join('');
+  };
+  const ticks = []; for (let v = lo; v <= hi + 0.01; v += st) ticks.push(v);
+  const months = nights.map((n, i) => [n, i]).filter(([n, i]) => i === 0 || n.date.endsWith('-01'));
+  box.innerHTML = `<svg width="${W}" height="${H}" role="img" aria-label="Recommended and current nightly price for the next 90 nights, with demand">
+    ${ticks.map(v => `<line x1="${padL}" x2="${W - padR}" y1="${y(v)}" y2="${y(v)}" class="grid"/><text x="${padL - 6}" y="${y(v) + 4}" class="axis" text-anchor="end">$${v >= 1000 ? (v / 1000) + 'K' : v}</text>`).join('')}
+    ${months.map(([n, i]) => `<text x="${x(i) - xw / 2}" y="${H - 8}" class="axis">${MONTHS[+n.date.slice(5, 7) - 1]} ${+n.date.slice(8)}</text>`).join('')}
+    ${series('current')}${series('price')}
+    ${nights.map((n, i) => `<rect x="${(x(i) - xw / 2 + 1).toFixed(1)}" y="${stripY}" width="${Math.max(1, xw - 2).toFixed(1)}" height="${stripH}" rx="2"
+      class="${n.booked ? 'sbooked' : n.blocked ? 'sblocked' : 'lv-' + n.level}"/>${n.event && !n.booked ? `<circle cx="${x(i).toFixed(1)}" cy="${stripY - 5}" r="2" class="evmark"/>` : ''}`).join('')}
+    <line class="xhair" y1="${top}" y2="${stripY + stripH}" hidden/>
+    <rect x="${padL}" y="0" width="${W - padL - padR}" height="${stripY + stripH + 4}" fill="transparent" class="hit" tabindex="0"/></svg>`;
+  const svg = box.querySelector('svg'), hair = svg.querySelector('.xhair'), hit = svg.querySelector('.hit');
+  const at = i => {
+    const n = nights[i];
+    hair.setAttribute('x1', x(i)); hair.setAttribute('x2', x(i)); hair.removeAttribute('hidden');
+    const r = svg.getBoundingClientRect();
+    showTip(r.left + x(i), r.top + top + 20, [
+      [dayLabel(n.date), ''],
+      ...(n.booked ? [['Booked', '']] : n.blocked ? [['Blocked', '']] : [[money(n.price), 'recommended', 'rec'], [n.current != null ? money(n.current) : '—', 'in Beds24 now', 'now']]),
+      [`${LEVEL_LABEL[n.level] || '—'} demand`, n.score != null ? `(${n.score}/100)` : ''],
+      ...(n.event ? [[n.event, '']] : []),
+    ]);
+  };
+  let idx = 0;
+  hit.onpointermove = e => { const r = svg.getBoundingClientRect(); idx = Math.max(0, Math.min(nights.length - 1, Math.floor((e.clientX - r.left - padL) / xw))); at(idx); };
+  hit.onpointerleave = () => { hair.setAttribute('hidden', ''); hideTip(); };
+  hit.onfocus = () => at(idx); hit.onblur = hit.onpointerleave;
+  hit.onkeydown = e => { if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') { e.preventDefault(); idx = Math.max(0, Math.min(nights.length - 1, idx + (e.key === 'ArrowRight' ? 1 : -1))); at(idx); } };
+}
+
+function kpiTiles(P) {
+  const f = P.forward.find(w => w.days === pr.win) || P.forward[0];
+  const ly = f.lastYearAtThisPoint, now = f.now;
+  const delta = (cur, prev, kind) => {
+    if (prev == null || cur == null || (kind !== 'pts' && !prev)) return '<div class="tdelta sub">No history for last year</div>';
+    const d = kind === 'pts' ? (cur - prev) * 100 : (cur / prev - 1) * 100;
+    if (Math.abs(d) < 0.5) return '<div class="tdelta sub">Same as this time last year</div>';
+    const up = d > 0;
+    return `<div class="tdelta ${up ? 'up' : 'down'}"><span aria-hidden="true">${up ? '▲' : '▼'}</span> ${Math.abs(Math.round(d))}${kind === 'pts' ? ' pts' : '%'} <span class="sub">vs this time last year</span></div>`;
+  };
+  const open = P.next90.slice(0, pr.win).filter(n => !n.booked && !n.blocked);
+  const hot = open.filter(n => n.level === 'high' || n.level === 'vhigh');
+  const evs = new Set(P.next90.slice(0, pr.win).map(n => n.event).filter(Boolean));
+  const recAvg = open.length ? open.reduce((a, n) => a + n.price, 0) / open.length : null;
+  const set = open.filter(n => n.current != null), curAvg = set.length ? set.reduce((a, n) => a + n.current, 0) / set.length : null;
+  return `<div class="kpis">
+    <div class="tile"><div class="tlabel">Occupancy on the books</div><div class="tval">${Math.round(now.occupancy * 100)}%</div>
+      ${delta(now.occupancy, ly?.occupancy, 'pts')}<div class="sub">${now.nights} of ${now.available} nights${f.lastYearFinal ? ` · last year finished at ${Math.round(f.lastYearFinal.occupancy * 100)}%` : ''}</div></div>
+    <div class="tile"><div class="tlabel">Average daily rate</div><div class="tval">${now.adr != null ? money(now.adr) : '—'}</div>
+      ${delta(now.adr, ly?.adr, 'pct')}<div class="sub">Booked nights in the next ${pr.win} days</div></div>
+    <div class="tile"><div class="tlabel">RevPAR</div><div class="tval">${money(now.revpar)}</div>
+      ${delta(now.revpar, ly?.revpar, 'pct')}<div class="sub">Revenue per available night</div></div>
+    <div class="tile"><div class="tlabel">High-demand nights still open</div><div class="tval">${hot.length}</div>
+      <div class="tdelta sub">of ${open.length} open night${open.length === 1 ? '' : 's'}${evs.size ? ` · ${evs.size} event${evs.size === 1 ? '' : 's'}` : ''}</div>
+      <div class="sub">${recAvg != null ? `Recommended avg ${money(recAvg)}${curAvg != null ? ` · Beds24 avg ${money(curAvg)}` : ''}` : 'Fully booked'}</div></div></div>`;
+}
+
+function eventsPanel(P) {
+  const S = P.scout, today = P.today, horizon = P.next90.at(-1)?.date || today;
+  const sug = P.suggestions;
+  const upcoming = P.events.filter(e => e.end_date >= today && e.start_date <= horizon);
+  const scanLine = S.last ? (S.last.error ? `<span class="bad">Last scan failed: ${esc(S.last.error)}</span>`
+    : `Last scan ${timeAgo(S.last.at)}: ${S.last.found} found, ${S.last.added} new${S.last.cost != null ? ` · about $${Math.max(0.01, S.last.cost).toFixed(2)}` : ''}`) : 'Not run yet.';
+  return `<div class="card"><div class="toolbar" style="margin:0 0 8px"><h3 style="margin:0">Upcoming events</h3><span style="margin-left:auto"></span>
+      ${S.aiReady ? `<button id="pscan" ${pr.scanning ? 'disabled' : ''}>${pr.scanning ? 'Searching the web…' : '🔎 Scan for events'}</button>` : ''}</div>
+    ${S.aiReady ? `<div class="sub">${pr.scanning ? 'The event scout is searching official schedules and event calendars. This takes a minute or two.' : scanLine}</div>`
+      : aiSetup('The event scout uses Claude with web search to find games, festivals, concerts and conferences near you and suggests price increases for them.')}
+    ${S.last?.notes && !S.last.error ? `<div class="sub" style="margin-top:4px">${esc(S.last.notes)}</div>` : ''}
+    ${sug.length ? `<div class="sugs">${sug.map(s => {
+      const replaced = s.replaces_event_id && P.events.find(e => e.id === s.replaces_event_id);
+      return `<div class="sug" data-sug="${s.id}"><div class="sdate"><b>${MONTHS[+s.start_date.slice(5, 7) - 1]}</b><span>${+s.start_date.slice(8)}</span></div>
+        <div class="sbody"><div><b>${esc(s.name)}</b> <span class="impact"><span class="sw lv-${IMPACT_LEVEL[s.impact] || 'mid'}"></span>${IMPACT_LABEL[s.impact] || ''} impact</span>
+          ${s.confidence === 'estimated' ? '<span class="warn">⚠ estimated date</span>' : s.confidence === 'confirmed' ? '<span class="sub">✓ confirmed</span>' : '<span class="sub">likely</span>'}</div>
+          <div class="sub">${nightsLabel(s.start_date, s.end_date)}${s.city ? ` · ${esc(s.city)}` : ''}${s.category ? ` · ${esc(s.category)}` : ''}</div>
+          ${replaced ? `<div class="sub">Corrects your event "${esc(replaced.name)}" (now ${nightsLabel(replaced.start_date, replaced.end_date)})</div>` : ''}
+          ${s.evidence ? `<div class="sub">${esc(s.evidence)}${s.url ? ` <a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">source</a>` : ''}</div>` : ''}
+          <div class="toolbar" style="margin:6px 0 0"><label class="sub">Price <input type="number" class="spct" value="${replaced ? replaced.pct : s.pct}" style="width:5em">%</label>
+            <label class="sub">Min stay <input type="number" class="smin" min="1" max="30" value="${(replaced ? replaced.min_stay : s.min_stay) || ''}" style="width:4em"></label>
+            <button class="primary" data-sadd="${s.id}">${replaced ? 'Update event' : 'Add to pricing'}</button><button data-sdis="${s.id}">Dismiss</button></div></div></div>`;
+    }).join('')}</div>` : ''}
+    <div class="sub" style="margin:12px 0 4px"><b>Your events, next 90 days</b></div>
+    ${upcoming.length ? `<ul class="list evlist">${upcoming.map(e => `<li><span><span class="evdot">●</span> ${esc(e.name)}</span><span class="sub">${nightsLabel(e.start_date, e.end_date)} · ${pctStr(e.pct)}</span></li>`).join('')}</ul>`
+      : '<div class="empty">None in the next 90 days.</div>'}
+    <details id="pscoutset" style="margin-top:8px"><summary class="sub">Scout settings</summary>
+      <form id="pscoutform" class="stack" style="max-width:none;margin-top:8px">
+        <label class="sub">Area to search<br><input name="area" value="${esc(S.customArea ? S.area : '')}" placeholder="${esc(S.defaultArea)}" style="width:100%" maxlength="200"></label>
+        <div class="toolbar" style="margin:0"><label class="sub">Look ahead <input name="months" type="number" min="1" max="12" value="${S.months}" style="width:4em"> months</label>
+          <label class="sub"><input name="auto" type="checkbox" ${S.auto ? 'checked' : ''}> Scan automatically every week</label><button>Save</button></div>
+        <div class="sub">Each scan runs up to 12 web searches (about a cent each) plus Claude's time, typically well under $1. Nothing changes prices until you add an event.</div></form></details></div>`;
+}
+
+function signalsPanel(P) {
+  const G = P.signals || { asked: [], pickup: [] };
+  const seen = new Set(), asked = G.asked.filter(a => !seen.has(a.booking_id) && seen.add(a.booking_id));
+  return `<div class="card"><h3>Demand signals</h3>
+    <div class="sub">Guests asking about dates and stays booked unusually early both point to demand. Each nudges those nights up ${P.settings.demand === false ? '(switched off under Pricing rules)' : `${P.settings.demandStepPct}%, up to ${P.settings.demandMax}%`}.</div>
+    <div class="sub" style="margin:10px 0 4px"><b>Guests asking</b> <span class="sub">(inquiries and booking requests, last 45 days)</span></div>
+    ${asked.length ? `<ul class="list">${asked.map(a => `<li><span>${nightsLabel(a.arrival, addDaysISO(a.departure, -1))} ${tag(a.channel || 'Other')}</span><span class="sub">${a.kind === 'request' ? 'Request' : 'Inquiry'} · ${timeAgo(a.seen_at)}</span></li>`).join('')}</ul>`
+      : '<div class="empty">None right now. Inquiries that didn\'t book still count here.</div>'}
+    <div class="sub" style="margin:10px 0 4px"><b>Booked unusually early</b> <span class="sub">(${G.usualLead ? `usually ${G.usualLead.days} days ahead${G.usualLead.assumed ? ', assumed until there\'s more history' : ''}` : ''})</span></div>
+    ${G.pickup.length ? `<ul class="list">${G.pickup.map(b => `<li><span>${nightsLabel(b.arrival, addDaysISO(b.departure, -1))} ${tag(b.channel || 'Other')}</span><span class="sub">${b.lead} days ahead</span></li>`).join('')}</ul>`
+      : '<div class="empty">Nothing unusual in the last 60 days.</div>'}</div>`;
+}
 
 async function pricingView() {
   const today = todayISO();
@@ -737,19 +886,22 @@ async function pricingView() {
     for (let i = 1; i <= len; i++) {
       const date = m.slice(0, 8) + String(i).padStart(2, '0'), n = byDate[date];
       if (!n) { cells += `<div class="day past"><div class="n">${i}</div></div>`; continue; }
+      const lv = n.demand ? `lv-${n.demand.level}` : '';
       if (n.booked || n.blocked) {
-        cells += `<div class="day ${n.blocked ? 'blocked' : 'booked ' + (n.booking?.channel || '')}"><div class="n">${i}</div><div class="m">${n.blocked ? 'Blocked' : esc((n.booking?.guest || 'Booked').split(' ')[0])}</div></div>`;
+        cells += `<div class="day dday ${n.blocked ? 'blocked' : 'booked'}" data-tip="${date}" tabindex="0"><div class="n">${i}</div><div class="m">${n.blocked ? 'Blocked' : 'Booked'}</div></div>`;
         continue;
       }
       const up = n.current != null && n.price > n.current, down = n.current != null && n.price < n.current;
-      cells += `<div class="day pday ${pr.selected === date ? 'sel' : ''} ${n.event ? 'event' : ''}" data-pdate="${date}" title="${esc(n.event || '')}">
-        <div class="n">${i}${n.event ? ' <span class="evdot">●</span>' : ''}${n.gap ? ' <span class="gapb">gap</span>' : ''}</div>
+      cells += `<div class="day dday pday ${lv} ${pr.selected === date ? 'sel' : ''}" data-pdate="${date}" data-tip="${date}" tabindex="0">
+        <div class="n">${i}${n.event ? ' <span class="evdot" aria-label="event">●</span>' : ''}${n.gap ? ' <span class="gapb">gap</span>' : ''}</div>
         <div class="p">${money(n.price)}</div>
-        <div class="m">${n.current == null ? 'not set' : up || down ? `<span class="${up ? 'ok' : 'bad'}">${up ? '▲' : '▼'}</span> now ${money(n.current)}` : '✓ set'}</div></div>`;
+        <div class="m">${n.current == null ? 'not set' : up || down ? `${up ? '▲' : '▼'} now ${money(n.current)}` : '✓ set'}</div></div>`;
     }
     return `<div class="month"><h4>${first.toLocaleDateString(undefined, { month: 'long', year: 'numeric', timeZone: 'UTC' })}</h4>
       <div class="mgrid">${['S', 'M', 'T', 'W', 'T', 'F', 'S'].map(w => `<div class="wd">${w}</div>`).join('')}${cells}</div></div>`;
   };
+  const legend = `<div class="dlegend"><span class="sub">Demand</span>${P.levels.slice().reverse().map(l => `<span><span class="sw lv-${l.key}"></span>${l.label}</span>`).join('')}
+    <span><span class="sw booked"></span>Booked</span><span><span class="evdot">●</span> Event</span></div>`;
   const sel = pr.selected && byDate[pr.selected];
   const pendRow = (label, p, days) => p ? `<tr><td>${label}</td><td>${p.nights ? `<b>${p.nights}</b> night${p.nights === 1 ? '' : 's'}` : '<span class="ok">Up to date</span>'}</td>
     <td class="sub">${p.nights ? `avg ${p.avgNow != null ? money(p.avgNow) : 'not set'} → ${money(p.avgNew)}` : ''}</td>
@@ -757,39 +909,56 @@ async function pricingView() {
   const paceRows = Object.entries(P.pace).slice(0, 6).map(([m, v]) => `<tr><td>${MONTHS[+m.slice(5) - 1]} ${m.slice(0, 4)}</td><td>${Math.round(v.now * 100)}%</td>
     <td>${v.lastYear == null ? '<span class="sub">no history</span>' : Math.round(v.lastYear * 100) + '%'}</td>
     <td>${v.lastYear == null || !S.pacing ? '–' : (() => { const a = Math.max(-S.pacingMax, Math.min(S.pacingMax, (v.now - v.lastYear) * 25)); return Math.abs(a) >= 1 ? pctStr(a) : '0%'; })()}</td></tr>`).join('');
+  const tableRows = P.next90.map(n => `<tr><td>${dayLabel(n.date)}</td><td>${n.booked ? 'Booked' : n.blocked ? 'Blocked' : money(n.price)}</td>
+    <td>${n.current != null ? money(n.current) : '—'}</td><td>${LEVEL_LABEL[n.level] || '—'}${n.score != null ? ` (${n.score})` : ''}</td><td>${esc(n.event || '')}</td></tr>`).join('');
 
   view.innerHTML = `${notice ? `<div class="notice">${notice}</div>` : ''}${P.error ? `<div class="notice">Auto-pricing problem: ${esc(P.error)}</div>` : ''}
+  <div class="toolbar pfilters">${P.rooms.length > 1 ? `<select id="proom">${P.rooms.map(r => `<option value="${r.id}" ${r.id === P.room.id ? 'selected' : ''}>${esc(r.property_name)} · ${esc(r.name)}</option>`).join('')}</select>` : `<b>${esc(P.room.property_name)}</b>`}
+    <div class="seg" role="group" aria-label="Window">${[30, 60, 90].map(d => `<button data-win="${d}" class="${pr.win === d ? 'on' : ''}" aria-pressed="${pr.win === d}">Next ${d} days</button>`).join('')}</div></div>
   ${P.needsBase ? `<div class="card stack" style="max-width:620px;margin-bottom:14px"><h3>Start here</h3>
     <div>Set a <b>base price</b>: your normal weeknight rate before any adjustments. Everything else builds on it.</div>
-    <div class="sub">Not sure? <b>Suggest from my history</b> works it out from your past stays (including the Guesty import).</div></div>` : ''}
+    <div class="sub">Not sure? <b>Suggest from my history</b> works it out from your past stays (including the Guesty import).</div></div>` : kpiTiles(P)}
   <div class="rates">
+    <div class="stack" style="max-width:none">
     <div class="card">
-      <div class="toolbar">${P.rooms.length > 1 ? `<select id="proom">${P.rooms.map(r => `<option value="${r.id}" ${r.id === P.room.id ? 'selected' : ''}>${esc(r.property_name)} · ${esc(r.name)}</option>`).join('')}</select>` : `<b>${esc(P.room.property_name)}</b>`}
-        <button id="pprev">‹</button><button id="ptoday">Today</button><button id="pnext">›</button>
-        <span class="sub">Recommended price per night. ▲▼ = differs from Beds24 now. Click a night to see why.</span></div>
-      ${P.needsBase ? '<div class="empty">Recommendations appear once a base price is set.</div>' : `<div class="months">${[pr.month, addMonths(pr.month, 1)].map(monthGrid).join('')}</div>`}
+      <div class="toolbar"><h3 style="margin:0">Demand calendar</h3><span style="margin-left:auto"></span><button id="pprev" aria-label="Previous month">‹</button><button id="ptoday">Today</button><button id="pnext" aria-label="Next month">›</button></div>
+      ${P.needsBase ? '<div class="empty">Recommendations appear once a base price is set.</div>' : `${legend}<div class="months">${[pr.month, addMonths(pr.month, 1)].map(monthGrid).join('')}</div>
+      <div class="sub">Each night shows the recommended price; ▲▼ = Beds24 has a different price now. Click a night to see why.</div>`}
+    </div>
+    ${P.needsBase ? '' : `<div class="card"><div class="toolbar" style="margin:0 0 4px"><h3 style="margin:0">Next 90 nights: price and demand</h3>
+      <div class="plegend"><span><span class="lk rec"></span>Recommended</span><span><span class="lk now"></span>In Beds24 now</span></div></div>
+      <div id="pchart" class="pchart"></div>
+      <div class="sub">Lines break on booked nights. The strip underneath is demand for each night (same colors as the calendar); dots above it mark events.</div>
+      <details id="ptable" ${pr.open.table ? 'open' : ''}><summary class="sub">Show as a table</summary><div class="tscroll"><table class="pv"><tr><th>Night</th><th>Recommended</th><th>Beds24 now</th><th>Demand</th><th>Event</th></tr>${tableRows}</table></div></details></div>`}
     </div>
     <div class="stack" style="max-width:none">
       ${sel ? `<div class="card"><h3>${new Date(sel.date + 'T00:00:00Z').toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric', timeZone: 'UTC' })}</h3>
+        ${sel.demand ? `<div class="toolbar" style="margin:0 0 6px"><span class="sw lv-${sel.demand.level}"></span><b>${LEVEL_LABEL[sel.demand.level]} demand</b><span class="sub">${sel.demand.score}/100</span></div>
+        <table class="pv">${sel.demand.parts.map(p => `<tr><td class="sub">${esc(p.label)}</td><td style="text-align:right" class="sub">${p.points > 0 && p !== sel.demand.parts[0] ? '+' : ''}${p.points}</td></tr>`).join('')}</table><hr>` : ''}
         <table class="pv">${sel.factors.map(f => `<tr><td>${esc(f.label)}</td><td style="text-align:right">${f.value != null ? money(f.value) : pctStr(f.pct)}</td></tr>`).join('')}
         ${sel.notes.map(n => `<tr><td colspan="2" class="sub">${esc(n)}</td></tr>`).join('')}
         <tr><td><b>Recommended</b></td><td style="text-align:right"><b>${money(sel.price)}</b></td></tr>
         <tr><td>In Beds24 now</td><td style="text-align:right">${sel.current != null ? money(sel.current) : '—'}</td></tr>
         <tr><td>Minimum stay</td><td style="text-align:right">${sel.minStay} night${sel.minStay === 1 ? '' : 's'}${sel.currentMinStay != null && sel.currentMinStay !== sel.minStay ? ` <span class="sub">(now ${sel.currentMinStay})</span>` : ''}</td></tr></table></div>` : ''}
-      ${P.needsBase ? '' : `<div class="card"><h3>✨ AI pricing review</h3>${status.ai ? `
-        <div class="toolbar" style="margin:0 0 6px"><button id="paireview" ${pr.ai.busy ? 'disabled' : ''}>Review next 90 days</button>${sel ? `<button id="painight" ${pr.ai.busy ? 'disabled' : ''}>Explain ${fmtDate(sel.date)}</button>` : ''}</div>
-        <form id="paiform" class="toolbar" style="margin:0"><input name="q" placeholder="Or ask, e.g. Is my weekend premium too low?" style="flex:1;min-width:0" maxlength="1000"><button ${pr.ai.busy ? 'disabled' : ''}>Ask</button></form>
-        <div id="paiout" class="aianswer">${pr.ai.html}</div><div class="sub">Advice only: nothing changes in Beds24 unless you apply it.</div>`
-        : aiSetup('Get a second opinion on these prices, or ask why a night is priced the way it is.')}</div>`}
-      ${P.pending ? `<div class="card"><h3>Apply to Beds24</h3><table class="pv">
-        ${pendRow('Next 30 days', P.pending.d30, 30)}${pendRow('Next 90 days', P.pending.d90, 90)}${pendRow('Next 12 months', P.pending.d365, 365)}</table>
-        <label class="sub"><input type="checkbox" id="pmin" checked> Also set minimum stays (events and gap nights)</label>
-        <div class="sub">Only unbooked, unblocked nights change. Each save is checked against Beds24 afterwards and logged on the Rates page.</div>
-        <hr><label><input type="checkbox" id="pauto" ${S.auto ? 'checked' : ''}> <b>Auto-pricing</b>: apply recommendations every day</label>
-        <div class="sub">Next ${S.autoHorizon} days, only where the price differs by $${S.autoThreshold}+, never more than ${S.autoMaxChangePct}% in one day.${P.lastAuto ? ` Last run ${fmtDate(P.lastAuto)}.` : ''}</div></div>` : ''}
-      <div class="card"><h3>Booking pace</h3><table class="pv"><tr><th>Month</th><th>Now</th><th>Last year</th><th>Adjust</th></tr>${paceRows}</table>
-        <div class="sub">Compares how full each month is today with how full it was a year ago today. Ahead of last year → prices up; behind → down.</div></div>
+      ${eventsPanel(P)}
     </div></div>
+
+  <div class="cols" style="margin-top:14px">
+    ${signalsPanel(P)}
+    <div class="card"><h3>Booking pace</h3><table class="pv"><tr><th>Month</th><th>Now</th><th>Last year</th><th>Adjust</th></tr>${paceRows}</table>
+      <div class="sub">Compares how full each month is today with how full it was a year ago today. Ahead of last year → prices up; behind → down.</div></div>
+    ${P.pending ? `<div class="card"><h3>Apply to Beds24</h3><table class="pv">
+      ${pendRow('Next 30 days', P.pending.d30, 30)}${pendRow('Next 90 days', P.pending.d90, 90)}${pendRow('Next 12 months', P.pending.d365, 365)}</table>
+      <label class="sub"><input type="checkbox" id="pmin" checked> Also set minimum stays (events and gap nights)</label>
+      <div class="sub">Only unbooked, unblocked nights change. Each save is checked against Beds24 afterwards and logged on the Rates page.</div>
+      <hr><label><input type="checkbox" id="pauto" ${S.auto ? 'checked' : ''}> <b>Auto-pricing</b>: apply recommendations every day</label>
+      <div class="sub">Next ${S.autoHorizon} days, only where the price differs by $${S.autoThreshold}+, never more than ${S.autoMaxChangePct}% in one day.${P.lastAuto ? ` Last run ${fmtDate(P.lastAuto)}.` : ''}</div></div>` : ''}
+    ${P.needsBase ? '' : `<div class="card"><h3>✨ AI pricing review</h3>${status.ai ? `
+      <div class="toolbar" style="margin:0 0 6px"><button id="paireview" ${pr.ai.busy ? 'disabled' : ''}>Review next 90 days</button>${sel ? `<button id="painight" ${pr.ai.busy ? 'disabled' : ''}>Explain ${fmtDate(sel.date)}</button>` : ''}</div>
+      <form id="paiform" class="toolbar" style="margin:0"><input name="q" placeholder="Or ask, e.g. Is my weekend premium too low?" style="flex:1;min-width:0" maxlength="1000"><button ${pr.ai.busy ? 'disabled' : ''}>Ask</button></form>
+      <div id="paiout" class="aianswer">${pr.ai.html}</div><div class="sub">Advice only: nothing changes in Beds24 unless you apply it.</div>`
+      : aiSetup('Get a second opinion on these prices, or ask why a night is priced the way it is.')}</div>`}
+  </div>
 
   <details class="card" id="psettings" style="margin-top:14px" ${pr.open.settings || P.needsBase ? 'open' : ''}><summary><b>Pricing rules</b></summary>
     <form id="psform" class="stack" style="max-width:none;margin-top:10px">
@@ -807,6 +976,8 @@ async function pricingView() {
       <div class="toolbar" style="margin:0">
         <label class="sub"><input name="pacing" type="checkbox" ${S.pacing ? 'checked' : ''}> Adjust for booking pace, up to ±<input name="pacingMax" type="number" min="0" max="30" value="${S.pacingMax}" style="width:4em">%</label>
         <label class="sub">Gap nights: <input name="gapPct" type="number" max="0" value="${S.gapPct}" style="width:5em">%</label></div>
+      <div class="toolbar" style="margin:0">
+        <label class="sub"><input name="demand" type="checkbox" ${S.demand !== false ? 'checked' : ''}> Demand signals: +<input name="demandStepPct" type="number" min="0" max="25" value="${S.demandStepPct}" style="width:4em">% per inquiry or early booking nearby, up to <input name="demandMax" type="number" min="0" max="50" value="${S.demandMax}" style="width:4em">%</label></div>
       <div class="toolbar" style="margin:0"><span class="sub">Auto-pricing:</span>
         <label class="sub">next <input name="autoHorizon" type="number" min="7" max="365" value="${S.autoHorizon}" style="width:5em"> days</label>
         <label class="sub">only if off by $<input name="autoThreshold" type="number" min="0" value="${S.autoThreshold}" style="width:4em">+</label>
@@ -814,24 +985,58 @@ async function pricingView() {
       <div class="toolbar" style="margin:0"><button class="primary">Save rules</button><button type="button" id="psuggest">Suggest from my history</button><span class="sub" id="psuggestout"></span></div>
     </form></details>
 
-  <details class="card" id="pevents" style="margin-top:14px" ${pr.open.events ? 'open' : ''}><summary><b>Events</b> <span class="sub">(${P.events.length}) · football weekends, festivals, holidays</span></summary>
+  <details class="card" id="pevents" style="margin-top:14px" ${pr.open.events ? 'open' : ''}><summary><b>All events</b> <span class="sub">(${P.events.filter(e => e.end_date >= P.today).length}) · edit, add or delete</span></summary>
     <div style="overflow-x:auto;margin-top:10px"><table><tr><th>Event</th><th>Nights</th><th>Price</th><th>Min stay</th><th>Source</th><th></th></tr>
-    ${P.events.filter(e => e.end_date >= P.today).map(e => `<tr><td>${esc(e.name)}</td><td>${fmtDate(e.start_date)}${e.end_date !== e.start_date ? ' → ' + fmtDate(e.end_date) : ''}</td>
-      <td>${pctStr(e.pct)}</td><td>${e.min_stay || '–'}</td><td class="sub">${/estimated/.test(e.source || '') ? '<span class="warn">⚠ estimated, check the date</span>' : esc(e.source || '')}</td>
+    ${P.events.filter(e => e.end_date >= P.today).map(e => `<tr><td>${esc(e.name)}</td><td>${nightsLabel(e.start_date, e.end_date)}</td>
+      <td>${pctStr(e.pct)}</td><td>${e.min_stay || '–'}</td><td class="sub">${/estimated/.test(e.source || '') ? `<span class="warn">⚠ ${esc(e.source)}</span>` : esc(e.source || '')}</td>
       <td><a href="#" data-eedit="${e.id}">edit</a> · <a href="#" data-edel="${e.id}">delete</a></td></tr>`).join('')}</table></div>
     <form id="peform" class="toolbar" style="margin-top:10px"><input type="hidden" name="id">
       <input name="name" placeholder="Event name" size="22"><label class="sub">First night <input type="date" name="start_date"></label>
       <label class="sub">Last night <input type="date" name="end_date"></label><label class="sub"><input name="pct" type="number" style="width:5em" placeholder="+%"> %</label>
       <label class="sub">Min stay <input name="min_stay" type="number" min="1" max="30" style="width:4em"></label><button class="primary">Save event</button></form>
-    <div class="sub">Tip: add next season's UW home games when the schedule comes out (usually in March). Game weekends are usually the Friday and Saturday nights.</div></details>`;
+    <div class="sub">Game weekends are usually the Friday and Saturday nights. The event scout finds new schedules as they're published.</div></details>`;
 
+  // The chart is drawn to the card's width (and again if the window is resized).
+  const chartBox = $('#pchart');
+  if (chartBox) {
+    priceChart(chartBox, P.next90);
+    let t; window.onresize = () => { clearTimeout(t); t = setTimeout(() => { if ($('#pchart') === chartBox) priceChart(chartBox, P.next90); }, 150); };
+  }
+  view.querySelectorAll('[data-tip]').forEach(el => {
+    const n = byDate[el.dataset.tip];
+    const show = () => { const r = el.getBoundingClientRect(); showTip(r.left + r.width / 2, r.top, [
+      [dayLabel(n.date), ''], ...(n.booked ? [['Booked', '']] : n.blocked ? [['Blocked', '']] : [[money(n.price), 'recommended'], [n.current != null ? money(n.current) : '—', 'in Beds24 now']]),
+      ...(n.demand ? [[`${LEVEL_LABEL[n.demand.level]} demand`, `(${n.demand.score}/100)`]] : []), ...(n.event ? [[n.event, '']] : [])]); };
+    el.onpointerenter = show; el.onfocus = show; el.onpointerleave = hideTip; el.onblur = hideTip;
+  });
+  view.querySelectorAll('[data-win]').forEach(b => b.onclick = () => { pr.win = +b.dataset.win; pricingView(); });
   const go = m => { pr.month = m; pricingView(); };
-  $('#pprev').onclick = () => go(addMonths(pr.month, -1)); $('#pnext').onclick = () => go(addMonths(pr.month, 1));
-  $('#ptoday').onclick = () => go(today.slice(0, 8) + '01');
+  if ($('#pprev')) { $('#pprev').onclick = () => go(addMonths(pr.month, -1)); $('#pnext').onclick = () => go(addMonths(pr.month, 1)); $('#ptoday').onclick = () => go(today.slice(0, 8) + '01'); }
   if ($('#proom')) $('#proom').onchange = e => { pr.room = +e.target.value; pr.selected = null; pr.ai = { busy: false, html: '' }; pricingView(); };
-  view.querySelectorAll('[data-pdate]').forEach(el => el.onclick = () => { pr.selected = pr.selected === el.dataset.pdate ? null : el.dataset.pdate; pricingView(); });
+  view.querySelectorAll('[data-pdate]').forEach(el => {
+    const pick = () => { hideTip(); pr.selected = pr.selected === el.dataset.pdate ? null : el.dataset.pdate; pricingView(); };
+    el.onclick = pick; el.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } };
+  });
   $('#psettings').ontoggle = e => { pr.open.settings = e.target.open; };
   $('#pevents').ontoggle = e => { pr.open.events = e.target.open; };
+  if ($('#ptable')) $('#ptable').ontoggle = e => { pr.open.table = e.target.open; };
+  // Event scout: a scan takes a minute or two; the page stays usable meanwhile.
+  if ($('#pscan')) $('#pscan').onclick = async () => {
+    pr.scanning = true; pricingView();
+    try {
+      const r = await api('/pricing/scout', { method: 'POST' });
+      banner(r.added ? `Found ${r.added} new event${r.added === 1 ? '' : 's'} to review.` : `No new events found (${r.found} checked).`, 'ok');
+    } catch (err) { if (err.message !== 'login') banner(err.message, true); }
+    pr.scanning = false;
+    if (location.hash === '#/pricing') pricingView();
+  };
+  view.querySelectorAll('[data-sadd]').forEach(b => b.onclick = () => {
+    const box = b.closest('.sug');
+    act(() => api('/pricing/suggestions/add', { method: 'POST', body: { id: +b.dataset.sadd, pct: box.querySelector('.spct').value, min_stay: box.querySelector('.smin').value } }));
+  });
+  view.querySelectorAll('[data-sdis]').forEach(b => b.onclick = () => act(() => api('/pricing/suggestions/dismiss', { method: 'POST', body: { id: +b.dataset.sdis } })));
+  const sf = $('#pscoutform');
+  if (sf) sf.onsubmit = e => { e.preventDefault(); act(() => api('/pricing/scout/settings', { method: 'POST', body: { area: sf.area.value, months: sf.months.value, auto: sf.auto.checked } })); };
   // AI review: the answer is kept in pr.ai so clicking around the calendar doesn't lose it.
   const aiAsk = async (body, label) => {
     if (pr.ai.busy) return;
@@ -873,6 +1078,7 @@ async function pricingView() {
       dow: DOWS.map((_, i) => +v('dow' + i)), season: MONTHS.map((_, i) => +v('season' + i)),
       lastMinutePct: v('lastMinutePct'), lastMinuteDays: v('lastMinuteDays'), farOutPct: v('farOutPct'), farOutDays: v('farOutDays'),
       pacing: f.pacing.checked, pacingMax: v('pacingMax'), gapPct: v('gapPct'),
+      demand: f.demand.checked, demandStepPct: v('demandStepPct'), demandMax: v('demandMax'),
       autoHorizon: v('autoHorizon'), autoThreshold: v('autoThreshold'), autoMaxChangePct: v('autoMaxChangePct') } }));
   };
   $('#psuggest').onclick = async () => {

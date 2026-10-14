@@ -139,6 +139,11 @@ the Tailscale add-on is running.
 Usage is billed to your Anthropic account, typically one to a few cents per request. Settings shows this
 month's estimate. The key stays on the server; the browser only ever sees its last four characters.
 
+The **event scout** (Pricing → Upcoming events → Scan for events) also uses the key, with Claude's web search
+(up to 12 searches a scan at about a cent each, plus Claude's time: usually $0.10-1 a scan). Under **Scout
+settings** you can set the area to search, how many months ahead, and a weekly automatic scan. Scans count
+toward the same monthly limit.
+
 ## Troubleshooting
 
 - **Deploy failed**: open **Deploy Logs**; any `STARTUP ERROR:` line says exactly what's missing.

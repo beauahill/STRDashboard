@@ -772,3 +772,59 @@ test('Money over HTTP: profit and loss, expenses with receipts (owner only), pay
   assert.equal((await call('/api/money/settings', { taxes: [{ name: 'Lodging', pct: 5 }] })).status, 200);
   assert.ok((await call('/api/money')).json.tax.total.due > 0, 'direct and Booking.com stays are taxable by you');
 });
+
+test('Pricing over HTTP: demand numbers, event scout scan, adding and dismissing its finds', async t => {
+  const day = n => new Date(Date.now() + n * 864e5).toISOString().slice(0, 10);
+  const finds = [
+    { name: 'Border War', first_night: day(500), last_night: day(501), city: 'Laramie', category: 'sports', impact: 'very_high', suggested_pct: 70,
+      suggested_min_stay: 2, confidence: 'confirmed', evidence: 'Schedule.', source_url: 'https://example.org/schedule', matches_event_id: 0 },
+    { name: 'Craft fair', first_night: day(530), last_night: day(530), city: 'Laramie', category: 'festival', impact: 'low', suggested_pct: 5,
+      suggested_min_stay: 0, confidence: 'estimated', evidence: 'Usually early December.', source_url: '', matches_event_id: 0 },
+  ];
+  const ai = await fakeAnthropic({ searches: 2, toolCall: () => ({ name: 'report_events', input: { events: finds, notes: '' } }) });
+  t.after(() => ai.close());
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), ANTHROPIC_BASE_URL: ai.url });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+  assert.equal((await call('/api/demo', {})).status, 200);
+  const room = (await call('/api/pricing')).json.room.id;
+  assert.equal((await call('/api/pricing/settings', { roomId: room, base: 150 })).status, 200);
+
+  const P = (await call('/api/pricing')).json;
+  assert.deepEqual(P.forward.map(w => w.days), [30, 60, 90]);
+  assert.ok(P.forward[0].now.occupancy >= 0 && P.forward[0].now.available > 0);
+  assert.equal(P.next90.length, 90);
+  assert.ok(P.next90.every(n => ['low', 'mid', 'high', 'vhigh'].includes(n.level)));
+  assert.ok(P.nights.every(n => n.demand && n.demand.parts.length), 'every night explains its demand');
+  assert.deepEqual(P.levels.map(l => l.key), ['vhigh', 'high', 'mid', 'low']);
+  assert.equal(P.scout.aiReady, false);
+
+  const noKey = await call('/api/pricing/scout', {});
+  assert.equal(noKey.status, 400);
+  assert.match(noKey.json.error, /Add your Anthropic API key/);
+  assert.equal((await call('/api/ai/key', { apiKey: 'sk-ant-api03-http-test-key-0000000000' })).status, 200);
+  assert.equal((await call('/api/pricing/scout/settings', { months: 0 })).status, 400);
+  const st = await call('/api/pricing/scout/settings', { months: 12, auto: true, area: 'Laramie, WY' });
+  assert.deepEqual([st.status, st.json.auto, st.json.area], [200, true, 'Laramie, WY']);
+
+  const scan = await call('/api/pricing/scout', {});
+  assert.equal(scan.status, 200, JSON.stringify(scan.json));
+  assert.deepEqual([scan.json.found, scan.json.added], [2, 0], 'beyond the 12-month look-ahead: skipped');
+  [[40, 41], [70, 70]].forEach(([a, b], i) => { finds[i].first_night = day(a); finds[i].last_night = day(b); });
+  const scan2 = await call('/api/pricing/scout', {});
+  assert.deepEqual([scan2.json.found, scan2.json.added], [2, 2]);
+  const sug = (await call('/api/pricing')).json.suggestions;
+  assert.deepEqual(sug.map(x => x.name), ['Border War', 'Craft fair']);
+  const before = (await call('/api/pricing')).json.events.length;
+  assert.equal((await call('/api/pricing/suggestions/add', { id: sug[0].id, pct: '60', min_stay: '2' })).status, 200);
+  assert.equal((await call('/api/pricing/suggestions/dismiss', { id: sug[1].id })).status, 200);
+  assert.equal((await call('/api/pricing/suggestions/dismiss', { id: sug[1].id })).status, 400, 'already handled');
+  const after = (await call('/api/pricing')).json;
+  assert.equal(after.events.length, before + 1);
+  assert.deepEqual(after.events.filter(e => e.name === 'Border War').map(e => [e.pct, e.min_stay]), [[60, 2]]);
+  assert.deepEqual(after.suggestions, []);
+  assert.equal(after.scout.last.added, 2);
+});

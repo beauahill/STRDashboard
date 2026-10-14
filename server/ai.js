@@ -15,8 +15,8 @@ import * as stats from './analytics.js';
 export const MODEL = 'claude-opus-5-5';
 // If Claude declines a request, the API retries it on Anthropic's recommended fallback model in the same call.
 const BETAS = ['server-side-fallback-2026-07-01'];
-// US$ per million tokens, for the running cost estimate in Settings.
-const PRICE = { input: 4, output: 20, cacheWrite: 5, cacheRead: 0.2 };
+// US$ per million tokens (and per web search), for the running cost estimate in Settings.
+const PRICE = { input: 4, output: 20, cacheWrite: 5, cacheRead: 0.2, search: 0.01 };
 export const DEFAULT_BUDGET = 25;
 
 const err = (msg, status = 400) => Object.assign(new Error(msg), { status });
@@ -74,7 +74,8 @@ function friendly(e) {
 }
 
 function record(db, task, u, error) {
-  const cost = (u.input * PRICE.input + u.output * PRICE.output + u.cacheWrite * PRICE.cacheWrite + u.cacheRead * PRICE.cacheRead) / 1e6;
+  const cost = (u.input * PRICE.input + u.output * PRICE.output + u.cacheWrite * PRICE.cacheWrite + u.cacheRead * PRICE.cacheRead) / 1e6
+    + (u.searches || 0) * PRICE.search;
   db.prepare(`INSERT INTO ai_usage(at,task,calls,input_tokens,output_tokens,cache_write_tokens,cache_read_tokens,cost,error)
     VALUES(?,?,?,?,?,?,?,?,?)`).run(new Date().toISOString(), task, u.calls, u.input, u.output, u.cacheWrite, u.cacheRead, cost, error);
   return cost;
@@ -82,9 +83,10 @@ function record(db, task, u, error) {
 
 /**
  * One request to Claude (or a tool-use loop when `tools` are given). Returns the text of the final answer.
- * Refusals and cut-off answers become errors rather than half an answer.
+ * Refusals and cut-off answers become errors rather than half an answer. `requireText: false` is for tasks whose
+ * result arrives through a tool call rather than the final text.
  */
-async function ask(db, task, { system, messages, tools = null, effort = 'medium', maxTokens = 16000 }) {
+export async function ask(db, task, { system, messages, tools = null, effort = 'medium', maxTokens = 16000, requireText = true, maxIterations = 10 }) {
   const key = keyOf(db);
   if (!key) throw err('Add your Anthropic API key in Settings → AI assistant first.');
   const spent = db.prepare('SELECT COALESCE(SUM(cost),0) c FROM ai_usage WHERE at >= ?').get(monthStart()).c;
@@ -95,17 +97,22 @@ async function ask(db, task, { system, messages, tools = null, effort = 'medium'
     thinking: { type: 'adaptive' }, output_config: { effort }, cache_control: { type: 'ephemeral' },
     system, messages,
   };
-  const used = { calls: 0, input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+  const used = { calls: 0, input: 0, output: 0, cacheWrite: 0, cacheRead: 0, searches: 0 };
   const add = m => {
     used.calls++;
+    used.searches += m.usage?.server_tool_use?.web_search_requests || 0;
     used.input += m.usage?.input_tokens || 0; used.output += m.usage?.output_tokens || 0;
     used.cacheWrite += m.usage?.cache_creation_input_tokens || 0; used.cacheRead += m.usage?.cache_read_input_tokens || 0;
   };
   let msg;
   try {
     if (tools) {
-      const runner = client.beta.messages.toolRunner({ ...params, tools, max_iterations: 10 });
-      for await (const m of runner) add(m);
+      const runner = client.beta.messages.toolRunner({ ...params, tools, max_iterations: maxIterations });
+      for await (const m of runner) {
+        add(m);
+        // A long web-search turn can pause; the runner doesn't resume those on its own.
+        if (m.stop_reason === 'pause_turn') runner.pushMessages({ role: 'assistant', content: m.content });
+      }
       msg = await runner.done();
     } else {
       msg = await client.beta.messages.create(params);
@@ -118,6 +125,7 @@ async function ask(db, task, { system, messages, tools = null, effort = 'medium'
   const cost = record(db, task, used, msg.stop_reason === 'refusal' ? 'refused' : null);
   if (msg.stop_reason === 'refusal') throw err('Claude declined to help with this one. Try rewording it.', 422);
   const text = msg.content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+  if (!requireText) return { text, stopReason: msg.stop_reason, cost: Math.round(cost * 1000) / 1000, searches: used.searches, model: msg.model };
   if (!text) throw err(msg.stop_reason === 'max_tokens' ? 'The answer got too long and was cut off. Try asking for something narrower.' : 'Claude didn\'t finish an answer. Try again or ask something narrower.', 502);
   return { text, truncated: msg.stop_reason === 'max_tokens', cost: Math.round(cost * 1000) / 1000, model: msg.model };
 }
@@ -246,7 +254,7 @@ export async function writeListing(db, { propertyId, section, field, roomId = nu
 }
 
 // ---------- Pricing review ----------
-const PRICING_SYSTEM = `You're a revenue manager advising the owner of a short-term rental in Laramie, Wyoming (home of the University of Wyoming). The owner's pricing tool recommends each unbooked night's price as a base price adjusted for day of week, month, local events, booking pace versus last year, last-minute discount or far-ahead premium, and gap nights, kept between a floor and a ceiling. The owner applies prices to Beds24 themselves; you only advise.
+const PRICING_SYSTEM = `You're a revenue manager advising the owner of a short-term rental in Laramie, Wyoming (home of the University of Wyoming). The owner's pricing tool recommends each unbooked night's price as a base price adjusted for day of week, month, local events, booking pace versus last year, demand signals (guests who asked about those dates, and stays booked unusually far ahead nearby), last-minute discount or far-ahead premium, and gap nights, kept between a floor and a ceiling. The owner applies prices to Beds24 themselves; you only advise.
 
 - Be concrete: name dates, the current price, the recommended price, what you'd charge instead, and why.
 - Ground it in the data given. Say when history is too thin to judge rather than guessing.

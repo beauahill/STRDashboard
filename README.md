@@ -141,7 +141,21 @@ Settings is the gear at the top right. On a phone, "Add to Home Screen" installs
   same point last year × last-minute discount / far-ahead premium × gap-night discount, kept within a floor
   and ceiling. Click any night for the breakdown. "Suggest from my history" derives the base and seasonal
   adjustments from past stays. Apply 30/90/365 days to Beds24 (unbooked nights only, verified and logged),
-  or switch on daily auto-pricing (capped change per day, off by default).
+  or switch on daily auto-pricing (capped change per day, off by default). Laid out like a market dashboard:
+  - *Forward numbers* for the next 30/60/90 days: occupancy, ADR and RevPAR on the books against the same point
+    last year (and how last year finished), plus high-demand nights still open.
+  - *Demand calendar and 90-night chart*: every night gets a 0-100 demand score (Low / Moderate / High / Very
+    high) from the room's own history for that month and weekday (or the pricing rules while history is thin),
+    events, booking pace, and demand signals, with the breakdown on click. The chart plots the recommended price
+    against Beds24's current price over a demand strip; a table view is one click away.
+  - *Demand signals*: every inquiry and booking request is remembered (even after it lapses), and stays booked
+    far further ahead than usual are spotted. Both nudge those nights up (+5% each, capped at 15%; editable or
+    off under Pricing rules).
+  - *Event scout*: Claude with web search finds upcoming games, commencement, rodeos, festivals, concerts and
+    conferences near the rental from official schedules and suggests a price increase and minimum stay for each,
+    with its source and how sure it is; it also spots wrong dates on existing events. Nothing changes until you
+    add a suggestion; dismissed ones don't come back. Run it on demand or weekly (needs the AI assistant; about
+    $0.10-1 per scan). New finds can go to your phone.
 - **Cleaning**: upcoming turnovers with the time available to clean (same-day turnovers highlighted) and next
   guests' head count, plus a private per-room calendar link for **Turno** (Turno has no public API; it
   subscribes to iCal). The feed contains real stays only, so blocks never create cleanings, and no guest
@@ -161,7 +175,7 @@ Settings is the gear at the top right. On a phone, "Add to Home Screen" installs
 
 `server/beds24.js` API client + token handling · `server/sync.js` mapping and sync ·
 `server/rates.js` prices, minimum stays and blocks · `server/doors.js` + `server/seam.js` door codes ·
-`server/messages.js` inbox and saved replies · `server/pricing.js` pricing tool · `server/cleaning.js` Turno feed and turnovers · `server/automations.js` automated messages · `server/listing.js` listing editor ·
+`server/messages.js` inbox and saved replies · `server/pricing.js` pricing tool · `server/demand.js` demand signals · `server/scout.js` event scout · `server/cleaning.js` Turno feed and turnovers · `server/automations.js` automated messages · `server/listing.js` listing editor ·
 `server/analytics.js` analytics · `server/ai.js` AI assistant · `server/notify.js` phone notifications · `server/ha.js` Home Assistant · `server/tailnet.js` Tailscale · `server/site.js` booking site · `server/guide.js` guidebook · `server/money.js` money ·
 `server/guesty.js` Guesty import ·
 `server/stats.js` metrics · `server/demo.js` sample data · `public/` UI · `test/` (`npm test`).

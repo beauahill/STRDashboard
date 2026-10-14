@@ -6,6 +6,7 @@ import { getSetting, setSetting } from './db.js';
 import { addDays, diffDays } from './sync.js';
 import { syncCalendar, readDays } from './rates.js';
 import { localToday } from './doors.js';
+import { demandSignals } from './demand.js';
 
 const userError = msg => Object.assign(new Error(msg), { status: 400 });
 const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -21,6 +22,7 @@ export const PRICING_DEFAULTS = {
   farOutDays: 120, farOutPct: 5,
   pacing: true, pacingMax: 10,
   gapPct: -15, minStay: 2,
+  demand: true, demandStepPct: 5, demandMax: 15,          // inquiries and early pickup: +step% each, at most max%
   auto: false, autoHorizon: 180, autoThreshold: 5, autoMaxChangePct: 25,
 };
 
@@ -42,6 +44,7 @@ export function savePricingSettings(db, roomId, input) {
   num('rounding', 1, 50, true); num('lastMinuteDays', 0, 60, true); num('lastMinutePct', -60, 0);
   num('farOutDays', 14, 730, true); num('farOutPct', 0, 50); num('pacingMax', 0, 30); num('gapPct', -60, 0);
   num('minStay', 1, 30, true); num('autoHorizon', 7, 365, true); num('autoThreshold', 0, 500); num('autoMaxChangePct', 5, 100);
+  num('demandStepPct', 0, 25); num('demandMax', 0, 50);
   for (const [k, n] of [['dow', 7], ['season', 12]]) {
     if (input[k] === undefined) continue;
     if (!Array.isArray(input[k]) || input[k].length !== n || !input[k].every(v => Number.isFinite(+v) && +v >= -80 && +v <= 200)) {
@@ -49,7 +52,7 @@ export function savePricingSettings(db, roomId, input) {
     }
     s[k] = input[k].map(Number);
   }
-  for (const k of ['pacing', 'auto']) if (input[k] !== undefined) s[k] = !!input[k];
+  for (const k of ['pacing', 'auto', 'demand']) if (input[k] !== undefined) s[k] = !!input[k];
   if (s.min != null && s.max != null && s.min > s.max) throw userError('The minimum price is above the maximum.');
   if (s.auto && !s.base) throw userError('Set a base price before turning on auto-pricing.');
   setSetting(db, `pricing_${roomId}`, JSON.stringify(s));
@@ -111,7 +114,7 @@ export function seedEvents(db, today) {
 
 export const listEvents = db => db.prepare('SELECT * FROM pricing_events ORDER BY start_date').all();
 
-export function saveEvent(db, e) {
+export function saveEvent(db, e, { source = null } = {}) {
   const isDate = s => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(s));
   const name = (e.name || '').trim();
   if (!name) throw userError('Give the event a name.');
@@ -122,11 +125,11 @@ export function saveEvent(db, e) {
   if (minStay != null && !(Number.isInteger(minStay) && minStay >= 1 && minStay <= 30)) throw userError('Minimum stay must be 1 to 30 nights.');
   if (e.id) {
     db.prepare('UPDATE pricing_events SET name=?, start_date=?, end_date=?, pct=?, min_stay=?, source=? WHERE id=?')
-      .run(name, e.start_date, e.end_date, pct, minStay, 'edited', e.id);
+      .run(name, e.start_date, e.end_date, pct, minStay, source || 'edited', e.id);
     return Number(e.id);
   }
   return Number(db.prepare('INSERT INTO pricing_events(name,start_date,end_date,pct,min_stay,source) VALUES(?,?,?,?,?,?)')
-    .run(name, e.start_date, e.end_date, pct, minStay, 'added').lastInsertRowid);
+    .run(name, e.start_date, e.end_date, pct, minStay, source || 'added').lastInsertRowid);
 }
 export const deleteEvent = (db, id) => db.prepare('DELETE FROM pricing_events WHERE id = ?').run(id);
 
@@ -170,6 +173,9 @@ export function recommend(db, roomId, { start, days = 365, today } = {}) {
   const current = new Map(readDays(db, roomId, start, days).map(d => [d.date, d]));
   const events = db.prepare('SELECT * FROM pricing_events WHERE end_date >= ? AND start_date < ?').all(start, end);
   const pace = s.pacing ? monthlyPace(db, roomId, today, Math.ceil(diffDays(today, end) / 30) + 1) : {};
+  const signals = demandSignals(db, roomId, today, s);
+  const eventOn = d => events.filter(e => e.start_date <= d && e.end_date >= d).sort((a, b) => b.pct - a.pct)[0];
+  const demandOf = d => signals.score(d, { event: eventOn(d), pace: pace[d.slice(0, 7)] });
 
   // Gap nights: a run of free nights between two stays (or between today and the next stay) that is shorter
   // than the usual minimum stay can't be booked as things stand, so it gets a discount and a matching minimum.
@@ -193,14 +199,14 @@ export function recommend(db, roomId, { start, days = 365, today } = {}) {
   const nights = [];
   for (let d = start; d < end; d = addDays(d, 1)) {
     const cur = current.get(d);
-    if (cur?.booking) { nights.push({ date: d, booked: true, booking: cur.booking, current: cur.price }); continue; }
-    if (cur?.blocked) { nights.push({ date: d, blocked: true, current: cur.price }); continue; }
+    if (cur?.booking) { nights.push({ date: d, booked: true, booking: cur.booking, current: cur.price, demand: demandOf(d), event: eventOn(d)?.name || null }); continue; }
+    if (cur?.blocked) { nights.push({ date: d, blocked: true, current: cur.price, demand: demandOf(d), event: eventOn(d)?.name || null }); continue; }
     const wd = new Date(d + 'T00:00:00Z').getUTCDay(), mo = +d.slice(5, 7) - 1;
     const factors = [{ label: 'Base price', value: s.base }];
     const pct = (label, p) => { if (p) factors.push({ label, pct: Math.round(p * 10) / 10 }); };
     pct(DAY_NAMES[wd], s.dow[wd]);
     pct(MONTH_NAMES[mo], s.season[mo]);
-    const ev = events.filter(e => e.start_date <= d && e.end_date >= d).sort((a, b) => b.pct - a.pct)[0];
+    const ev = eventOn(d);
     if (ev) pct(`Event: ${ev.name}`, ev.pct);
     const p = pace[d.slice(0, 7)];
     if (p && p.lastYear != null) {
@@ -208,6 +214,8 @@ export function recommend(db, roomId, { start, days = 365, today } = {}) {
       const adj = Math.max(-s.pacingMax, Math.min(s.pacingMax, diffPts * 0.25));
       if (Math.abs(adj) >= 1) pct(`Pace: ${Math.round(p.now * 100)}% booked vs ${Math.round(p.lastYear * 100)}% this time last year`, adj);
     }
+    const df = signals.factor(d);
+    if (df) pct(df.label, df.pct);
     const out = diffDays(today, d);
     if (s.lastMinuteDays && out < s.lastMinuteDays) pct(`Last-minute (${out === 0 ? 'tonight' : out + ' day' + (out === 1 ? '' : 's') + ' out'})`, s.lastMinutePct * (1 - out / s.lastMinuteDays));
     if (s.farOutPct && out >= s.farOutDays) pct(`Booking far ahead (${out} days out)`, s.farOutPct);
@@ -221,9 +229,11 @@ export function recommend(db, roomId, { start, days = 365, today } = {}) {
     price = Math.max(1, roundTo(price, s.rounding || 1));
     const minStay = gap ? gap : Math.max(s.minStay, ev?.min_stay || 0);
     nights.push({ date: d, price, minStay, factors, notes, event: ev?.name || null, gap: gap || null,
-      current: cur?.price ?? null, currentMinStay: cur?.minStay ?? null });
+      current: cur?.price ?? null, currentMinStay: cur?.minStay ?? null, demand: demandOf(d) });
   }
-  return { settings: s, nights, pace };
+  return { settings: s, nights, pace, signals: {
+    asked: signals.asked.rows, pickup: signals.pickup.rows, usualLead: signals.pickup.usual, pickupThreshold: signals.pickup.threshold,
+    historyNights: signals.baseline.nights } };
 }
 
 /** Nights where the recommendation differs enough from what Beds24 has to be worth sending. */
