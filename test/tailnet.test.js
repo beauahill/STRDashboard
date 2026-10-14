@@ -20,6 +20,7 @@ async function fakeProxy(t, seen = []) {
     seen.push(req.url);
     const [name, port] = [req.url.slice(0, req.url.lastIndexOf(':')), req.url.slice(req.url.lastIndexOf(':') + 1)];
     if (name.startsWith('nowhere')) { client.end('HTTP/1.1 502 Bad Gateway\r\n\r\nno route to host'); return; }
+    if (name.startsWith('hang')) return;   // like a dial that never completes
     const up = connect(Number(port), '127.0.0.1', () => { client.write('HTTP/1.1 200 OK\r\n\r\n'); up.write(head); up.pipe(client); client.pipe(up); });
     up.on('error', () => client.destroy());
     client.on('error', () => up.destroy());
@@ -68,7 +69,17 @@ test('proxyFetch: requests go through the CONNECT proxy with headers, body and s
 
   await assert.rejects(proxyFetch(proxy, `http://nowhere.tail1ebd8f.ts.net:${haPort}/`), /Tailscale couldn't reach nowhere\.tail1ebd8f\.ts\.net.*no route to host/);
   await assert.rejects(proxyFetch({ host: '127.0.0.1', port: 1 }, `${url}/`), /Tailscale's proxy isn't answering \(ECONNREFUSED\)/);
-  await assert.rejects(proxyFetch(proxy, `${url}/slow`, { signal: AbortSignal.timeout(150) }), e => e.name === 'TimeoutError');
+  await assert.rejects(proxyFetch(proxy, `${url}/slow`, { signal: AbortSignal.timeout(150) }), e => e.name === 'TimeoutError' && e.phase === 'waiting for Home Assistant to answer');
+  await assert.rejects(proxyFetch(proxy, `http://hang.tail1ebd8f.ts.net:${haPort}/`, { signal: AbortSignal.timeout(150) }), e => e.name === 'TimeoutError' && e.phase === 'connecting through Tailscale');
+  await assert.rejects(new HAClient(`http://hang.tail1ebd8f.ts.net:${haPort}`, 'x', (u, o) => proxyFetch(proxy, u, { ...o, signal: AbortSignal.timeout(150) })).config(),
+    /Couldn't reach Home Assistant at http:\/\/hang\.tail1ebd8f\.ts\.net:\d+ \(timed out connecting through Tailscale\)/);
+
+  // `via`: connect to an address, but keep the name for the Host header.
+  seen.length = 0;
+  const v = await proxyFetch(proxy, `${url}/api/via`, { via: '127.0.0.1' });
+  assert.equal(v.status, 200);
+  assert.deepEqual(seen, [`127.0.0.1:${haPort}`]);
+  assert.equal(log.at(-1).host, `homeassistant.tail1ebd8f.ts.net:${haPort}`);
 });
 
 const hasOpenssl = (() => { try { execFileSync('openssl', ['version'], { stdio: 'ignore' }); return true; } catch { return false; } })();
@@ -82,6 +93,8 @@ test('proxyFetch: https through the tunnel checks the certificate against the na
   const proxy = { host: '127.0.0.1', port: await fakeProxy(t) };
   const r = await proxyFetch(proxy, `https://homeassistant.tail1ebd8f.ts.net:${haPort}/api/`, { ca: cert });
   assert.deepEqual(await r.json(), { secure: true });
+  const byIp = await proxyFetch(proxy, `https://homeassistant.tail1ebd8f.ts.net:${haPort}/api/`, { ca: cert, via: '127.0.0.1' });
+  assert.deepEqual(await byIp.json(), { secure: true }, 'connecting by IP still checks the certificate against the name');
   await assert.rejects(proxyFetch(proxy, `https://homeassistant.tail1ebd8f.ts.net:${haPort}/api/`), /SELF_SIGNED|self[- ]signed|unable to verify/i, 'an untrusted certificate is refused');
   await assert.rejects(proxyFetch(proxy, `https://other.tail1ebd8f.ts.net:${haPort}/api/`, { ca: cert }), /altnames|does not match|ERR_TLS_CERT_ALTNAME_INVALID/i, 'the name must match');
 });
@@ -113,13 +126,14 @@ function fakeTailscale({ statuses, upFails } = {}) {
   };
   return { spawn, cli, calls, children };
 }
-const running = { BackendState: 'Running', Self: { DNSName: 'str-dashboard.tail1ebd8f.ts.net.', TailscaleIPs: ['fd7a:115c:a1e0::9', '100.90.1.2'] }, CurrentTailnet: { Name: 'beau@example.com' }, Health: [] };
+const running = { BackendState: 'Running', Self: { DNSName: 'str-dashboard.tail1ebd8f.ts.net.', TailscaleIPs: ['fd7a:115c:a1e0::9', '100.90.1.2'] }, CurrentTailnet: { Name: 'beau@example.com' }, Health: [],
+  Peer: { 'nodekey:abc': { DNSName: 'HomeAssistant-Laradise.tail1ebd8f.ts.net.', HostName: 'homeassistant', TailscaleIPs: ['fd7a:115c:a1e0::7', '100.105.116.108'] } } };
 
 test('Tailscale: starts in userspace mode, signs in once with the key from a temporary file, then routes tailnet requests', async t => {
   const dataDir = mkdtempSync(join(tmpdir(), 'tailnet-'));
   const fake = fakeTailscale({ statuses: [{ BackendState: 'NeedsLogin' }, running] });
-  const log = [];
-  const proxyPort = await fakeProxy(t), haPort = await fakeHA(t, log);
+  const log = [], seen = [];
+  const proxyPort = await fakeProxy(t, seen), haPort = await fakeHA(t, log);
   assert.equal(startTailnet({ authKey: '', dataDir }), null, 'nothing runs without TS_AUTHKEY');
   const ctl = startTailnet({ authKey: 'tskey-auth-test123', hostname: 'str-dashboard', dataDir, proxyPort, socket: '/tmp/x.sock', spawn: fake.spawn, cli: fake.cli, checkEvery: 60000, restartAfter: 10 });
   t.after(() => ctl?.stop());
@@ -146,6 +160,13 @@ test('Tailscale: starts in userspace mode, signs in once with the key from a tem
   assert.deepEqual(r, { ok: true, path: '/api/config' });
   assert.equal(log.at(-1).host, `homeassistant.tail1ebd8f.ts.net:${haPort}`);
   assert.deepEqual(await new HAClient(`http://127.0.0.1:${haPort}`, 'tok').config(), { ok: true, path: '/api/config' }, 'a non-tailnet address is fetched directly');
+
+  // A machine Tailscale lists is reached at its IPv4 address (not left to the proxy's name lookup), by full or short name.
+  seen.length = 0;
+  await new HAClient(`http://homeassistant-laradise.tail1ebd8f.ts.net:${haPort}`, 'tok').config();
+  await new HAClient(`http://homeassistant-laradise:${haPort}`, 'tok').config();
+  assert.deepEqual(seen, [`100.105.116.108:${haPort}`, `100.105.116.108:${haPort}`]);
+  assert.equal(log.at(-2).host, `homeassistant-laradise.tail1ebd8f.ts.net:${haPort}`, 'the name is still sent as the Host');
 
   // Already signed in: later checks don't sign in again.
   await ctl.check();

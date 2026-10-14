@@ -48,7 +48,8 @@ export class HAClient {
         throw err(`Couldn't find ${host}: that's a Tailscale address, which only works inside your Tailscale network. `
           + 'Add a Tailscale auth key to the dashboard (TS_AUTHKEY, see DEPLOY.md section 9), or turn on Tailscale Funnel for it.', 502);
       }
-      throw err(`Couldn't reach Home Assistant at ${this.url} (${e.name === 'TimeoutError' ? 'timed out' : e.cause?.code || e.message}).`, 502);
+      const why = e.name === 'TimeoutError' ? (e.phase ? `timed out ${e.phase}` : 'timed out') : e.cause?.code || e.message;
+      throw err(`Couldn't reach Home Assistant at ${this.url} (${why}).`, 502);
     }
     if (res.status === 401 || res.status === 403) throw err('Home Assistant rejected the access token.');
     if (!res.ok) {
