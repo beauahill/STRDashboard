@@ -1,4 +1,5 @@
 import { request as httpRequest } from 'node:http';
+import { connect } from 'node:net';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -26,6 +27,9 @@ function start(env) {
 }
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'str-'));
+// Every write to /api/* must say it's JSON (a browser can't send that cross-site without a preflight).
+const JSON_H = { 'content-type': 'application/json' };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 test('password-protected server: health, login, lockout, logout', async t => {
   const s = start({ APP_PASSWORD: 'hunter2', DB_PATH: join(tmp(), 'db.sqlite') });
@@ -60,7 +64,7 @@ test('password-protected server: health, login, lockout, logout', async t => {
   });
   assert.match(secure.headers.get('set-cookie'), /; Secure/);
 
-  const out = await fetch(s.url('/api/logout'), { method: 'POST' });
+  const out = await fetch(s.url('/api/logout'), { method: 'POST', headers: JSON_H });
   assert.match(out.headers.get('set-cookie'), /Max-Age=0/);
 });
 
@@ -112,8 +116,8 @@ test('connecting to Beds24 clears demo data and blocks reloading it', async t =>
   const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), BEDS24_BASE: `http://127.0.0.1:${beds.address().port}` });
   t.after(() => s.child.kill());
   await s.ready;
-  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
-  const call = (path, method = 'GET', body) => fetch(s.url(path), { method, headers: { cookie: sid }, body: body && JSON.stringify(body) })
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (path, method = 'GET', body) => fetch(s.url(path), { method, headers: { cookie: sid, ...JSON_H }, body: body && JSON.stringify(body) })
     .then(async r => ({ status: r.status, json: await r.json() }));
 
   assert.equal((await call('/api/demo', 'POST')).status, 200);
@@ -143,7 +147,7 @@ test('on startup, demo data left next to a Beds24 connection is removed', async 
   const s = start({ APP_PASSWORD: 'pw', DB_PATH: path });
   t.after(() => s.child.kill());
   await s.ready;
-  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
   assert.deepEqual(await (await fetch(s.url('/api/properties'), { headers: { cookie: sid } })).json(), []);
 });
 
@@ -151,8 +155,8 @@ test('Guesty import endpoints: preview, import, bad file, remove', async t => {
   const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite') });
   t.after(() => s.child.kill());
   await s.ready;
-  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
-  const call = (path, body) => fetch(s.url(path), { method: 'POST', headers: { cookie: sid }, body: JSON.stringify(body) })
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (path, body) => fetch(s.url(path), { method: 'POST', headers: { cookie: sid, ...JSON_H }, body: JSON.stringify(body) })
     .then(async r => ({ status: r.status, json: await r.json() }));
   const csv = 'CHECK-IN,CHECK-OUT,CONFIRMATION CODE,LISTING,GUEST,STATUS,SOURCE,ACCOMMODATION FARE\n' +
     '2025-06-01,2025-06-04,GY-1,Laramie House,Pat,Confirmed,Airbnb,450\n2025-07-01,2025-07-02,GY-2,Laramie House,Ina,Inquiry,Airbnb,\n';
@@ -216,8 +220,8 @@ async function connectedApp(t, scopes) {
   const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), BEDS24_BASE: `http://127.0.0.1:${beds.srv.address().port}` });
   t.after(() => s.child.kill());
   await s.ready;
-  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
-  const call = (path, body) => fetch(s.url(path), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (path, body) => fetch(s.url(path), { method: body ? 'POST' : 'GET', headers: { cookie: sid, ...JSON_H }, body: body && JSON.stringify(body) })
     .then(async r => ({ status: r.status, json: await r.json() }));
   assert.equal((await call('/api/connect', { inviteCode: 'abc' })).status, 200);
   return { call, posts: beds.posts };
@@ -278,6 +282,7 @@ function fakeSeamServer() {
     const body = raw ? JSON.parse(raw) : {};
     calls.push({ path: req.url, auth: req.headers.authorization, body });
     const send = (status, b) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(b)); };
+    if (req.headers.authorization === 'Bearer seam_emptykey_1111111') return send(200, { devices: [] });   // a key for another, empty workspace
     if (req.headers.authorization !== 'Bearer seam_testkey_1234567') return send(401, { error: { type: 'unauthorized', message: 'bad key' } });
     switch (req.url) {
       case '/devices/list': return send(200, { devices: [
@@ -315,8 +320,8 @@ test('Locks: connect Seam, assign locks, automatic guest codes, change a Yale-ap
   const s = start({ APP_PASSWORD: 'pw', DB_PATH: path, SEAM_BASE: `http://127.0.0.1:${seam.srv.address().port}` });
   t.after(() => s.child.kill());
   await s.ready;
-  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
-  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid, ...JSON_H }, body: body && JSON.stringify(body) })
     .then(async r => ({ status: r.status, json: await r.json() }));
 
   assert.equal((await call('/api/locks')).json.configured, false);
@@ -356,6 +361,16 @@ test('Locks: connect Seam, assign locks, automatic guest codes, change a Yale-ap
 
   assert.equal((await call('/api/locks/connect', {})).json.url, 'https://connect.getseam.com/cw/abc');
   assert.equal((await call('/api/locks/settings', { checkin: 'noon' })).status, 400);
+  // A wrong key (rejected by Seam, or one that lists no locks) can't wipe the working connection.
+  for (const apiKey of ['seam_wrongkey_0000000', 'seam_emptykey_1111111']) {
+    assert.equal((await call('/api/locks/key', { apiKey })).status, 400, apiKey);
+    assert.equal((await call('/api/locks')).json.keyHint, '…4567', `the working key stays after ${apiKey}`);
+  }
+  assert.equal((await call('/api/locks')).json.locks.length, 2, 'and so do its locks');
+  // Changing a Yale-app code to a guest's code would swap it from under them.
+  const taken = await call('/api/locks/code/change', { entries: cleaner.locks, code: '777888' });
+  assert.equal(taken.status, 400);
+  assert.match(taken.json.error, /Pat.*door code/);
 });
 
 /** Fake Beds24 with a message log (GET/POST/PATCH /bookings/messages). */
@@ -395,8 +410,8 @@ test('Inbox: messages sync, unread badge, open marks read, reply sends, polling 
   const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), BEDS24_BASE: `http://127.0.0.1:${beds.srv.address().port}` });
   t.after(() => s.child.kill());
   await s.ready;
-  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
-  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid, ...JSON_H }, body: body && JSON.stringify(body) })
     .then(async r => ({ status: r.status, json: await r.json() }));
   assert.equal((await call('/api/connect', { inviteCode: 'abc' })).status, 200);
 
@@ -444,7 +459,7 @@ test('Turno feed URL works without login, only with the right secret, and stops 
   const s = start({ APP_PASSWORD: 'pw', DB_PATH: path });
   t.after(() => s.child.kill());
   await s.ready;
-  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
   const cl = await (await fetch(s.url('/api/cleaning'), { headers: { cookie: sid } })).json();
   const feedPath = new URL(cl.feeds[0].url).pathname;
   const ok = await fetch(s.url(feedPath));
@@ -453,7 +468,7 @@ test('Turno feed URL works without login, only with the right secret, and stops 
   assert.match(await ok.text(), /SUMMARY:Reserved \(2 guests\)/);
   assert.equal((await fetch(s.url(feedPath.replace(/\/cal\/[^/]+/, '/cal/wrongwrongwrongwrongwrong')))).status, 404);
   assert.equal((await fetch(s.url('/api/cleaning'))).status, 401, 'the cleaning page itself still needs login');
-  await fetch(s.url('/api/cleaning/regenerate'), { method: 'POST', headers: { cookie: sid } });
+  await fetch(s.url('/api/cleaning/regenerate'), { method: 'POST', headers: { cookie: sid, ...JSON_H } });
   assert.equal((await fetch(s.url(feedPath))).status, 404, 'old link stops working');
 });
 
@@ -463,8 +478,8 @@ test('Automations: a due message for a newly synced booking is sent through Beds
   const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), BEDS24_BASE: `http://127.0.0.1:${beds.srv.address().port}` });
   t.after(() => s.child.kill());
   await s.ready;
-  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
-  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid, ...JSON_H }, body: body && JSON.stringify(body) })
     .then(async r => ({ status: r.status, json: await r.json() }));
 
   const list = (await call('/api/automations')).json;
@@ -520,8 +535,8 @@ for (const [label, scopes, canSave] of [['write access', ['all:properties', 'all
     const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), BEDS24_BASE: `http://127.0.0.1:${beds.srv.address().port}` });
     t.after(() => s.child.kill());
     await s.ready;
-    const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
-    const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+    const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+    const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid, ...JSON_H }, body: body && JSON.stringify(body) })
       .then(async r => ({ status: r.status, json: await r.json() }));
     await call('/api/connect', { inviteCode: 'abc' });
     const L = (await call('/api/listing')).json;
@@ -549,8 +564,8 @@ test('Analytics and AI assistant over HTTP: key stays on the server, answers com
   const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), ANTHROPIC_BASE_URL: ai.url });
   t.after(() => s.child.kill());
   await s.ready;
-  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
-  const call = (path, method = 'GET', body) => fetch(s.url(path), { method, headers: { cookie: sid }, body: body && JSON.stringify(body) })
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (path, method = 'GET', body) => fetch(s.url(path), { method, headers: { cookie: sid, ...JSON_H }, body: body && JSON.stringify(body) })
     .then(async r => ({ status: r.status, json: await r.json() }));
   assert.equal((await call('/api/demo', 'POST')).status, 200);
 
@@ -597,8 +612,8 @@ test('Phone notifications: test message, then a new guest message is pushed to n
   const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), BEDS24_BASE: `http://127.0.0.1:${beds.srv.address().port}`, RAILWAY_PUBLIC_DOMAIN: 'str.example.app' });
   t.after(() => s.child.kill());
   await s.ready;
-  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
-  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid, ...JSON_H }, body: body && JSON.stringify(body) })
     .then(async r => ({ status: r.status, json: await r.json() }));
   assert.equal((await call('/api/connect', { inviteCode: 'abc' })).status, 200);
 
@@ -653,8 +668,8 @@ test('Smart home over HTTP: connect Home Assistant, status without the token, au
   const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite') });
   t.after(() => s.child.kill());
   await s.ready;
-  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
-  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid, ...JSON_H }, body: body && JSON.stringify(body) })
     .then(async r => ({ status: r.status, json: await r.json() }));
   assert.equal((await call('/api/demo', {})).status, 200);
   assert.equal((await call('/api/home')).json.configured, false);
@@ -687,8 +702,8 @@ test('Direct booking site: hidden until switched on, preview for the owner, live
   const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite') });
   t.after(() => s.child.kill());
   await s.ready;
-  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
-  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid, ...JSON_H }, body: body && JSON.stringify(body) })
     .then(async r => ({ status: r.status, json: await r.json() }));
   assert.equal((await call('/api/demo', {})).status, 200);
   const site = (await call('/api/site')).json;
@@ -721,8 +736,8 @@ test('Guidebook over HTTP: private link, online check-in for direct guests, ID o
   const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), RAILWAY_PUBLIC_DOMAIN: 'str.example.app' });
   t.after(() => s.child.kill());
   await s.ready;
-  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
-  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid, ...JSON_H }, body: body && JSON.stringify(body) })
     .then(async r => ({ status: r.status, json: await r.json() }));
   assert.equal((await call('/api/demo', {})).status, 200);
   const g = (await call('/api/guide')).json;
@@ -756,8 +771,8 @@ test('Money over HTTP: profit and loss, expenses with receipts (owner only), pay
   const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite') });
   t.after(() => s.child.kill());
   await s.ready;
-  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
-  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid, ...JSON_H }, body: body && JSON.stringify(body) })
     .then(async r => ({ status: r.status, json: await r.json() }));
   assert.equal((await call('/api/demo', {})).status, 200);
   const before = (await call('/api/money')).json;
@@ -791,8 +806,8 @@ test('Pricing over HTTP: demand numbers, event scout scan, adding and dismissing
   const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite'), ANTHROPIC_BASE_URL: ai.url });
   t.after(() => s.child.kill());
   await s.ready;
-  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
-  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid }, body: body && JSON.stringify(body) })
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid, ...JSON_H }, body: body && JSON.stringify(body) })
     .then(async r => ({ status: r.status, json: await r.json() }));
   assert.equal((await call('/api/demo', {})).status, 200);
   const room = (await call('/api/pricing')).json.room.id;
@@ -838,7 +853,7 @@ test('a request body is decoded whole: an accented letter split across two netwo
   const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite') });
   t.after(() => s.child.kill());
   await s.ready;
-  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
   const body = Buffer.from(JSON.stringify({ title: 'Café', body: 'Bienvenue au café, à bientôt' }));
   const cut = body.indexOf(Buffer.from('é')) + 1;   // in the middle of the two bytes of "é"
   await new Promise((ok, no) => {
@@ -851,4 +866,169 @@ test('a request body is decoded whole: an accented letter split across two netwo
   });
   const replies = await fetch(s.url('/api/replies'), { headers: { cookie: sid } }).then(r => r.json());
   assert.ok(replies.some(r => r.title === 'Café' && r.body === 'Bienvenue au café, à bientôt'));
+});
+
+// ---------- Second review: login wall, session revocation, bodies, static errors, cross-site writes, boot sync ----------
+
+test('login: a hundred wrong passwords from a hundred addresses slow guessing down but never lock the owner out', async t => {
+  const s = start({ APP_PASSWORD: 'hunter2', DB_PATH: join(tmp(), 'db.sqlite') });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const login = (password, ip) => fetch(s.url('/api/login'), { method: 'POST', headers: { ...JSON_H, 'x-forwarded-for': ip }, body: JSON.stringify({ password }) });
+  const codes = await Promise.all(Array.from({ length: 100 }, (_, i) => login('nope', `10.0.0.${i}`).then(r => r.status)));
+  assert.ok(codes.every(c => c === 401));
+  let t0 = Date.now();
+  assert.equal((await login('hunter2', '192.0.2.1')).status, 200, 'the right password gets in whatever the rest of the internet is doing');
+  assert.ok(Date.now() - t0 < 1000, 'and without waiting');
+  t0 = Date.now();
+  assert.equal((await login('nope', '192.0.2.2')).status, 401);
+  assert.ok(Date.now() - t0 >= 1400, 'wrong answers are slowed down while guessing is heavy');
+});
+
+test('logging out revokes the cookie; "sign out everywhere" revokes every session', async t => {
+  const s = start({ APP_PASSWORD: 'hunter2', DB_PATH: join(tmp(), 'db.sqlite') });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const login = () => fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"hunter2"}' }).then(r => r.headers.get('set-cookie').split(';')[0]);
+  const status = sid => fetch(s.url('/api/status'), { headers: { cookie: sid } }).then(r => r.status);
+  const post = (p, sid) => fetch(s.url(p), { method: 'POST', headers: { ...JSON_H, cookie: sid } });
+  const sid = await login();
+  assert.equal(await status(sid), 200);
+  const out = await post('/api/logout', sid);
+  assert.equal(out.status, 200);
+  assert.match(out.headers.get('set-cookie'), /Max-Age=0/);
+  assert.equal(await status(sid), 401, 'a copied cookie is useless after logout');
+  const a = await login(), b = await login();
+  assert.equal(await status(a), 200); assert.equal(await status(b), 200);
+  assert.equal((await post('/api/logout-all', a)).status, 200);
+  assert.equal(await status(a), 401); assert.equal(await status(b), 401);
+  assert.equal((await post('/api/logout-all', b)).status, 401, 'needs a live session');
+});
+
+/** One raw HTTP request over a socket: the first response line, and how much of a body was written before it came. */
+function rawRequest(s, head, { total = 0, chunked = false, timeout = 1000 } = {}) {
+  return new Promise((ok, no) => {
+    const sock = connect(Number(new URL(s.url('/')).port), '127.0.0.1');
+    let reply = '', written = 0;
+    const timer = setTimeout(() => { sock.destroy(); no(new Error(`no reply within ${timeout} ms`)); }, timeout);
+    sock.on('error', () => {});
+    sock.on('data', d => { reply += d; if (reply.includes('\r\n')) { clearTimeout(timer); sock.destroy(); ok({ line: reply.split('\r\n')[0], written }); } });
+    sock.on('connect', async () => {
+      sock.write(head);
+      const data = Buffer.alloc(65536, 0x20);
+      const chunk = chunked ? Buffer.concat([Buffer.from(data.length.toString(16) + '\r\n'), data, Buffer.from('\r\n')]) : data;
+      while (written < total && !reply && !sock.destroyed) {
+        if (!sock.write(chunk)) await new Promise(r => { sock.once('drain', r); sock.once('close', r); });
+        written += data.length;
+      }
+      if (chunked && !reply && !sock.destroyed) sock.write('0\r\n\r\n');
+    });
+  });
+}
+
+test('bodies: null, arrays, bad dates and oversized uploads are clean 4xx answers, never a crash or a swallowed upload', async t => {
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite') });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const post = (p, body, extra = {}) => fetch(s.url(p), { method: 'POST', headers: { ...JSON_H, cookie: sid, ...extra }, body }).then(async r => ({ status: r.status, json: await r.json() }));
+  const nul = await post('/api/login', 'null', { cookie: '' });
+  assert.equal(nul.status, 400);
+  assert.match(nul.json.error, /JSON object/);
+  for (const body of ['null', '[1]', '"x"', '12']) assert.equal((await post('/api/connect', body)).status, 400, body);
+  assert.equal((await post('/api/automations/skip', '{}')).status, 400);
+  assert.equal((await post('/api/locks/assign', '{}')).status, 400);
+  for (const p of ['/api/calendar?start=garbage', '/api/rates?start=2026-13-45', '/api/pricing?start=2026-02-30', '/api/bookings?from=yesterday']) {
+    assert.equal((await fetch(s.url(p), { headers: { cookie: sid } })).status, 400, p);
+  }
+  assert.equal((await fetch(s.url('/api/calendar?start=2026-02-28'), { headers: { cookie: sid } })).status, 200);
+  const up = await rawRequest(s, 'POST /api/login HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 5000000000\r\n\r\n');
+  assert.match(up.line, /^HTTP\/1\.1 413/, 'a 5 GB Content-Length is refused before any of it is read');
+  const total = 64 * 1024 * 1024;   // well past what loopback buffers absorb before the client has to yield
+  const mid = await rawRequest(s, 'POST /api/login HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n', { total, chunked: true, timeout: 5000 });
+  assert.match(mid.line, /^HTTP\/1\.1 413/);
+  assert.ok(mid.written < total, `answered after ${mid.written} bytes, not after all ${total}`);
+  assert.equal((await fetch(s.url('/healthz'))).status, 200, 'still up');
+  assert.ok(!/Cannot destructure|Invalid time value|TypeError|RangeError/.test(s.output()), `nothing crashed:\n${s.output()}`);
+});
+
+test('static files: a path with a trailing slash is a plain 404, not a 500 that names the install directory', async t => {
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite') });
+  t.after(() => s.child.kill());
+  await s.ready;
+  for (const p of ['/icon.svg/', '/app.js/x', '/style.css/']) {
+    const r = await fetch(s.url(p));
+    assert.equal(r.status, 404, p);
+    assert.ok(!(await r.text()).includes('/home'), `no install path in the answer to ${p}`);
+  }
+  assert.ok(!s.output().includes('ENOTDIR'), `nothing logged as an error:\n${s.output()}`);
+});
+
+test('no-password mode: cross-site writes are refused and the API only answers to localhost', async t => {
+  const s = start({ DB_PATH: join(tmp(), 'db.sqlite') });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const port = new URL(s.url('/')).port;
+  const post = (headers, title) => fetch(s.url('/api/replies'), { method: 'POST', headers, body: JSON.stringify({ title, body: 'x' }) }).then(r => r.status);
+  assert.equal(await post({ 'content-type': 'text/plain', origin: 'https://evil.example' }, 'planted'), 415, 'a "simple" cross-site POST');
+  assert.equal(await post({ ...JSON_H, origin: 'https://evil.example' }, 'planted2'), 403, 'JSON from another site');
+  assert.equal(await post({ ...JSON_H, origin: `http://127.0.0.1:${port}` }, 'own'), 200, 'the app itself');
+  assert.equal(await post(JSON_H, 'own2'), 200, 'and a client that sends no Origin');
+  const titles = (await (await fetch(s.url('/api/replies'))).json()).map(r => r.title);
+  assert.ok(!titles.some(x => x.startsWith('planted')) && titles.includes('own') && titles.includes('own2'), JSON.stringify(titles));
+  const rebind = await new Promise((ok, no) => httpRequest({ host: '127.0.0.1', port, path: '/api/status', headers: { host: 'attacker.example' } }, r => { r.resume(); ok(r.statusCode); }).on('error', no).end());
+  assert.equal(rebind, 403, 'a page that rebound its DNS to 127.0.0.1 sees nothing');
+  assert.equal((await fetch(s.url('/api/status'))).status, 200);
+});
+
+test('HTTPS visitors get HSTS, and a short APP_PASSWORD is warned about at boot', async t => {
+  const s = start({ APP_PASSWORD: 'short', DB_PATH: join(tmp(), 'db.sqlite') });
+  t.after(() => s.child.kill());
+  await s.ready;
+  for (let i = 0; i < 40 && !/12 characters/.test(s.output()); i++) await sleep(25);
+  assert.match(s.output(), /APP_PASSWORD.*12 characters/);
+  assert.equal((await fetch(s.url('/healthz'))).headers.get('strict-transport-security'), null);
+  assert.equal((await fetch(s.url('/healthz'), { headers: { 'x-forwarded-proto': 'https' } })).headers.get('strict-transport-security'), 'max-age=31536000');
+});
+
+/** Fake Beds24 that honours a stored refresh token and takes its time over the bookings list. */
+function fakeBeds24Slow(delay) {
+  const srv = createServer(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    const send = b => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(b)); };
+    if (u.pathname.endsWith('/authentication/token')) return send({ token: 't', expiresIn: 86400 });
+    if (u.pathname.endsWith('/authentication/setup')) return send({ token: 't', refreshToken: 'r', expiresIn: 86400 });
+    if (u.pathname.endsWith('/authentication/details')) return send({ token: { scopes: ['all:bookings'] } });
+    if (u.pathname.endsWith('/properties')) return send({ data: [{ id: 500, name: 'Laramie Retreat', roomTypes: [{ id: 600, name: 'Whole house', qty: 1 }] }], pages: {} });
+    if (u.pathname.endsWith('/bookings')) await sleep(delay);
+    send({ data: [], pages: {} });
+  });
+  return new Promise(ok => srv.listen(0, '127.0.0.1', () => ok(srv)));
+}
+
+test('a sync runs at boot, and Sync pressed while one is running is a 409, never a silent nothing', async t => {
+  const beds = await fakeBeds24Slow(2500);
+  t.after(() => beds.close());
+  const { openDb, setSetting } = await import('../server/db.js');
+  const path = join(tmp(), 'db.sqlite');
+  const db = openDb(path);
+  setSetting(db, 'beds24_refresh_token', 'r');
+  db.close();
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: path, BEDS24_BASE: `http://127.0.0.1:${beds.address().port}` });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', headers: JSON_H, body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const call = (p, body) => fetch(s.url(p), { method: body ? 'POST' : 'GET', headers: { cookie: sid, ...JSON_H }, body: body && JSON.stringify(body) })
+    .then(async r => ({ status: r.status, json: await r.json() }));
+  assert.equal((await call('/api/status')).json.syncing, true, 'syncing straight after boot');
+  const busy = await call('/api/sync', {});
+  assert.equal(busy.status, 409);
+  assert.match(busy.json.error, /already running/);
+  assert.equal((await call('/api/connect', { inviteCode: 'abc' })).status, 409);
+  for (let i = 0; i < 60 && (await call('/api/status')).json.syncing; i++) await sleep(100);
+  const st = (await call('/api/status')).json;
+  assert.equal(st.syncing, false);
+  assert.ok(st.lastSync, 'the boot sync finished and recorded itself');
+  assert.equal(st.lastSyncError, null);
+  assert.equal((await call('/api/sync', {})).status, 200, 'and a sync can run again');
 });

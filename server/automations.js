@@ -7,7 +7,7 @@
 //  - Each automation sends to each booking once (per date change for "dates changed").
 import { addDays } from './sync.js';
 import { doorSettings, zonedTimeToUtc } from './doors.js';
-import { templateVars, fillTemplate, sendMessage } from './messages.js';
+import { templateVars, fillTemplate, missingVars, sendMessage } from './messages.js';
 
 const userError = msg => Object.assign(new Error(msg), { status: 400 });
 const HOUR = 3600e3;
@@ -91,7 +91,9 @@ export function describe(a) {
 export function schedule(a, b, ds, eventAt = null) {
   const at = iso => new Date(iso);
   if (a.anchor === 'booked' || a.anchor === 'cancelled' || a.anchor === 'dates_changed') {
-    const base = a.anchor === 'booked' ? (b.booked_at || b.first_seen) : a.anchor === 'cancelled' ? (b.cancelled_at || b.modified_at) : eventAt;
+    // A request or inquiry becomes a booking when it's accepted (confirmed_at), however long after it was made. A
+    // cancellation without Beds24's cancel time has no reliable moment: an edit to an old cancelled row isn't one.
+    const base = a.anchor === 'booked' ? (b.confirmed_at || b.booked_at || b.first_seen) : a.anchor === 'cancelled' ? b.cancelled_at : eventAt;
     if (!base) return null;
     const when = new Date(Date.parse(base) + (a.delay_minutes || 0) * 60e3);
     return { when, expires: new Date(when.getTime() + 48 * HOUR) };
@@ -105,19 +107,28 @@ export function schedule(a, b, ds, eventAt = null) {
   return { when, expires };
 }
 
-const eligible = (a, b) => b.source === 'beds24' && b.id > 0 &&
-  (a.anchor === 'cancelled' ? b.status === 'cancelled' : ['confirmed', 'new'].includes(b.status)) &&
+// Beds24 also reports an expired inquiry and a declined request as 'cancelled': the cancellation message is only for a
+// booking this app once saw as a real stay (`stayed`). A booking that vanished from Beds24 ('deleted') is neither.
+const eligible = (a, b, stayed = () => false) => b.source === 'beds24' && b.id > 0 &&
+  (a.anchor === 'cancelled' ? b.status === 'cancelled' && stayed(b) : ['confirmed', 'new'].includes(b.status)) &&
   (!a.channels || a.channels.includes(b.channel)) && (!a.min_nights || b.nights >= a.min_nights);
 
-/** Record date changes since the last run (the first sighting of a booking just takes a snapshot). */
+/**
+ * Record date changes since the last run, and the moment a request or inquiry is accepted (the first sighting of a
+ * booking just takes a snapshot). Snapshots from before statuses were recorded only ever covered stays.
+ */
 function detectDateChanges(db, now) {
   const changes = [];
   const snap = db.prepare('SELECT * FROM booking_snapshots WHERE booking_id = ?');
-  const put = db.prepare('INSERT OR REPLACE INTO booking_snapshots(booking_id, arrival, departure) VALUES(?,?,?)');
-  for (const b of db.prepare("SELECT id, arrival, departure FROM bookings WHERE source = 'beds24' AND status IN ('confirmed','new')").all()) {
+  const put = db.prepare('INSERT OR REPLACE INTO booking_snapshots(booking_id, arrival, departure, status) VALUES(?,?,?,?)');
+  const confirm = db.prepare('UPDATE bookings SET confirmed_at = ? WHERE id = ?');
+  const isStay = st => ['confirmed', 'new'].includes(st);
+  for (const b of db.prepare("SELECT id, arrival, departure, status FROM bookings WHERE source = 'beds24' AND status IN ('confirmed','new','request','inquiry')").all()) {
     const s = snap.get(b.id);
-    if (s && (s.arrival !== b.arrival || s.departure !== b.departure)) changes.push({ bookingId: b.id, key: `${b.arrival}|${b.departure}`, at: now.toISOString() });
-    if (!s || s.arrival !== b.arrival || s.departure !== b.departure) put.run(b.id, b.arrival, b.departure);
+    const moved = !!s && (s.arrival !== b.arrival || s.departure !== b.departure), wasStay = !!s && (!s.status || isStay(s.status));
+    if (moved && wasStay && isStay(b.status)) changes.push({ bookingId: b.id, key: `${b.arrival}|${b.departure}`, at: now.toISOString() });
+    if (s && !wasStay && isStay(b.status)) confirm.run(now.toISOString(), b.id);
+    if (!s || moved || s.status !== b.status) put.run(b.id, b.arrival, b.departure, b.status);
   }
   return changes;
 }
@@ -132,6 +143,8 @@ export async function runAutomations(db, client, now = new Date(), send = (booki
   const changes = detectDateChanges(db, now);
   if (!autos.length) return result;
   const ds = doorSettings(db);
+  const wasStay = db.prepare("SELECT 1 FROM booking_snapshots WHERE booking_id = ? AND (status IS NULL OR status IN ('confirmed','new'))");
+  const stayed = b => !!b.confirmed_at || !!wasStay.get(b.id);
   const getSend = db.prepare('SELECT * FROM automation_sends WHERE automation_id = ? AND booking_id = ? AND key = ?');
   const putSend = db.prepare(`INSERT INTO automation_sends(automation_id,booking_id,key,status,scheduled_at,sent_at,error,body,updated_at) VALUES(?,?,?,?,?,?,?,?,?)
     ON CONFLICT(automation_id,booking_id,key) DO UPDATE SET status=excluded.status, scheduled_at=excluded.scheduled_at, sent_at=excluded.sent_at,
@@ -143,7 +156,7 @@ export async function runAutomations(db, client, now = new Date(), send = (booki
   const horizon = addDays(today, 32), past = addDays(today, -35), recent = addDays(today, -4);
   const bookings = db.prepare(`SELECT b.*, p.name property_name FROM bookings b LEFT JOIN properties p ON p.id = b.property_id
     WHERE b.source = 'beds24' AND b.id > 0 AND ((b.departure >= ? AND b.arrival <= ?)
-      OR substr(COALESCE(b.booked_at, b.first_seen, ''), 1, 10) >= ? OR substr(COALESCE(b.cancelled_at, b.modified_at, ''), 1, 10) >= ?)`)
+      OR substr(COALESCE(b.confirmed_at, b.booked_at, b.first_seen, ''), 1, 10) >= ? OR substr(COALESCE(b.cancelled_at, ''), 1, 10) >= ?)`)
     .all(past, horizon, recent, recent);
   const byId = new Map(bookings.map(b => [b.id, b]));
   const oneBooking = db.prepare('SELECT b.*, p.name property_name FROM bookings b LEFT JOIN properties p ON p.id = b.property_id WHERE b.id = ?');
@@ -170,7 +183,7 @@ export async function runAutomations(db, client, now = new Date(), send = (booki
       }
     } else jobs = bookings.map(b => ({ b, key: '' }));
     for (const { b, key, eventAt } of jobs) {
-      if (!eligible(a, b)) continue;
+      if (!eligible(a, b, stayed)) continue;
       const prev = getSend.get(a.id, b.id, key);
       if (prev && ['sent', 'failed', 'skipped'].includes(prev.status)) continue;
       const sch = schedule(a, b, ds, eventAt);
@@ -185,8 +198,8 @@ export async function runAutomations(db, client, now = new Date(), send = (booki
         if (prev) { putSend.run(a.id, b.id, key, 'failed', when, null, `Not sent before its deadline${prev.error ? ': ' + prev.error : ''}`, prev.body, stamp); result.failed++; }
         continue;
       }
-      const text = fillTemplate(a.body, templateVars(db, b));
-      const missing = [...new Set([...text.matchAll(/\{(\w+)\}/g)].map(m => m[1]))];
+      const vars = templateVars(db, b);
+      const text = fillTemplate(a.body, vars), missing = missingVars(a.body, vars);
       if (missing.length) {
         putSend.run(a.id, b.id, key, 'waiting', when, null, `Waiting for: ${missing.map(m => `{${m}}`).join(', ')}`, null, stamp);
         result.waiting++;
@@ -222,9 +235,9 @@ export function upcoming(db, now = new Date(), days = 14) {
       const sch = schedule(a, b, ds);
       if (sch.when > end || now > sch.expires) continue;
       if (sch.when < new Date(a.enabled_at || 0)) continue;
-      const text = fillTemplate(a.body, templateVars(db, b));
+      const vars = templateVars(db, b);
       out.push({ automationId: a.id, automation: a.name, bookingId: b.id, guest: b.guest_name, channel: b.channel,
-        when: sch.when.toISOString(), status: done?.status || 'scheduled', missing: [...text.matchAll(/\{(\w+)\}/g)].map(m => m[1]), preview: text });
+        when: sch.when.toISOString(), status: done?.status || 'scheduled', missing: missingVars(a.body, vars), preview: fillTemplate(a.body, vars) });
     }
   }
   return out.sort((x, y) => x.when.localeCompare(y.when));
@@ -243,6 +256,6 @@ export const history = (db, limit = 50) => db.prepare(`SELECT s.*, a.name automa
 export function previewFor(db, body, bookingId) {
   const b = db.prepare('SELECT b.*, p.name property_name FROM bookings b LEFT JOIN properties p ON p.id = b.property_id WHERE b.id = ?').get(bookingId);
   if (!b) throw userError('Choose a booking to preview with.');
-  const text = fillTemplate(body || '', templateVars(db, b));
-  return { text, missing: [...new Set([...text.matchAll(/\{(\w+)\}/g)].map(m => m[1]))] };
+  const vars = templateVars(db, b);
+  return { text: fillTemplate(body || '', vars), missing: missingVars(body || '', vars) };
 }

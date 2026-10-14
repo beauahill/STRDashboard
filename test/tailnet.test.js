@@ -118,13 +118,15 @@ function fakeTailscale({ statuses, upFails } = {}) {
     return child;
   };
   let i = 0;
-  const cli = async args => {
+  const fake = { spawn, calls, children, wedged: false };   // wedged: the daemon runs but its socket never answers
+  fake.cli = async args => {
     const keyFile = args.find(a => a.startsWith('--auth-key=file:'))?.slice('--auth-key=file:'.length);
     calls.push({ args, key: keyFile && readFileSync(keyFile, 'utf8'), keyFile });
+    if (fake.wedged) throw new Error('timeout: tailscaled is not responding');
     if (args[0] === 'up') { if (upFails) throw new Error(upFails); return ''; }
     return JSON.stringify(statuses[Math.min(i++, statuses.length - 1)]);
   };
-  return { spawn, cli, calls, children };
+  return fake;
 }
 const running = { BackendState: 'Running', Self: { DNSName: 'str-dashboard.tail1ebd8f.ts.net.', TailscaleIPs: ['fd7a:115c:a1e0::9', '100.90.1.2'] }, CurrentTailnet: { Name: 'beau@example.com' }, Health: [],
   Peer: { 'nodekey:abc': { DNSName: 'HomeAssistant-Laradise.tail1ebd8f.ts.net.', HostName: 'homeassistant', TailscaleIPs: ['fd7a:115c:a1e0::7', '100.105.116.108'] } } };
@@ -198,4 +200,24 @@ test('Tailscale: a refused key is explained', async t => {
   await assert.rejects(haFetch('https://homeassistant.tail1ebd8f.ts.net/api/'), /needs a new auth key: the auth key was refused/);
   await ctl.check();
   assert.equal(fake.calls.filter(c => c.args[0] === 'up').length, 1, 'no hammering: at most one sign-in attempt every 5 minutes');
+});
+
+test('Tailscale: a daemon that stops answering its socket is replaced', async t => {
+  const fake = fakeTailscale({ statuses: [running] });
+  const ctl = startTailnet({ authKey: 'tskey-x', dataDir: mkdtempSync(join(tmpdir(), 'tailnet-')), spawn: fake.spawn, cli: fake.cli, checkEvery: 60000, restartAfter: 10 });
+  t.after(() => ctl.stop());
+  await ctl.check();
+  assert.equal(tailnetStatus().state, 'Running');
+  fake.wedged = true;
+  for (let i = 0; i < 5; i++) await ctl.check();
+  assert.equal(fake.children.length, 1, 'a few failed checks are tolerated');
+  assert.match(tailnetStatus().error, /waiting for Tailscale \(timeout/);
+  await ctl.check();
+  assert.match(tailnetStatus().error, /stopped answering.*restarting/);
+  await new Promise(ok => setTimeout(ok, 30));
+  assert.equal(fake.children.length, 2, 'a fresh daemon was started');
+  fake.wedged = false;
+  await ctl.check();
+  assert.equal(tailnetStatus().state, 'Running');
+  assert.equal(tailnetStatus().error, null);
 });

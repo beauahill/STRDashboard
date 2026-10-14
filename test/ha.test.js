@@ -267,6 +267,8 @@ test('lock after checkout: locks an unlocked door once, leaves a locked one alon
 
 test('stay records: conditions during each stay, alerts and lock events', async () => {
   const { db, ha } = await connected();
+  // Connecting sampled at the real clock (which may fall inside this stay); the polls below are at fixed instants.
+  db.exec('DELETE FROM ha_samples'); setSetting(db, 'ha_last_sample', '0');
   const checkIn = T('2026-10-14T22:00:00Z');
   for (let i = 0; i < 6; i++) {
     ha.set('sensor.bedroom_temperature', String(68 + i));
@@ -381,4 +383,31 @@ test('a leak alert keeps trying to reach the phone through an ntfy outage', asyn
   assert.equal(pushes.length, 0, 'waits five minutes between tries after the first few');
   await runNotifications(db, { now: NOW + 11 * 60e3, fetchImpl });
   assert.equal(pushes.filter(p => /Leak detected/.test(p.title)).length, 1, 'still delivered once ntfy is back');
+});
+
+test('freeze protection tries again ten minutes after a failed call, and says so once', async () => {
+  const ha = fakeHA();
+  ha.set('climate.living_room', 'off', { current_temperature: 49 });
+  const { db } = await connected(ha);
+  saveHASettings(db, { climate: { propertyId: 1, enabled: true, thermostats: ['climate.living_room'], freezeFloor: 50 } });
+  let broken = true;
+  const tries = [];
+  const flaky = async (url, opts) => {
+    if (/\/api\/services\//.test(url)) tries.push(url.split('/').pop());
+    return broken && /\/api\/services\//.test(url) ? { ok: false, status: 500, text: async () => '{"message":"Internal Server Error"}' } : ha.fetchImpl(url, opts);
+  };
+  const c = new HAClient('https://ha.example.com', 'good-token', flaky);
+  const at = async m => { storeStates(db, haSettings(db), [...ha.states.values()], NOW + m * 60e3); await freezeProtect(db, c, NOW + m * 60e3, new Set()); };
+  await at(0);
+  assert.deepEqual(tries, ['set_hvac_mode']);
+  await at(1); await at(5);
+  assert.deepEqual(tries, ['set_hvac_mode'], 'not hammered every minute');
+  await at(10);
+  assert.deepEqual(tries, ['set_hvac_mode', 'set_hvac_mode'], 'tried again after ten minutes');
+  assert.deepEqual(db.prepare("SELECT ok, notify FROM ha_actions WHERE kind = 'freeze' ORDER BY id").all().map(a => [a.ok, a.notify]), [[0, 1], [0, 0]], 'one push per episode');
+  broken = false;
+  await at(20);
+  assert.deepEqual(ha.calls, [['climate.set_hvac_mode', { entity_id: 'climate.living_room', hvac_mode: 'heat' }],
+    ['climate.set_temperature', { entity_id: 'climate.living_room', temperature: 50 }]]);
+  assert.deepEqual({ ...db.prepare("SELECT ok, notify FROM ha_actions WHERE kind = 'freeze' ORDER BY id").all().at(-1) }, { ok: 1, notify: 1 });
 });

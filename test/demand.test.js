@@ -120,3 +120,13 @@ test('forward numbers: occupancy, ADR and RevPAR on the books, against last year
   add(fresh, 1, 'confirmed', '2026-10-15', '2026-10-17', { price: 200 });
   assert.equal(forwardStats(fresh, 10, TODAY)[0].lastYearAtThisPoint, null, 'no history yet');
 });
+
+test('an old inquiry pulled in by the first sync is not fresh demand', () => {
+  const db = setup();
+  savePricingSettings(db, 10, FLAT);
+  // Asked in February (Beds24's time), first seen by this app today.
+  add(db, 60, 'inquiry', '2026-11-24', '2026-11-26', { bookedAt: '2026-02-03T10:00:00Z', firstSeen: '2026-10-14T12:00:00Z' });
+  recordSignals(db, new Date('2026-10-14T12:00:00Z'));
+  assert.equal(db.prepare('SELECT seen_at FROM demand_signals WHERE booking_id = 60').get().seen_at, '2026-02-03T10:00:00Z');
+  assert.equal(factor(recommend(db, 10, { start: '2026-11-24', days: 1, today: TODAY }).nights[0], /Demand/), undefined);
+});

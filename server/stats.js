@@ -6,7 +6,7 @@ function units(db, propertyId) {
   const row = propertyId
     ? db.prepare('SELECT COALESCE(SUM(qty),0) n FROM rooms WHERE property_id=?').get(propertyId)
     : db.prepare('SELECT COALESCE(SUM(qty),0) n FROM rooms').get();
-  return row.n;
+  return Math.max(1, row.n);   // retired rooms (qty 0) don't count, but there is always one unit to divide by
 }
 
 /** Occupancy / revenue / ADR for [from, to) with revenue prorated per night across the range. */

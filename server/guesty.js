@@ -190,12 +190,13 @@ export function importGuesty(db, bookings, mapping = {}) {
  */
 export function dedupeImported(db) {
   adoptLocalRooms(db);
-  // Only a real stay counts: Beds24 often holds a block (or an inquiry) on exactly a reservation's dates.
+  // An equal channel reference is the same reservation whatever its status now (cancelled since the export, say).
+  // By room and dates only a real stay counts: Beds24 often holds a block (or an inquiry) on exactly a reservation's dates.
   const n = Number(db.prepare(`
     DELETE FROM bookings WHERE source = 'guesty' AND EXISTS (
-      SELECT 1 FROM bookings b WHERE b.source = 'beds24' AND b.status IN ('confirmed','new') AND (
-        (b.channel_ref IS NOT NULL AND b.channel_ref = bookings.channel_ref) OR
-        (b.room_id = bookings.room_id AND b.arrival = bookings.arrival AND b.departure = bookings.departure)))`).run().changes);
+      SELECT 1 FROM bookings b WHERE b.source = 'beds24' AND (
+        (b.channel_ref IS NOT NULL AND b.channel_ref = bookings.channel_ref AND b.status IN ('confirmed','new','request','cancelled','deleted')) OR
+        (b.status IN ('confirmed','new') AND b.room_id = bookings.room_id AND b.arrival = bookings.arrival AND b.departure = bookings.departure)))`).run().changes);
   removeEmptyLocalProperties(db);
   return n;
 }

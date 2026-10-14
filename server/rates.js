@@ -9,8 +9,8 @@ const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const weekday = date => new Date(date + 'T00:00:00Z').getUTCDay();
 const money = n => '$' + (Math.round(n * 100) / 100).toLocaleString('en-US');
 
-/** Refresh the local calendar copy for [start, end] (inclusive) from Beds24. */
-export async function syncCalendar(db, client, start = iso(Date.now()), end = addDays(iso(Date.now()), 365)) {
+/** Refresh the local calendar copy for [start, end] (inclusive) from Beds24. "Today" is the property's date, so tonight is refreshed too. */
+export async function syncCalendar(db, client, start = localToday(doorSettings(db).tz), end = addDays(start, 365)) {
   const roomIds = db.prepare('SELECT id FROM rooms WHERE id > 0').all().map(r => r.id);
   if (!roomIds.length) return { rooms: 0 };
   const rows = await client.getAll('/inventory/rooms/calendar', {

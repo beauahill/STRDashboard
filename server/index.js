@@ -42,7 +42,7 @@ import {
 } from './messages.js';
 import {
   doorSettings, saveDoorSettings, refreshLocks, assignLock, reconcileDoorCodes, doorCodesFor, setBookingCode,
-  lockOverview, changeOtherCode, deleteOtherCode, addCode, localToday,
+  lockOverview, changeOtherCode, deleteOtherCode, addCode, localToday, doorAlerts,
 } from './doors.js';
 
 const PORT = Number(process.env.PORT || 3000);
@@ -55,6 +55,7 @@ const VOLUME = process.env.RAILWAY_VOLUME_MOUNT_PATH;
 if (ON_RAILWAY && !PASSWORD) fail('APP_PASSWORD is not set. Add it under the service\'s Variables tab.');
 if (ON_RAILWAY && !VOLUME && !process.env.DB_PATH) fail('No volume attached. Add a volume to this service mounted at /data.');
 function fail(msg) { console.error(`\nSTARTUP ERROR: ${msg}\n`); process.exit(1); }
+if (PASSWORD && PASSWORD.length < 12) console.warn('WARNING: APP_PASSWORD is short. Use at least 12 characters (a passphrase): a short one can be guessed.');
 
 const DB_PATH = process.env.DB_PATH || (VOLUME ? join(VOLUME, 'str.db') : 'data/str.db');
 const db = openDb(DB_PATH);
@@ -63,14 +64,29 @@ const seam = () => new SeamClient(getSetting(db, 'seam_api_key'));
 
 if (!getSetting(db, 'session_secret')) setSetting(db, 'session_secret', randomBytes(32).toString('hex'));
 const secret = getSetting(db, 'session_secret');
-// Sessions are bound to the current password, so changing APP_PASSWORD signs everyone out.
+// Sessions are bound to the current password, so changing APP_PASSWORD signs everyone out. Each one is a random id,
+// signed, and recorded in the database, so logging out (or "sign out everywhere") really revokes the cookie. They
+// last 30 days, or 14 days unused.
+const SESSION_MS = 30 * 86400000, IDLE_MS = 14 * 86400000;
 const sign = v => createHmac('sha256', secret).update(`${v}:${PASSWORD}`).digest('hex');
-const makeSession = () => { const exp = Date.now() + 30 * 86400000; return `${exp}.${sign(String(exp))}`; };
 const safeEqual = (a, b) => { a = Buffer.from(a); b = Buffer.from(b); return a.length === b.length && timingSafeEqual(a, b); };
+const at = t => new Date(t).toISOString();
+const endSession = tok => { const id = String(tok || '').split('.')[0]; if (id) db.prepare('DELETE FROM sessions WHERE id = ?').run(id); };
+function makeSession() {
+  const now = Date.now(), id = randomBytes(16).toString('hex'), exp = now + SESSION_MS;
+  db.prepare('DELETE FROM sessions WHERE last_seen < ? OR created_at < ?').run(at(now - IDLE_MS), at(now - SESSION_MS));
+  db.prepare('INSERT INTO sessions(id, created_at, last_seen) VALUES(?,?,?)').run(id, at(now), at(now));
+  return `${id}.${exp}.${sign(`${id}.${exp}`)}`;
+}
 function validSession(tok = '') {
-  const [exp, mac] = tok.split('.');
-  if (!exp || !mac || Number(exp) < Date.now()) return false;
-  return safeEqual(mac, sign(exp));
+  const [id, exp, mac] = tok.split('.');
+  if (!id || !exp || !mac || Number(exp) < Date.now() || !safeEqual(mac, sign(`${id}.${exp}`))) return false;
+  const row = db.prepare('SELECT last_seen FROM sessions WHERE id = ?').get(id);
+  if (!row) return false;
+  const now = Date.now(), seen = Date.parse(row.last_seen);
+  if (seen < now - IDLE_MS) { endSession(id); return false; }
+  if (seen < now - 3600000) db.prepare('UPDATE sessions SET last_seen = ? WHERE id = ?').run(at(now), id);
+  return true;
 }
 const cookie = req => Object.fromEntries((req.headers.cookie || '').split(';').map(c => c.trim().split('=')).filter(p => p[0]));
 // The client's address as seen by the proxy in front of the app (Railway adds it as the LAST X-Forwarded-For
@@ -80,17 +96,22 @@ const clientIp = req => {
   return (hops.at(-1) || req.socket.remoteAddress || '').slice(0, 64);
 };
 
-// Brute-force guard: 10 failed logins per address per 15 minutes, and 100 from everywhere together (so a spread-out
-// guess still runs into a wall).
+// Brute-force guard: 10 failed logins per address per 15 minutes is a hard stop. Failures from everywhere together
+// only slow wrong answers down (1.5 s each past 100 in the window): the right password always gets in, so a guess
+// spread over many addresses can't lock the owner out.
 const failures = new Map();
 const FAIL_WINDOW = 15 * 60000;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const failureCount = k => failures.get(k)?.count || 0;
 function loginBlocked(ip) {
   const now = Date.now();
   for (const [k, f] of failures) if (f.until < now) failures.delete(k);
-  return (failures.get(ip)?.count || 0) >= 10 || (failures.get('*')?.count || 0) >= 100;
+  return failureCount(ip) >= 10;
 }
 function recordFailure(ip) {
-  for (const k of [ip, '*']) {
+  for (const k of ['*', ip]) {
+    // Bounded: past a few thousand addresses in one window only the shared count keeps growing.
+    if (k !== '*' && !failures.has(k) && failures.size > 5000) continue;
     const f = failures.get(k) || { count: 0, until: Date.now() + FAIL_WINDOW };
     f.count++; failures.set(k, f);
   }
@@ -108,7 +129,7 @@ async function runSync() {
     // Prices are a separate permission in Beds24; a read-only or bookings-only code shouldn't fail the whole sync.
     try { await syncCalendar(db, beds24); setSetting(db, 'calendar_error', null); }
     catch (e) { setSetting(db, 'calendar_error', e.message); }
-    await runDoorCodes();
+    await runDoorCodes().catch(() => {});
     try { await autoPrice(db, beds24, localToday(doorSettings(db).tz)); setSetting(db, 'pricing_error', null); }
     catch (e) { setSetting(db, 'pricing_error', e.message); }
     try { await syncMessages(db, beds24); setSetting(db, 'messages_error', null); }
@@ -121,14 +142,18 @@ async function runSync() {
   finally { syncing = false; }
 }
 
-// Automated messages: checked every 5 minutes (and after each sync). Never throws.
-let automationsRunning = false;
+// Automated messages: checked every 5 minutes (and after each sync). Never throws. The run in flight is kept so a
+// shutdown can wait for it (a message just sent must be recorded as sent, or it goes out again after the restart).
+let automationsRunning = false, automationRun = null;
 async function runAutomationsSafely() {
   if (automationsRunning || !beds24.connected) return null;
   automationsRunning = true;
-  try { const r = await runAutomations(db, beds24); setSetting(db, 'automations_error', null); return r; }
-  catch (e) { setSetting(db, 'automations_error', e.message); return { error: e.message }; }
-  finally { automationsRunning = false; }
+  automationRun = (async () => {
+    try { const r = await runAutomations(db, beds24); setSetting(db, 'automations_error', null); return r; }
+    catch (e) { setSetting(db, 'automations_error', e.message); return { error: e.message }; }
+    finally { automationsRunning = false; }
+  })();
+  return automationRun;
 }
 
 // Phone notifications: while they're on, new guest messages are checked every minute (the full sync runs every
@@ -167,10 +192,10 @@ async function runHASafely() {
 // code on the lock and track only one of them.
 let doorChain = Promise.resolve();
 function runDoorCodes() {
-  // Each run waits for the one before it (runs never reject, so the chain can't break).
-  doorChain = doorChain.then(async () => {
+  // Each run waits for the one before it; even a run that fails to record its own error can't break the chain.
+  doorChain = doorChain.catch(() => {}).then(async () => {
     try { const r = await reconcileDoorCodes(db, seam(), beds24); setSetting(db, 'door_error', null); return r; }
-    catch (e) { setSetting(db, 'door_error', e.message); return { error: e.message }; }
+    catch (e) { try { setSetting(db, 'door_error', e.message); } catch {} return { error: e.message }; }
   });
   return doorChain;
 }
@@ -190,7 +215,7 @@ function rememberOrigin(req) {
   const host = req.headers['x-forwarded-host'] || req.headers.host;
   if (!host || /^(localhost|127\.|\[::1\])/.test(host)) return null;
   const origin = `${req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http'}://${host}`;
-  setSetting(db, 'app_origin', origin);
+  if (getSetting(db, 'app_origin') !== origin) setSetting(db, 'app_origin', origin);
   return origin;
 }
 
@@ -198,18 +223,39 @@ const send = (res, code, body, type = 'application/json') => {
   res.writeHead(code, { 'content-type': type, 'cache-control': 'no-store' });
   res.end(type === 'application/json' ? JSON.stringify(body) : body);
 };
-// Oversized bodies are drained and discarded (not kept in memory) so the client still gets a clean 413. The body
-// is decoded once at the end: decoding chunk by chunk would break characters split across two chunks.
+// Only a JSON object is accepted (routes read fields from it). An oversized body is refused the moment it's known to be
+// too big (from Content-Length, or as the limit is passed mid-stream) and the rest is never read. The body is decoded
+// once at the end: decoding chunk by chunk would break characters split across two chunks.
 const readJson = (req, limit = 1e6) => new Promise((ok, no) => {
-  let parts = [], size = 0, tooBig = false;
-  req.on('data', c => { if (tooBig) return; size += c.length; if (size > limit) { tooBig = true; parts = []; } else parts.push(c); });
+  const tooBig = () => no(Object.assign(new Error('Upload too large'), { status: 413, dropBody: true }));
+  if (Number(req.headers['content-length']) > limit) return tooBig();
+  let parts = [], size = 0;
+  req.on('data', c => { if (!parts) return; size += c.length; if (size > limit) { parts = null; tooBig(); } else parts.push(c); });
   req.on('error', no);
   req.on('end', () => {
-    if (tooBig) return no(Object.assign(new Error('Upload too large'), { status: 413 }));
-    const s = Buffer.concat(parts).toString('utf8');
-    try { ok(s ? JSON.parse(s) : {}); } catch { no(Object.assign(new Error('Invalid JSON'), { status: 400 })); }
+    if (!parts) return;
+    let v;
+    try { const s = Buffer.concat(parts).toString('utf8'); v = s ? JSON.parse(s) : {}; } catch { return no(Object.assign(new Error('Invalid JSON'), { status: 400 })); }
+    if (v === null || typeof v !== 'object' || Array.isArray(v)) return no(Object.assign(new Error('Expected a JSON object'), { status: 400 }));
+    ok(v);
   });
 });
+// Date query strings feed date arithmetic: anything that isn't a real YYYY-MM-DD is a 400, not a crash.
+function dateParam(q, k) {
+  const v = q[k];
+  if (!v) return undefined;
+  const t = Date.parse(v);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v) || Number.isNaN(t) || iso(t) !== v) throw Object.assign(new Error(`${k} must be a date like 2026-10-14.`), { status: 400 });
+  return v;
+}
+const SYNC_BUSY = { error: 'A sync is already running. Try again in a minute.' };
+// The page's own requests always say they're JSON and come from this host. A browser sends a cross-site request
+// without asking first only as a "simple" one (never JSON), and always with the page's Origin.
+const sameHost = (origin, req) => {
+  let h; try { h = new URL(origin).host.toLowerCase(); } catch { return false; }
+  return [req.headers.host, req.headers['x-forwarded-host']].some(x => x && x.toLowerCase() === h);
+};
+const CLEAR_COOKIE = 'sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0';
 
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.webmanifest': 'application/manifest+json' };
 
@@ -218,12 +264,22 @@ async function api(req, res, url) {
   const prop = q.property ? Number(q.property) : null;
   const route = `${req.method} ${url.pathname}`;
 
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    if (!/^application\/json\b/i.test(req.headers['content-type'] || '')) return send(res, 415, { error: 'Expected a JSON body (content-type: application/json).' });
+    if (req.headers.origin && !sameHost(req.headers.origin, req)) return send(res, 403, { error: 'Cross-site request refused.' });
+  }
+  // Without a password nothing else guards the API, so only this machine's own names may reach it (a web page that
+  // pointed its own domain at 127.0.0.1 would otherwise read everything).
+  if (!PASSWORD && !/^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(req.headers.host || '')) return send(res, 403, { error: `Open the app at http://localhost:${PORT}.` });
+
   if (route === 'POST /api/login') {
     const ip = clientIp(req);
     if (loginBlocked(ip)) return send(res, 429, { error: 'Too many attempts. Try again in 15 minutes.' });
     const { password } = await readJson(req);
     if (!PASSWORD || typeof password !== 'string' || !safeEqual(sign(password), sign(PASSWORD))) {
+      const heavy = failureCount('*') >= 100;
       recordFailure(ip);
+      if (heavy) await sleep(1500);
       return send(res, 401, { error: 'Wrong password' });
     }
     failures.delete(ip);
@@ -232,12 +288,17 @@ async function api(req, res, url) {
     return send(res, 200, { ok: true });
   }
   if (route === 'POST /api/logout') {
-    res.setHeader('set-cookie', 'sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
+    endSession(cookie(req).sid);
+    res.setHeader('set-cookie', CLEAR_COOKIE);
     return send(res, 200, { ok: true });
   }
   if (PASSWORD && !validSession(cookie(req).sid)) return send(res, 401, { error: 'Login required' });
 
   switch (route) {
+    case 'POST /api/logout-all':   // sign out everywhere: every browser, phone and copied cookie
+      db.exec('DELETE FROM sessions');
+      res.setHeader('set-cookie', CLEAR_COOKIE);
+      return send(res, 200, { ok: true });
     case 'GET /api/status':
       return send(res, 200, {
         connected: beds24.connected, scopes: beds24.scopes, auth: !!PASSWORD, demo: getSetting(db, 'demo') === '1', syncing,
@@ -247,6 +308,7 @@ async function api(req, res, url) {
         unreadMessages: unreadCount(db), ai: aiStatus(db).configured, home: haConfigured(db), tz: doorSettings(db).tz,
       });
     case 'POST /api/connect': {
+      if (syncing) return send(res, 409, SYNC_BUSY);
       const { inviteCode } = await readJson(req);
       if (!inviteCode) return send(res, 400, { error: 'Invite code required' });
       await beds24.connect(inviteCode);
@@ -256,6 +318,7 @@ async function api(req, res, url) {
     case 'POST /api/disconnect': beds24.disconnect(); return send(res, 200, { ok: true });
     case 'POST /api/sync':
       if (!beds24.connected) return send(res, 400, { error: 'Not connected to Beds24' });
+      if (syncing) return send(res, 409, SYNC_BUSY);
       return send(res, 200, await runSync());
     case 'POST /api/demo':
       if (beds24.connected) return send(res, 400, { error: 'Demo data can\'t be loaded while connected to Beds24.' });
@@ -274,24 +337,26 @@ async function api(req, res, url) {
     }
     case 'POST /api/import/guesty/remove': return send(res, 200, removeGuestyImport(db));
     case 'GET /api/rates': {
+      const start = dateParam(q, 'start');
       const rooms = db.prepare(`SELECT r.id, r.name, p.name property_name FROM rooms r JOIN properties p ON p.id = r.property_id
         WHERE r.id > 0 ${prop ? 'AND r.property_id = ?' : ''} ORDER BY p.name, r.name`).all(...(prop ? [prop] : []));
       const room = rooms.find(r => r.id === Number(q.room)) || rooms[0] || null;
       return send(res, 200, {
         rooms, room, connected: beds24.connected, canWrite: beds24.canWriteInventory,
         calendarError: getSetting(db, 'calendar_error'), lastSync: getSetting(db, 'last_sync'),
-        days: room ? readDays(db, room.id, q.start || localToday(doorSettings(db).tz), Math.min(Number(q.days) || 62, 120)) : [],
+        days: room ? readDays(db, room.id, start || localToday(doorSettings(db).tz), Math.min(Number(q.days) || 62, 120)) : [],
         changes: recentChanges(db),
       });
     }
     case 'POST /api/rates/preview': return send(res, 200, planChanges(db, await readJson(req)));
     case 'GET /api/pricing': {
+      const start = dateParam(q, 'start');
       const rooms = db.prepare(`SELECT r.id, r.name, p.name property_name FROM rooms r JOIN properties p ON p.id = r.property_id
         WHERE r.id > 0 ${prop ? 'AND r.property_id = ?' : ''} ORDER BY p.name, r.name`).all(...(prop ? [prop] : []));
       const room = rooms.find(r => r.id === Number(q.room)) || rooms[0] || null;
       if (!room) return send(res, 200, { rooms, room: null });
       const today = localToday(doorSettings(db).tz);
-      const rec = recommend(db, room.id, { start: q.start, days: Math.min(Number(q.days) || 62, 400), today });
+      const rec = recommend(db, room.id, { start, days: Math.min(Number(q.days) || 62, 400), today });
       const year = rec.needsBase ? null : recommend(db, room.id, { days: 365, today });
       const ahead = days => {
         const p = pendingChanges({ ...year, nights: year.nights.slice(0, days) }, { includeMinStay: q.minStay !== '0' });
@@ -367,7 +432,11 @@ async function api(req, res, url) {
     case 'POST /api/automations': return send(res, 200, { id: saveAutomation(db, await readJson(req)) });
     case 'POST /api/automations/enable': { const { id, enabled } = await readJson(req); setEnabled(db, Number(id), !!enabled); return send(res, 200, { ok: true }); }
     case 'POST /api/automations/delete': { const { id } = await readJson(req); deleteAutomation(db, Number(id)); return send(res, 200, { ok: true }); }
-    case 'POST /api/automations/skip': { const { automationId, bookingId } = await readJson(req); skipSend(db, Number(automationId), Number(bookingId)); return send(res, 200, { ok: true }); }
+    case 'POST /api/automations/skip': {
+      const { automationId, bookingId } = await readJson(req);
+      if (!Number(automationId) || !Number(bookingId)) return send(res, 400, { error: 'automationId and bookingId are required.' });
+      skipSend(db, Number(automationId), Number(bookingId)); return send(res, 200, { ok: true });
+    }
     case 'POST /api/automations/preview': { const { body, bookingId } = await readJson(req); return send(res, 200, previewFor(db, body, Number(bookingId))); }
     case 'POST /api/automations/run': return send(res, 200, (await runAutomationsSafely()) || { skipped: true });
     case 'POST /api/property-vars': { const { propertyId, vars } = await readJson(req); return send(res, 200, savePropertyVars(db, Number(propertyId), vars)); }
@@ -578,9 +647,12 @@ async function api(req, res, url) {
     case 'POST /api/locks/key': {
       const { apiKey } = await readJson(req);
       if (apiKey && !/^seam_\S{10,}$/.test(apiKey.trim())) return send(res, 400, { error: 'That doesn\'t look like a Seam API key (they start with "seam_").' });
+      const previous = getSetting(db, 'seam_api_key');
       setSetting(db, 'seam_api_key', apiKey ? apiKey.trim() : null);
       if (!apiKey) { db.exec('DELETE FROM locks'); return send(res, 200, { removed: true }); }
-      return send(res, 200, { locks: await refreshLocks(db, seam()) });
+      // A key Seam rejects, or one that lists no locks (wrong workspace), mustn't replace the one that works.
+      try { return send(res, 200, { locks: await refreshLocks(db, seam()) }); }
+      catch (e) { setSetting(db, 'seam_api_key', previous); throw e; }
     }
     case 'POST /api/locks/connect': {
       const wv = await seam().connectWebview();
@@ -592,6 +664,7 @@ async function api(req, res, url) {
     }
     case 'POST /api/locks/assign': {
       const { deviceId, roomId } = await readJson(req);
+      if (typeof deviceId !== 'string' || !deviceId) return send(res, 400, { error: 'deviceId is required.' });
       assignLock(db, deviceId, roomId == null || roomId === '' ? null : Number(roomId));
       return send(res, 200, { ok: true, doors: await runDoorCodes() });
     }
@@ -604,7 +677,7 @@ async function api(req, res, url) {
     }
     case 'POST /api/locks/code/change': {
       const { entries, code, name } = await readJson(req);
-      await changeOtherCode(seam(), checkEntries(entries), { code: String(code || '').trim(), name: name?.trim() });
+      await changeOtherCode(seam(), checkEntries(entries), { code: String(code || '').trim(), name: name?.trim() }, db);
       return send(res, 200, { ok: true });
     }
     case 'POST /api/locks/code/delete': {
@@ -635,21 +708,15 @@ async function api(req, res, url) {
         JOIN automations a ON a.id = s.automation_id LEFT JOIN bookings b ON b.id = s.booking_id
         WHERE (s.status = 'failed' AND s.updated_at >= ?) OR (s.status = 'waiting' AND s.scheduled_at <= ?)
         ORDER BY s.updated_at DESC LIMIT 5`).all(new Date(Date.now() - 7 * 86400e3).toISOString(), new Date(Date.now() - 3600e3).toISOString());
-      const ds = doorSettings(db);
-      if (ds.auto) {
-        const soon = [...sum.arrivals, ...sum.inHouse, ...sum.upcoming];
-        sum.doors = doorCodesFor(db, soon.map(b => b.id));
-        // A guest arriving soon (within 3 days, and inside the code window) at a property with locks, without
-        // a working code on every lock, needs attention now.
-        const limit = iso(Date.parse(localToday(ds.tz)) + Math.min(3, ds.lookahead) * 86400000);
-        const lockRooms = new Set(db.prepare('SELECT DISTINCT room_id FROM locks WHERE room_id IS NOT NULL').all().map(r => r.room_id));
-        sum.doorAlerts = [...sum.arrivals, ...sum.upcoming].filter(b => b.source === 'beds24' && lockRooms.has(b.room_id) && b.arrival <= limit && !sum.doors[b.id]?.ok)
-          .map(b => ({ id: b.id, guest: b.guest_name, arrival: b.arrival, problem: sum.doors[b.id]?.perLock.find(l => !['set', 'scheduled'].includes(l.state))?.label || 'No door code yet' }));
+      if (doorSettings(db).auto) {
+        sum.doors = doorCodesFor(db, [...sum.arrivals, ...sum.inHouse, ...sum.upcoming].map(b => b.id));
+        // Guests in the house or arriving within 3 days without a working code on every lock (or no lock at all).
+        sum.doorAlerts = doorAlerts(db, { days: 3 });
       }
       return send(res, 200, sum);
     }
     case 'GET /api/calendar': {
-      const cal = calendar(db, q.start || localToday(doorSettings(db).tz), Math.min(Number(q.days) || 42, 120), prop);
+      const cal = calendar(db, dateParam(q, 'start') || localToday(doorSettings(db).tz), Math.min(Number(q.days) || 42, 120), prop);
       if (doorSettings(db).auto) cal.doors = doorCodesFor(db, cal.bookings.map(b => b.id));
       return send(res, 200, cal);
     }
@@ -657,8 +724,9 @@ async function api(req, res, url) {
       const where = [], args = [];
       if (prop) { where.push('b.property_id = ?'); args.push(prop); }
       for (const f of ['status', 'channel']) if (q[f]) { where.push(`b.${f} = ?`); args.push(q[f]); }
-      if (q.from) { where.push('b.departure >= ?'); args.push(q.from); }
-      if (q.to) { where.push('b.arrival <= ?'); args.push(q.to); }
+      const from = dateParam(q, 'from'), to = dateParam(q, 'to');
+      if (from) { where.push('b.departure >= ?'); args.push(from); }
+      if (to) { where.push('b.arrival <= ?'); args.push(to); }
       if (q.q) {
         where.push('(b.guest_name LIKE ? OR b.email LIKE ? OR b.channel_ref LIKE ? OR CAST(b.id AS TEXT) = ?)');
         args.push(`%${q.q}%`, `%${q.q}%`, `%${q.q}%`, q.q);
@@ -679,6 +747,8 @@ const server = createServer(async (req, res) => {
   res.setHeader('x-content-type-options', 'nosniff');
   res.setHeader('x-frame-options', 'DENY');
   res.setHeader('referrer-policy', 'same-origin');
+  // Behind a TLS proxy (Railway), tell browsers to come back over HTTPS only.
+  if (req.headers['x-forwarded-proto'] === 'https') res.setHeader('strict-transport-security', 'max-age=31536000');
   try {
     if (url.pathname === '/healthz') return send(res, 200, { ok: true });
     // Cleaning calendar for Turno: no login (Turno can't sign in), protected by the secret in the URL.
@@ -736,10 +806,18 @@ const server = createServer(async (req, res) => {
     if (!file.startsWith(PUBLIC)) return send(res, 403, 'Forbidden', 'text/plain');
     send(res, 200, await readFile(file), MIME[extname(file)] || 'application/octet-stream');
   } catch (e) {
-    if (!e.status && e.code !== 'ENOENT') console.error(e);
+    if (e.code === 'ECONNRESET' || e.message === 'aborted') return res.end();   // the client hung up mid-request
+    const missing = ['ENOENT', 'ENOTDIR', 'EISDIR', 'ENAMETOOLONG'].includes(e.code);
+    // The app's own errors (a plain Error, or one carrying a status) are for the owner to read. Anything else (a type
+    // error, SQLite, the file system) would describe the server's insides: logged here, a generic answer to the client.
+    const internal = !e.status && !missing && (!!e.code || e.constructor !== Error);
+    if (!e.status && !missing) console.error(internal ? e : e.message);
     if (res.headersSent) return res.end();
-    if (e.code === 'ENOENT') return send(res, 404, 'Not found', 'text/plain');
-    send(res, e.status || 500, { error: e.message });
+    if (missing) return send(res, 404, 'Not found', 'text/plain');
+    // A refused upload: answer, half-close so the client stops sending, then (a moment later, so the answer has been
+    // read: a reset would make the client drop it) cut the connection rather than read the rest.
+    if (e.dropBody) res.once('finish', () => { req.socket?.end(); setTimeout(() => { if (!req.complete) req.destroy(); }, 1000).unref(); });
+    send(res, e.status || 500, { error: internal ? 'Something went wrong' : e.message });
   }
 });
 // Anything that still slips through is logged rather than taking the dashboard (and door codes) down.
@@ -753,9 +831,15 @@ seedAutomations(db);
 
 // No password configured -> only reachable from this machine.
 const host = PASSWORD ? '0.0.0.0' : '127.0.0.1';
+// Headers within 30 s and the whole request within 60 s: nobody can hold a connection open for minutes.
+server.headersTimeout = 30000;
+server.requestTimeout = 60000;
 server.listen(PORT, host, () => {
   console.log(`STR Dashboard on http://${host === '0.0.0.0' ? 'localhost' : host}:${server.address().port}`);
   if (!PASSWORD) console.log('APP_PASSWORD not set: listening on localhost only. Set it before exposing this to a network.');
+  // Sync straight away (bookings, door codes and messages are current right after a deploy, and a restart after an
+  // outage doesn't look like a broken Beds24 connection), then every 15 minutes.
+  runSync().catch(e => console.error('sync failed:', e.message));
 });
 
 setInterval(() => runSync().catch(e => console.error('sync failed:', e.message)), 15 * 60000).unref();
@@ -779,9 +863,12 @@ setInterval(async () => {
 // Tailscale (only with TS_AUTHKEY): a private route to Home Assistant. Its identity lives next to the database.
 const tailnet = startTailnet({ dataDir: dirname(DB_PATH) });
 
-// Railway sends SIGTERM on redeploy; close cleanly so SQLite isn't mid-write.
+// Railway sends SIGTERM on redeploy: stop taking requests, let a door-code or message run that's mid-flight finish
+// (up to 4 s, so a code Seam just made or a message just sent is recorded), then close SQLite cleanly.
 for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => {
   tailnet?.stop();
-  server.close(() => { db.close(); process.exit(0); });
-  setTimeout(() => process.exit(0), 5000).unref();
+  const quit = () => { try { db.close(); } catch {} process.exit(0); };
+  const settled = Promise.race([Promise.allSettled([doorChain, automationRun]), sleep(4000)]);
+  server.close(() => settled.then(quit));
+  setTimeout(quit, 5000).unref();
 });

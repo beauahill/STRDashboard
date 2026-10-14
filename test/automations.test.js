@@ -243,3 +243,54 @@ test('a message Beds24 accepted is not sent again when reading the thread back f
   assert.equal(posts, 1, 'sent once');
   assert.equal(db.prepare("SELECT status FROM automation_sends WHERE booking_id = 72").get().status, 'sent');
 });
+
+test('a cancellation message only goes to a guest who really had a booking', async () => {
+  const { db, sent, send } = setup();
+  enable(db, 'Cancellation', new Date('2026-10-01T00:00:00Z'));
+  book(db, { id: 1, status: 'inquiry', arrival: '2026-11-20', departure: '2026-11-22', bookingTime: '2026-10-13T15:00:00Z' });
+  book(db, { id: 2, status: 'request', channel: 'vrbo', arrival: '2026-12-01', departure: '2026-12-04', bookingTime: '2026-10-13T16:00:00Z' });
+  await runAutomations(db, null, new Date('2026-10-13T16:10:00Z'), send);
+  // The inquiry expired and the request was declined: Beds24 reports both as cancelled. A booking cancelled long
+  // before the app existed (no cancel time) is re-synced because something else about it changed.
+  book(db, { id: 1, status: 'cancelled', arrival: '2026-11-20', departure: '2026-11-22', bookingTime: '2026-10-13T15:00:00Z', cancelTime: '2026-10-14T15:00:00Z' });
+  book(db, { id: 2, status: 'cancelled', channel: 'vrbo', arrival: '2026-12-01', departure: '2026-12-04', bookingTime: '2026-10-13T16:00:00Z', cancelTime: '2026-10-14T16:00:00Z' });
+  book(db, { id: 3, status: 'cancelled', arrival: '2026-03-01', departure: '2026-03-04', bookingTime: '2026-01-02T10:00:00Z', modifiedTime: '2026-10-14T12:00:00Z' });
+  await runAutomations(db, null, new Date('2026-10-14T16:10:00Z'), send);
+  assert.deepEqual(sent, []);
+  assert.equal(schedule(auto(db, 'Cancellation'), { status: 'cancelled', modified_at: '2026-10-14T12:00:00Z' }, { tz: TZ }), null, 'no cancel time, no cancellation moment');
+});
+
+test('a booking request accepted late still gets its confirmation, once', async () => {
+  const { db, sent, send } = setup();
+  enable(db, 'Booking confirmation', new Date('2026-10-01T00:00:00Z'));
+  // Asked on Oct 10, accepted on Oct 13: the message is due from the acceptance, not from the request.
+  book(db, { id: 1, status: 'request', channel: 'bookingpage', arrival: '2026-11-20', departure: '2026-11-22', bookingTime: '2026-10-10T15:00:00Z' }, new Date('2026-10-10T15:01:00Z'));
+  await runAutomations(db, null, new Date('2026-10-10T15:10:00Z'), send);
+  assert.equal(sent.length, 0, 'a request is not a booking yet');
+  book(db, { id: 1, status: 'confirmed', channel: 'bookingpage', arrival: '2026-11-20', departure: '2026-11-22', bookingTime: '2026-10-10T15:00:00Z', modifiedTime: '2026-10-13T09:00:00Z' });
+  await runAutomations(db, null, new Date('2026-10-13T09:02:00Z'), send);
+  assert.equal(sent.length, 0, 'the 5-minute delay runs from the acceptance');
+  await runAutomations(db, null, new Date('2026-10-13T09:08:00Z'), send);
+  assert.deepEqual(sent.map(s => s.bookingId), [1]);
+  assert.match(sent[0].text, /thank you for booking/);
+  await runAutomations(db, null, new Date('2026-10-13T09:20:00Z'), send);
+  assert.equal(sent.length, 1, 'not again');
+  assert.equal(db.prepare('SELECT status FROM booking_snapshots WHERE booking_id = 1').get().status, 'confirmed');
+  // Accepted within the delay: one confirmation, not two.
+  book(db, { id: 2, status: 'request', arrival: '2026-11-25', departure: '2026-11-27', bookingTime: '2026-10-14T10:00:00Z' }, new Date('2026-10-14T10:00:30Z'));
+  await runAutomations(db, null, new Date('2026-10-14T10:01:00Z'), send);
+  book(db, { id: 2, status: 'confirmed', arrival: '2026-11-25', departure: '2026-11-27', bookingTime: '2026-10-14T10:00:00Z' });
+  for (const m of ['10:02', '10:06', '10:09', '10:30']) await runAutomations(db, null, new Date(`2026-10-14T${m}:00Z`), send);
+  assert.deepEqual(sent.map(s => s.bookingId), [1, 2]);
+});
+
+test('a guest name shaped like a placeholder is sent as plain text, not treated as a missing fill-in', async () => {
+  const { db, sent, send } = setup();
+  db.prepare("INSERT INTO door_codes(booking_id, code) VALUES (1, '4242')").run();
+  book(db, { id: 1, arrival: '2026-11-12', departure: '2026-11-15', firstName: '{door_code}', lastName: 'Smith' }, new Date('2026-10-01T00:00:00Z'));
+  enable(db, 'Check-in instructions', new Date('2026-11-01T00:00:00Z'));
+  const r = await runAutomations(db, null, mt('2026-11-10', '10:05'), send);
+  assert.deepEqual([r.sent, r.waiting], [1, 0]);
+  assert.match(sent[0].text, /^Hi door_code, your stay at Laramie Retreat/);
+  assert.match(sent[0].text, /Door code: 4242/);
+});

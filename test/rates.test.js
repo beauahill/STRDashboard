@@ -207,3 +207,15 @@ test('incremental sync sends modifiedFrom in the format Beds24 documents', async
   const inc = urls.filter(u => u.path === '/bookings')[1].q;
   assert.match(inc.modifiedFrom, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/);
 });
+
+test('the calendar window starts on the property\'s date, not the UTC one', async () => {
+  const db = openDb(':memory:');
+  upsertProperties(db, [{ id: 500, name: 'P', roomTypes: [{ id: 600, name: 'R', qty: 1 }] }]);
+  const seen = [];
+  const client = { getAll: async (path, q) => { seen.push(q); return []; } };
+  const realNow = Date.now;
+  Date.now = () => Date.parse('2026-12-25T01:00:00Z');   // 6 pm on Christmas Eve in Wyoming
+  try { await syncCalendar(db, client); } finally { Date.now = realNow; }
+  assert.equal(seen[0].startDate, '2026-12-24', 'tonight is refreshed too');
+  assert.equal(seen[0].endDate, '2027-12-24');
+});

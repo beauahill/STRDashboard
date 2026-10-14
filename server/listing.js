@@ -47,7 +47,8 @@ export const FIELDS = {
 };
 
 const textFor = (texts, lang) => (texts || []).find(t => (t.language || 'en') === lang) || {};
-const pick = (obj, fields) => Object.fromEntries(fields.map(f => [f.key, obj?.[f.key] ?? (f.type === 'int' || f.type === 'money' ? null : '')]));
+const numeric = f => f.type === 'int' || f.type === 'money';
+const pick = (obj, fields) => Object.fromEntries(fields.map(f => [f.key, obj?.[f.key] ?? (numeric(f) ? null : '')]));
 
 /** Current listing content from Beds24, in the editor's shape. */
 export async function fetchListing(client, propertyId, lang = 'en') {
@@ -75,7 +76,10 @@ function clean(f, v) {
   if (f.key === 'name' && !s.trim()) throw userError(`${f.label} can't be empty.`);
   return f.type === 'textarea' ? s : s.trim();
 }
-const same = (a, b) => (a ?? '') === (b ?? '') || (a == null && b === '') || (b == null && a === '');
+// Beds24 may return a number as a string ("95.00"): numeric fields compare by value, text (a ZIP code) by spelling.
+const num = v => (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '') ? Number(v) : NaN);
+const same = (a, b, byValue = false) => (byValue && Number.isFinite(num(a)) && Number.isFinite(num(b)) ? num(a) === num(b)
+  : (a ?? '') === (b ?? '') || (a == null && b === '') || (b == null && a === ''));
 // Beds24 doesn't return every field; a field that's blank both there and in the form isn't a change.
 const blank = v => v == null || v === '';
 
@@ -86,13 +90,13 @@ export function diffListing(current, edited) {
   for (const f of FIELDS.property) {
     if (!(f.key in (edited.property || {})) || (blank(edited.property[f.key]) && blank(current.property[f.key]))) continue;
     const v = clean(f, edited.property[f.key]);
-    if (!same(v, current.property[f.key])) { body[f.key] = v; add('Property', f, current.property[f.key], v); }
+    if (!same(v, current.property[f.key], numeric(f))) { body[f.key] = v; add('Property', f, current.property[f.key], v); }
   }
   const ptext = {};
   for (const f of FIELDS.propertyText) {
     if (!(f.key in (edited.propertyText || {})) || (blank(edited.propertyText[f.key]) && blank(current.propertyText[f.key]))) continue;
     const v = clean(f, edited.propertyText[f.key]);
-    if (!same(v, current.propertyText[f.key])) { ptext[f.key] = v; add('Property', f, current.propertyText[f.key], v); }
+    if (!same(v, current.propertyText[f.key], numeric(f))) { ptext[f.key] = v; add('Property', f, current.propertyText[f.key], v); }
   }
   if (Object.keys(ptext).length) body.texts = [{ language: current.lang, ...ptext }];
   const rooms = [];
@@ -103,12 +107,12 @@ export function diffListing(current, edited) {
     for (const f of FIELDS.room) {
       if (!(f.key in er) || (blank(er[f.key]) && blank(cr[f.key]))) continue;
       const v = clean(f, er[f.key]);
-      if (!same(v, cr[f.key])) { rb[f.key] = v; add(cr.name || `Room ${cr.id}`, f, cr[f.key], v); }
+      if (!same(v, cr[f.key], numeric(f))) { rb[f.key] = v; add(cr.name || `Room ${cr.id}`, f, cr[f.key], v); }
     }
     for (const f of FIELDS.roomText) {
       if (!(f.key in (er.text || {})) || (blank(er.text[f.key]) && blank(cr.text[f.key]))) continue;
       const v = clean(f, er.text[f.key]);
-      if (!same(v, cr.text[f.key])) { rtext[f.key] = v; add(cr.name || `Room ${cr.id}`, f, cr.text[f.key], v); }
+      if (!same(v, cr.text[f.key], numeric(f))) { rtext[f.key] = v; add(cr.name || `Room ${cr.id}`, f, cr.text[f.key], v); }
     }
     if (Object.keys(rtext).length) rb.texts = [{ language: current.lang, ...rtext }];
     if (Object.keys(rb).length > 1) rooms.push(rb);

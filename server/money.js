@@ -3,6 +3,7 @@
 // Income is counted by night of stay (a stay crossing months counts partly in each), like the Dashboard.
 import { getSetting, setSetting } from './db.js';
 import { addDays, diffDays } from './sync.js';
+import { doorSettings, localToday } from './doors.js';
 
 const err = (msg, status = 400) => Object.assign(new Error(msg), { status });
 const r2 = v => Math.round(v * 100) / 100;
@@ -184,7 +185,7 @@ export function markPayout(db, bookingId, { amount, receivedOn, note } = {}) {
   if (amount === '' || amount == null) { db.prepare('DELETE FROM payouts_received WHERE booking_id = ?').run(bookingId); return null; }
   const v = Number(amount);
   if (!(Number.isFinite(v) && v >= 0 && v <= 1e7)) throw err('Enter the amount received.');
-  const on = receivedOn && /^\d{4}-\d{2}-\d{2}$/.test(receivedOn) ? receivedOn : new Date().toISOString().slice(0, 10);
+  const on = receivedOn && /^\d{4}-\d{2}-\d{2}$/.test(receivedOn) ? receivedOn : localToday(doorSettings(db).tz);
   db.prepare(`INSERT INTO payouts_received(booking_id, amount, received_on, note, updated_at) VALUES(?,?,?,?,?)
     ON CONFLICT(booking_id) DO UPDATE SET amount = excluded.amount, received_on = excluded.received_on, note = excluded.note, updated_at = excluded.updated_at`)
     .run(bookingId, r2(v), on, String(note || '').slice(0, 300), new Date().toISOString());

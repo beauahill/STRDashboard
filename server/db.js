@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS rooms (
 CREATE TABLE IF NOT EXISTS bookings (
   id INTEGER PRIMARY KEY,
   property_id INTEGER, room_id INTEGER,
-  status TEXT NOT NULL,            -- confirmed | new | request | cancelled | inquiry | block
+  status TEXT NOT NULL,            -- confirmed | new | request | cancelled | inquiry | block | deleted (gone from Beds24)
   channel TEXT NOT NULL,           -- Airbnb | Booking.com | VRBO | Direct | Other
   arrival TEXT NOT NULL, departure TEXT NOT NULL, nights INTEGER NOT NULL,
   guest_name TEXT, email TEXT, phone TEXT,
@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS messages (
   attachment_name TEXT, attachment_mime TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_booking ON messages(booking_id, time);
+CREATE INDEX IF NOT EXISTS idx_messages_unread ON messages(booking_id) WHERE source = 'guest' AND read = 0;
+-- Owner logins, so signing out (or "sign out everywhere") actually revokes the cookie.
+CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, last_seen TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS saved_replies (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, body TEXT NOT NULL);
 -- Dates that move prices: football weekends, festivals, holidays (inclusive first and last night).
 CREATE TABLE IF NOT EXISTS pricing_events (
@@ -145,12 +148,16 @@ const ADDED_COLUMNS = [
   ['bookings', 'first_seen', 'TEXT'],                         // when this app first saw the booking
   ['bookings', 'commission', 'REAL'],                         // channel commission (Beds24), when known
   ['bookings', 'tax', 'REAL'],                                // tax on the booking (Beds24), when known
+  ['bookings', 'confirmed_at', 'TEXT'],                       // when this app saw a request/inquiry become a stay
+  ['booking_snapshots', 'status', 'TEXT'],                    // last status seen, to notice a request being accepted
+  ['locks', 'missing', 'INTEGER DEFAULT 0'],                  // 1 while Seam stops listing the lock (assignment kept)
 ];
 
 export function openDb(path = ':memory:') {
   if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
-  db.exec('PRAGMA journal_mode = WAL;');
+  // WAL with synchronous=NORMAL: still safe across a crash of this single process, far fewer fsyncs on a network volume.
+  db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;');
   db.exec(SCHEMA);
   for (const [table, col, def] of ADDED_COLUMNS) {
     if (!db.prepare(`PRAGMA table_info(${table})`).all().some(c => c.name === col)) {

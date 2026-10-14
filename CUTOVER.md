@@ -22,6 +22,10 @@ Nothing here touches your live listings yet.
 
 - [ ] **Property and room**: name, address, photos, description, amenities, house rules, check-in/out times.
       VRBO's connection checks this content and lists anything missing as "Fix Content Errors".
+- [ ] **Import your Guesty history**: app → Settings → Guesty history import → upload the CSV from Phase 1 →
+      preview → import. Do this after Beds24 is connected (DEPLOY.md §6) so the history lands on your Beds24
+      room; imported earlier, it sits in its own property until Beds24 has exactly one room, then moves over
+      automatically. The price suggestion in the next step, and the analytics, need it (20 nights at least).
 - [ ] **Prices and minimum stays for the next 12 months.** This is the most important step: if prices
       aren't set when you connect, Beds24 sends its base rate and **overwrites your current Airbnb/VRBO
       prices**. Match what's live on Airbnb today. Quickest: on the dashboard's **Pricing** page, click

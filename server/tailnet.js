@@ -46,7 +46,7 @@ export function haFetch(url, opts) {
 }
 
 function describeState() {
-  const s = { off: 'off', starting: 'starting', NoState: 'starting', Starting: 'starting', NeedsLogin: 'needs a new auth key',
+  const s = { off: 'off', starting: 'starting', restarting: 'restarting', NoState: 'starting', Starting: 'starting', NeedsLogin: 'needs a new auth key',
     NeedsMachineAuth: 'waiting for approval in the Tailscale admin console', Stopped: 'stopped' }[t.state] || t.state;
   return t.error ? `${s}: ${t.error}` : s;
 }
@@ -134,7 +134,7 @@ export function startTailnet({ authKey = process.env.TS_AUTHKEY, hostname = proc
   const stateDir = join(dataDir || 'data', 'tailscale');
   mkdirSync(stateDir, { recursive: true });
   Object.assign(t, { enabled: true, state: 'starting', error: null });
-  let child = null, stopped = false, timer = null, lastLogin = 0, backoff = restartAfter, lastLog = '';
+  let child = null, stopped = false, timer = null, lastLogin = 0, backoff = restartAfter, lastLog = '', fails = 0, killedFor = null;
 
   const launch = () => {
     lastLog = '';
@@ -148,8 +148,9 @@ export function startTailnet({ authKey = process.env.TS_AUTHKEY, hostname = proc
     child.on('exit', code => {
       child = null;
       if (stopped) return;
-      Object.assign(t, { state: 'off', error: `Tailscale stopped (${lastLog || `exit ${code}`}); restarting` });
-      console.error(`tailscale: daemon exited (${code}): ${lastLog}`);
+      Object.assign(t, { state: 'off', error: `Tailscale stopped (${killedFor || lastLog || `exit ${code}`}); restarting` });
+      console.error(`tailscale: daemon exited (${code}): ${killedFor || lastLog}`);
+      killedFor = null;
       setTimeout(() => { if (!stopped) { launch(); backoff = Math.min(backoff * 2, 300000); } }, backoff).unref?.();
     });
   };
@@ -158,7 +159,18 @@ export function startTailnet({ authKey = process.env.TS_AUTHKEY, hostname = proc
     if (stopped || !child) return;
     let s;
     try { s = JSON.parse(await cli(['status', '--json'])); }
-    catch (e) { if (t.state !== 'off') t.error = `waiting for Tailscale (${e.message})`; return; }
+    catch (e) {
+      if (t.state !== 'off') t.error = `waiting for Tailscale (${e.message})`;
+      // A daemon that is alive but has stopped answering its socket is replaced: the exit handler starts a fresh one.
+      if (++fails >= 6 && child) {
+        fails = 0;
+        killedFor = `stopped answering: ${e.message}`;
+        Object.assign(t, { state: 'restarting', error: `Tailscale ${killedFor}; restarting` });
+        child.kill('SIGKILL');
+      }
+      return;
+    }
+    fails = 0;
     t.checkedAt = new Date().toISOString();
     t.state = s.BackendState || 'NoState';
     t.name = s.Self?.DNSName?.replace(/\.$/, '') || null;

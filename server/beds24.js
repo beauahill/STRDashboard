@@ -3,21 +3,34 @@
 import { getSetting, setSetting } from './db.js';
 
 const BASE = process.env.BEDS24_BASE || 'https://beds24.com/api/v2';
+// How far each sync has got; cleared on connect so a new connection (maybe another account) starts with a full sync.
+const SYNC_MARKS = ['last_sync', 'messages_synced', 'last_full_check'];
 
 export class Beds24Client {
-  constructor(db, fetchImpl = fetch) {
+  constructor(db, fetchImpl = fetch, { timeoutMs = 30000 } = {}) {
     this.db = db;
     this.fetch = fetchImpl;
+    this.timeoutMs = timeoutMs;
   }
 
   get connected() { return !!getSetting(this.db, 'beds24_refresh_token'); }
 
+  /** Every request has a deadline: a connection Beds24 accepts but never answers must not wedge syncing for minutes. */
+  async #call(url, opts) {
+    try { return await this.fetch(url, { ...opts, signal: AbortSignal.timeout(this.timeoutMs) }); }
+    catch (e) {
+      if (e?.name === 'TimeoutError' || e?.name === 'AbortError') throw new Error(`Beds24 didn't answer within ${this.timeoutMs / 1000} s`);
+      throw e;
+    }
+  }
+
   /** Exchange a one-time invite code (Beds24: Settings > Apps & Integrations > API) for tokens. */
   async connect(inviteCode) {
-    const res = await this.fetch(`${BASE}/authentication/setup`, { headers: { code: inviteCode.trim(), deviceName: 'STR Dashboard' } });
+    const res = await this.#call(`${BASE}/authentication/setup`, { headers: { code: inviteCode.trim(), deviceName: 'STR Dashboard' } });
     const body = await res.json().catch(() => ({}));
     if (!res.ok || !body.refreshToken) throw new Error(body.error || `Beds24 setup failed (${res.status})`);
     setSetting(this.db, 'beds24_refresh_token', body.refreshToken);
+    for (const k of SYNC_MARKS) setSetting(this.db, k, null);
     this.#cacheToken(body.token, body.expiresIn);
     await this.refreshScopes().catch(() => {});
   }
@@ -54,8 +67,8 @@ export class Beds24Client {
     const cached = getSetting(this.db, 'beds24_token');
     if (!force && cached && Number(getSetting(this.db, 'beds24_token_exp')) > Date.now()) return cached;
     const refresh = getSetting(this.db, 'beds24_refresh_token');
-    if (!refresh) throw new Error('Not connected to Beds24');
-    const res = await this.fetch(`${BASE}/authentication/token`, { headers: { refreshToken: refresh } });
+    if (!refresh) throw Object.assign(new Error('Not connected to Beds24'), { status: 400 });
+    const res = await this.#call(`${BASE}/authentication/token`, { headers: { refreshToken: refresh } });
     const body = await res.json().catch(() => ({}));
     if (!res.ok || !body.token) throw new Error(body.error || `Beds24 token refresh failed (${res.status})`);
     this.#cacheToken(body.token, body.expiresIn);
@@ -70,14 +83,18 @@ export class Beds24Client {
     }
     const headers = { token: await this.#token(retried) };
     if (body !== undefined) headers['content-type'] = 'application/json';
-    const res = await this.fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    const res = await this.#call(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
     if (res.status === 401 && !retried) return this.#request(method, path, { query, body }, true);
     if (res.status === 429) throw new Error('Beds24 rate limit hit - try again in a few minutes');
-    const json = await res.json().catch(() => ({}));
+    const json = await res.json().catch(() => undefined);
     if (res.status === 403) {
-      throw Object.assign(new Error(json.error || 'Beds24 refused this: the invite code doesn\'t have permission for it.'), { status: 403 });
+      throw Object.assign(new Error(json?.error || 'Beds24 refused this: the invite code doesn\'t have permission for it.'), { status: 403 });
     }
-    if (!res.ok) throw new Error(json.error || `Beds24 ${path} failed (${res.status})`);
+    if (!res.ok) throw new Error(json?.error || `Beds24 ${path} failed (${res.status})`);
+    // A 2xx that isn't Beds24's JSON (a maintenance page, a proxy) or says success:false is an error, not an empty
+    // result: taken as data it would move the sync watermark past changes that were never fetched.
+    if (json == null || typeof json !== 'object') throw new Error(`Beds24 ${path} returned ${res.headers?.get?.('content-type') || 'no content type'} instead of JSON (${res.status})`);
+    if (json.success === false) throw new Error(json.error || `Beds24 ${path} failed`);
     return json;
   }
 
@@ -90,7 +107,8 @@ export class Beds24Client {
     const rows = [];
     for (let page = 1; page < 200; page++) {
       const body = await this.get(path, { ...query, page });
-      rows.push(...(body.data || []));
+      if (!Array.isArray(body.data)) throw new Error(`Beds24 ${path} returned no data list`);
+      rows.push(...body.data);
       if (!body.pages?.nextPageExists) break;
     }
     return rows;
