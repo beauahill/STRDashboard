@@ -6,11 +6,20 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': 
 const fmtDate = s => new Date(s + 'T00:00:00Z').toLocaleDateString(undefined, {
   month: 'short', day: 'numeric', timeZone: 'UTC', ...(s.slice(0, 4) !== String(new Date().getFullYear()) && { year: 'numeric' }) });
 const tag = t => `<span class="tag ${esc(t)}">${esc(t)}</span>`;
+// A booking removed in Beds24 keeps its row with its own muted label; it is never shown like a confirmed stay.
+const statusTag = s => s === 'deleted' ? '<span class="tag deleted">Deleted in Beds24</span>' : tag(s);
 let status = {};
 
 // Each page render gets a number. A page load (GET) that finishes after the owner has moved to another page is
 // dropped ("stale") instead of drawing the old page over the new one.
 let renderSeq = 0;
+// Same for reloads within a page (‹ ›, a year or room select): each gets a number per page, and a slower earlier
+// load finds it is no longer the latest and draws nothing.
+const pageSeq = {};
+const stamp = k => { const n = pageSeq[k] = (pageSeq[k] || 0) + 1; return () => pageSeq[k] === n; };
+// A failed request in a handler that has no page of its own to draw into: show it, unless the owner was signed
+// out (the login form is already up) or has moved on.
+const fail = err => { if (!['login', 'stale'].includes(err.message)) banner(err.message, true); };
 async function api(path, opts = {}) {
   const seq = renderSeq, load = !opts.method || opts.method === 'GET';
   const res = await fetch('/api' + path, { ...opts, body: opts.body && JSON.stringify(opts.body), headers: { 'content-type': 'application/json' } });
@@ -25,9 +34,46 @@ const q = (extra = {}) => new URLSearchParams({ ...(prop() && { property: prop()
 
 // kind: true/'err' = problem, 'ok' = success, otherwise a neutral notice.
 function banner(msg, kind) { if (msg === 'stale') return; const b = $('#banner'); b.hidden = !msg; b.textContent = msg || ''; b.className = kind === true || kind === 'err' ? 'err' : kind === 'ok' ? 'ok' : ''; }
+// What the banner goes back to after a page change: a failed sync stays up until the next one; everything else
+// (a page that didn't load, "Saved.") belongs to the page it was shown on.
+let stickyBanner = '';
+
+// Re-rendering after a change rebuilds the page's forms from the server. Fields the owner has changed and not saved
+// (an open automation editor, a half-filled lock or pricing form) are carried over, so toggling a switch next to
+// them can't wipe ten minutes of typing. Taken when the change starts, put back once the page has redrawn.
+let drafts = null;
+const routeOf = () => location.hash.replace(/^#\/?/, '').split('?')[0].split('/');
+const formKey = f => f.id || `${f.className}:${f.dataset.form ?? f.dataset.prop ?? f.dataset.pid ?? ''}`;
+const fieldKey = el => el.type === 'checkbox' || el.type === 'radio' ? `${el.name}=${el.value}` : el.name;
+const defaultOf = el => el.tagName === 'SELECT' ? ([...el.options].find(o => o.defaultSelected) || el.options[0])?.value : el.defaultValue;
+function takeDrafts(except) {
+  drafts = { route: routeOf()[0], forms: {} };
+  for (const f of view.querySelectorAll('form')) {
+    if (f === except) continue;
+    for (const el of f.elements) {
+      if (!el.name || ['file', 'submit', 'button', 'reset'].includes(el.type)) continue;
+      const box = el.type === 'checkbox' || el.type === 'radio';
+      if (box ? el.checked !== el.defaultChecked : el.value !== defaultOf(el)) (drafts.forms[formKey(f)] ||= {})[fieldKey(el)] = box ? el.checked : el.value;
+    }
+  }
+}
+function restoreDrafts(route) {
+  if (!drafts || drafts.route !== route) return;
+  for (const f of view.querySelectorAll('form')) for (const [k, v] of Object.entries(drafts.forms[formKey(f)] || {})) {
+    const el = [...f.elements].find(x => fieldKey(x) === k);
+    if (!el) continue;
+    if (typeof v === 'boolean') el.checked = v; else el.value = v;
+    el.dispatchEvent(new Event(el.tagName === 'INPUT' && !['checkbox', 'radio'].includes(el.type) || el.tagName === 'TEXTAREA' ? 'input' : 'change', { bubbles: true }));
+  }
+  drafts = null;
+}
+// A form being submitted is the one change act() must not carry a draft for: its saved values come back from the server.
+let submitting = null;
+view.addEventListener('submit', e => { submitting = e.target; queueMicrotask(() => { submitting = null; }); }, true);
 
 function showLogin() {
   clearInterval(pageTimer); pageTimer = null;   // a poll would redraw the form under a half-typed password
+  banner('');                                   // "Working…" from a change that hit the expired session
   document.body.classList.add('signed-out');
   view.innerHTML = `<form class="card stack login"><h3>Sign in</h3><input type="password" name="password" placeholder="Password" autofocus><button class="primary">Sign in</button><div class="sub" id="lerr"></div></form>`;
   view.querySelector('form').onsubmit = async e => {
@@ -93,12 +139,14 @@ async function calendarView() {
   const first = calState.month, next = addMonths(first, 1);
   const gridStart = addDaysISO(first, -new Date(first + 'T00:00:00Z').getUTCDay());
   const weeks = Math.ceil(daysBetween(gridStart, next) / 7);
+  const live = stamp('calendar');
   const c = await api('/calendar?' + q({ start: gridStart, days: weeks * 7 }));
+  if (!live()) return;
   const rooms = c.rooms;
   if (calState.room && !rooms.some(r => String(r.id) === calState.room)) calState.room = '';
   const inView = calState.room ? rooms.filter(r => String(r.id) === calState.room) : rooms;
   const roomIds = new Set(inView.map(r => r.id));
-  const bookings = c.bookings.filter(b => roomIds.has(b.room_id));
+  const bookings = c.bookings.filter(b => roomIds.has(b.room_id) && b.status !== 'deleted');   // gone from Beds24: those nights are open
   const doors = c.doors || {};
   // Prices only make sense when one room is in view.
   const priceRoom = inView.length === 1 ? inView[0].id : null;
@@ -140,7 +188,7 @@ async function calendarView() {
         calState.selected === b.id && 'sel'].filter(Boolean).join(' ');
       const roomTag = inView.length > 1 ? ` · ${rooms.find(r => r.id === b.room_id)?.name || ''}` : '';
       const label = (b.status === 'block' ? 'Blocked' : `${b.guest_name || 'Guest'}${doors[b.id] ? ' · 🔑' + doors[b.id].code : ''}`) + roomTag;
-      return `<div class="${cls}" data-bid="${b.id}" style="left:${s0 / 14 * 100}%;width:${(e0 - s0) / 14 * 100}%;top:${26 + lane * 24}px"
+      return `<div class="${cls}" data-bid="${b.id}" role="button" tabindex="0" style="left:${s0 / 14 * 100}%;width:${(e0 - s0) / 14 * 100}%;top:${26 + lane * 24}px"
         title="${esc(`${b.status === 'block' ? 'Blocked' : b.guest_name || 'Guest'} · ${fmtDate(b.arrival)} → ${fmtDate(b.departure)}`)}">${esc(label)}</div>`;
     }).join('');
     html += `<div class="mweek" style="min-height:${Math.max(84, 34 + laneEnd.length * 24)}px"><div class="mdays">${cells}</div>${bars}</div>`;
@@ -152,7 +200,7 @@ async function calendarView() {
       <button id="cprev" aria-label="Previous month">‹</button><button id="ctoday">Today</button><button id="cnext" aria-label="Next month">›</button>
       <h3 style="margin:0 8px;font-size:16px;text-transform:none;letter-spacing:0;color:var(--ink)">${new Date(first + 'T00:00:00Z').toLocaleDateString(undefined, { month: 'long', year: 'numeric', timeZone: 'UTC' })}</h3>
       <input type="month" id="cmonth" value="${first.slice(0, 7)}" aria-label="Jump to month">
-      ${rooms.length > 1 ? `<select id="croom"><option value="">All rooms</option>${rooms.map(r => `<option value="${r.id}" ${String(r.id) === calState.room ? 'selected' : ''}>${esc(r.property_name)} · ${esc(r.name)}</option>`).join('')}</select>` : ''}
+      ${rooms.length > 1 ? `<select id="croom" aria-label="Room"><option value="">All rooms</option>${rooms.map(r => `<option value="${r.id}" ${String(r.id) === calState.room ? 'selected' : ''}>${esc(r.property_name)} · ${esc(r.name)}</option>`).join('')}</select>` : ''}
       <span class="sub" style="margin-left:auto">${booked} of ${available} nights booked (${available ? Math.round(booked / available * 100) : 0}%) · ${money(revenue)}</span>
     </div>
     <div class="mcal"><div class="mhead">${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(d => `<div>${d}</div>`).join('')}</div>${html}</div>
@@ -160,7 +208,7 @@ async function calendarView() {
       <span><i class="sw block"></i>Blocked</span><span><i class="sw request"></i>Request</span>${Object.keys(night).length ? '<span>Nightly prices from the Rates page</span>' : ''}</div>
   </div>
   ${sel ? `<div class="card" style="margin-top:14px" id="cdetail">
-    <div class="toolbar" style="margin:0"><h3 style="margin:0">${sel.status === 'block' ? 'Blocked dates' : esc(sel.guest_name || 'Guest')}</h3>${sel.status === 'block' ? '' : tag(sel.channel) + ' ' + tag(sel.status)}<button id="cclose" style="margin-left:auto">Close</button></div>
+    <div class="toolbar" style="margin:0"><h3 style="margin:0">${sel.status === 'block' ? 'Blocked dates' : esc(sel.guest_name || 'Guest')}</h3>${sel.status === 'block' ? '' : tag(sel.channel) + ' ' + statusTag(sel.status)}<button id="cclose" style="margin-left:auto">Close</button></div>
     <ul class="list"><li><span>Stay</span><span>${fmtDate(sel.arrival)} → ${fmtDate(sel.departure)} · ${sel.nights} night${sel.nights === 1 ? '' : 's'}</span></li>
       ${sel.status === 'block' ? '' : `<li><span>Guests</span><span>${sel.adults || 0} adult${sel.adults === 1 ? '' : 's'}${sel.children ? `, ${sel.children} child${sel.children === 1 ? '' : 'ren'}` : ''}</span></li>
       <li><span>Total</span><span>${money(sel.price)}${sel.nights ? ` <span class="sub">(${money(sel.price / sel.nights)}/night)</span>` : ''}</span></li>`}
@@ -174,26 +222,32 @@ async function calendarView() {
   $('#ctoday').onclick = () => go(today.slice(0, 8) + '01');
   $('#cmonth').onchange = e => e.target.value && go(e.target.value + '-01');
   if ($('#croom')) $('#croom').onchange = e => { calState.room = e.target.value; calendarView(); };
-  view.querySelectorAll('.mbar[data-bid]').forEach(el => el.onclick = () => {
-    calState.selected = calState.selected === +el.dataset.bid ? null : +el.dataset.bid;
-    calendarView().then(() => $('#cdetail')?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }));
+  view.querySelectorAll('.mbar[data-bid]').forEach(el => {
+    const pick = key => {
+      const id = +el.dataset.bid;
+      calState.selected = calState.selected === id ? null : id;
+      calendarView().then(() => { if (key) view.querySelector(`.mbar[data-bid="${id}"]`)?.focus({ preventScroll: true }); $('#cdetail')?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); });
+    };
+    el.onclick = () => pick(false); el.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(true); } };
   });
   if ($('#cclose')) $('#cclose').onclick = () => { calState.selected = null; calendarView(); };
 }
 
 async function bookingsView() {
-  view.innerHTML = `<div class="toolbar"><input id="bq" placeholder="Search guest, email, ref…" size="28">
-    <select id="bs"><option value="">Any status</option><option>confirmed</option><option>new</option><option>request</option><option>inquiry</option><option>cancelled</option><option>block</option></select>
-    <select id="bc"><option value="">Any channel</option><option>Airbnb</option><option>Booking.com</option><option>VRBO</option><option>Direct</option></select></div>
+  view.innerHTML = `<div class="toolbar"><input id="bq" placeholder="Search guest, email, ref…" aria-label="Search bookings" size="28">
+    <select id="bs" aria-label="Status"><option value="">Any status</option><option>confirmed</option><option>new</option><option>request</option><option>inquiry</option><option>cancelled</option><option>block</option><option value="deleted">deleted in Beds24</option></select>
+    <select id="bc" aria-label="Channel"><option value="">Any channel</option><option>Airbnb</option><option>Booking.com</option><option>VRBO</option><option>Direct</option></select></div>
     <div class="card" style="overflow-x:auto"><table><thead><tr><th>Guest</th><th>Property / room</th><th>Dates</th><th>Nights</th><th>Guests</th><th>Channel</th><th>Status</th><th>Total</th></tr></thead><tbody id="rows"></tbody></table></div>`;
   const load = async () => {
+    const live = stamp('bookings');
     const rows = await api('/bookings?' + q({ q: $('#bq').value, status: $('#bs').value, channel: $('#bc').value }));
+    if (!live() || !$('#rows')) return;
     $('#rows').innerHTML = rows.map(b => `<tr title="${esc(b.notes || '')}"><td>${esc(b.guest_name || '—')}<div class="sub">${esc(b.email || '')}</div></td>
       <td>${esc(b.property_name)}<div class="sub">${esc(b.room_name)}</div></td><td>${fmtDate(b.arrival)} → ${fmtDate(b.departure)}</td><td>${b.nights}</td>
-      <td>${b.adults + b.children}</td><td>${tag(b.channel)}${b.source === 'guesty' ? ' <span class="sub" title="Imported from Guesty history">Guesty</span>' : ''}</td><td>${tag(b.status)}</td><td>${money(b.price)}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">No bookings</td></tr>';
+      <td>${b.adults + b.children}</td><td>${tag(b.channel)}${b.source === 'guesty' ? ' <span class="sub" title="Imported from Guesty history">Guesty</span>' : ''}</td><td>${statusTag(b.status)}</td><td>${money(b.price)}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">No bookings</td></tr>';
   };
-  let t; $('#bq').oninput = () => { clearTimeout(t); t = setTimeout(load, 250); };
-  $('#bs').onchange = $('#bc').onchange = load;
+  let t; $('#bq').oninput = () => { clearTimeout(t); t = setTimeout(() => load().catch(fail), 250); };
+  $('#bs').onchange = $('#bc').onchange = () => load().catch(fail);
   await load();
 }
 
@@ -210,7 +264,7 @@ async function settingsView() {
     ${status.connected ? '<button id="dc">Disconnect</button>' : ''}
     ${status.demo ? '<hr><button id="cleardemo">Clear demo data</button>'
       : status.connected ? '' : '<hr><button id="demo">Load demo data</button><div class="sub">Fills the app with sample properties and bookings so you can try it before connecting. Connecting to Beds24 removes it automatically.</div>'}
-    ${status.auth ? '<hr><button id="lo">Sign out</button>' : ''}</div>
+    ${status.auth ? '<hr><div class="toolbar" style="margin:0"><button id="lo">Sign out</button><button id="loall">Sign out everywhere</button></div><div class="sub">Everywhere: every phone and browser signed in to this dashboard has to sign in again.</div>' : ''}</div>
     <div class="card stack" style="margin-top:14px"><h3>Phone notifications</h3>
       <div>${NS.enabled ? '✅ On' : 'Off'}${N.error ? ` · <span class="bad">Last send failed: ${esc(N.error)}</span>` : ''}</div>
       <div class="sub">Alerts on your phones through the free <a href="https://ntfy.sh" target="_blank" rel="noopener">ntfy</a> app, within about a minute of a guest message. Tap one to open that conversation.</div>
@@ -256,7 +310,9 @@ async function settingsView() {
   $('#cf').onsubmit = async e => { e.preventDefault(); await act(() => api('/connect', { method: 'POST', body: { inviteCode: e.target.code.value } })); };
   if ($('#demo')) $('#demo').onclick = () => act(() => api('/demo', { method: 'POST' }));
   if ($('#cleardemo')) $('#cleardemo').onclick = () => act(() => api('/demo/clear', { method: 'POST' }));
-  if ($('#lo')) $('#lo').onclick = async () => { await api('/logout', { method: 'POST' }); showLogin(); };
+  const signOut = path => async () => { try { await api(path, { method: 'POST' }); showLogin(); } catch (err) { fail(err); } };
+  if ($('#lo')) $('#lo').onclick = signOut('/logout');
+  if ($('#loall')) $('#loall').onclick = () => confirm('Sign out on every phone and browser? Each one has to sign in again.') && signOut('/logout-all')();
   if ($('#dc')) $('#dc').onclick = () => act(() => api('/disconnect', { method: 'POST' }));
   $('#ncopy').onclick = async () => {
     try { await navigator.clipboard.writeText(NS.topic); $('#ncopy').textContent = 'Copied'; }
@@ -341,7 +397,9 @@ const addMonths = (m, n) => { const d = new Date(m + 'T00:00:00Z'); d.setUTCMont
 async function ratesView() {
   const today = todayISO();
   ratesState.start ||= today.slice(0, 8) + '01';
+  const live = stamp('rates');
   const r = await api('/rates?' + q({ start: ratesState.start, days: 62, ...(ratesState.room && { room: ratesState.room }) }));
+  if (!live()) return;
   if (!r.room) {
     view.innerHTML = `<div class="card empty">${r.connected ? 'No rooms found in Beds24 yet. Set up your property and room in Beds24, then press Sync.' : 'Connect Beds24 in Settings to see and change your prices.'}</div>`;
     return;
@@ -358,7 +416,7 @@ async function ratesView() {
       const date = `${m.slice(0, 8)}${String(i).padStart(2, '0')}`, d = byDate[date] || {};
       const cls = ['day', date < today && 'past', d.blocked && 'blocked', d.booking && `booked ${d.booking.status === 'block' ? '' : d.booking.channel}`, inSel(date) && 'sel'].filter(Boolean).join(' ');
       const who = d.booking ? (d.booking.status === 'block' ? 'Block' : (d.booking.guest || 'Booked').split(' ')[0]) : d.blocked ? 'Blocked' : '';
-      cells += `<div class="${cls}" data-date="${date}" title="${esc(d.booking ? `${d.booking.guest || 'Booking'} (${d.booking.channel})` : '')}">
+      cells += `<div class="${cls}" data-date="${date}" ${date < today ? '' : 'role="button" tabindex="0"'} title="${esc(d.booking ? `${d.booking.guest || 'Booking'} (${d.booking.channel})` : '')}">
         <div class="n">${i}</div><div class="p">${d.price != null ? money(d.price) : '—'}</div>${d.minStay ? `<div class="m">${d.minStay}n min</div>` : ''}<div class="g">${esc(who)}</div></div>`;
     }
     return `<div class="month"><h4>${first.toLocaleDateString(undefined, { month: 'long', year: 'numeric', timeZone: 'UTC' })}</h4>
@@ -371,8 +429,8 @@ async function ratesView() {
   view.innerHTML = `${notice ? `<div class="notice">${notice}</div>` : ''}
     <div class="rates"><div class="card">
       <div class="toolbar">
-        ${r.rooms.length > 1 ? `<select id="rroom">${r.rooms.map(x => `<option value="${x.id}" ${x.id === r.room.id ? 'selected' : ''}>${esc(x.property_name)} · ${esc(x.name)}</option>`).join('')}</select>` : `<b>${esc(r.room.property_name)}</b>`}
-        <button id="rprev">‹</button><button id="rtoday">Today</button><button id="rnext">›</button>
+        ${r.rooms.length > 1 ? `<select id="rroom" aria-label="Room">${r.rooms.map(x => `<option value="${x.id}" ${x.id === r.room.id ? 'selected' : ''}>${esc(x.property_name)} · ${esc(x.name)}</option>`).join('')}</select>` : `<b>${esc(r.room.property_name)}</b>`}
+        <button id="rprev" aria-label="Previous month">‹</button><button id="rtoday">Today</button><button id="rnext" aria-label="Next month">›</button>
         <span class="sub">Click a night, then another, to select a range.</span></div>
       <div class="months">${months.map(monthHtml).join('')}</div></div>
     <div class="card stack" style="max-width:none"><h3>Change selected nights</h3>
@@ -403,14 +461,17 @@ async function ratesView() {
     weekdays: [...form.querySelectorAll('[name=wd]:checked')].map(x => Number(x.value)),
     price: form.price.value, minStay: form.minStay.value, block: form.block.value,
   });
-  view.querySelectorAll('.day[data-date]').forEach(el => el.onclick = () => {
-    const d = el.dataset.date;
-    if (d < today) return;
-    ratesState.form = readForm();
-    if (!ratesState.from || ratesState.to) { ratesState.from = d; ratesState.to = null; }
-    else if (d < ratesState.from) { ratesState.to = ratesState.from; ratesState.from = d; }
-    else ratesState.to = d;
-    ratesView();
+  view.querySelectorAll('.day[data-date]').forEach(el => {
+    const pick = key => {
+      const d = el.dataset.date;
+      if (d < today) return;
+      ratesState.form = readForm();
+      if (!ratesState.from || ratesState.to) { ratesState.from = d; ratesState.to = null; }
+      else if (d < ratesState.from) { ratesState.to = ratesState.from; ratesState.from = d; }
+      else ratesState.to = d;
+      ratesView().then(() => key && view.querySelector(`.day[data-date="${d}"]`)?.focus({ preventScroll: true }));
+    };
+    el.onclick = () => pick(false); el.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(true); } };
   });
   form.onsubmit = async e => {
     e.preventDefault();
@@ -471,7 +532,7 @@ async function locksView() {
     <div class="cols">
     <div class="card" style="overflow-x:auto"><h3>Locks</h3>
       ${L.locks.length ? `<table><tr><th>Lock</th><th>Status</th><th>Battery</th><th>Opens</th></tr>${L.locks.map(l => `<tr>
-        <td>${esc(l.name)}</td><td>${l.online ? '<span class="ok">● Online</span>' : '<span class="bad">● Offline</span>'}</td>
+        <td>${esc(l.name)}</td><td>${l.missing ? '<span class="sub">not listed by Seam</span>' : l.online ? '<span class="ok">● Online</span>' : '<span class="bad">● Offline</span>'}</td>
         <td>${l.battery != null ? Math.round(l.battery * 100) + '%' : '—'}</td>
         <td><select data-lock="${esc(l.device_id)}">${roomOpts(l.room_id)}</select></td></tr>`).join('')}</table>`
         : '<div class="empty">No locks yet. Connect your Yale account, then refresh.</div>'}
@@ -516,7 +577,7 @@ async function locksView() {
         <td><button data-ochange="${i}">Change</button> <button data-odel="${i}">Delete</button></td></tr>`).join('')}</table>` : '<div class="empty">No other codes.</div>'}
       <form id="aform" class="toolbar" style="margin:6px 0 0">
         <input name="name" placeholder="Name, e.g. Cleaner" size="16"><input name="code" placeholder="Code (4–8 digits)" size="14" inputmode="numeric">
-        ${L.locks.map(l => `<label class="sub"><input type="checkbox" name="dev" value="${esc(l.device_id)}" checked> ${esc(l.name)}</label>`).join('')}
+        ${L.locks.filter(l => !l.missing).map(l => `<label class="sub"><input type="checkbox" name="dev" value="${esc(l.device_id)}" checked> ${esc(l.name)}</label>`).join('')}
         <label class="sub">From <input type="datetime-local" name="startsAt"></label><label class="sub">To <input type="datetime-local" name="endsAt"></label>
         <button class="primary">Add code</button><span class="sub">Leave From/To empty for a permanent code.</span></form></div>`;
 
@@ -568,16 +629,18 @@ const timeAgo = t => {
 const fill = (body, vars) => body.replace(/\{(\w+)\}/g, (m, k) => (vars[k] !== undefined && vars[k] !== '' ? String(vars[k]) : m));
 
 async function inboxView() {
+  const seq = renderSeq;
   view.innerHTML = `<div class="inbox ${inbox.booking ? 'has-thread' : ''}">
     <div class="card convs"><div class="toolbar" style="margin-bottom:6px">
-      <select id="ifilter">${[['all', 'All'], ['unread', 'Unread'], ['upcoming', 'Current & upcoming'], ['inquiries', 'Inquiries']].map(([v, l]) => `<option value="${v}" ${inbox.filter === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
-      <input id="iq" placeholder="Search" value="${esc(inbox.q)}" style="flex:1;min-width:0"></div>
+      <select id="ifilter" aria-label="Show">${[['all', 'All'], ['unread', 'Unread'], ['upcoming', 'Current & upcoming'], ['inquiries', 'Inquiries']].map(([v, l]) => `<option value="${v}" ${inbox.filter === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      <input id="iq" placeholder="Search" aria-label="Search messages" value="${esc(inbox.q)}" style="flex:1;min-width:0"></div>
       <div id="ilist"></div></div>
     <div class="card tpane" id="ithread">${inbox.booking ? '' : '<div class="empty" style="padding:40px;text-align:center">Choose a conversation</div>'}</div></div>`;
-  $('#ifilter').onchange = e => { inbox.filter = e.target.value; loadList(); };
-  let t; $('#iq').oninput = e => { clearTimeout(t); t = setTimeout(() => { inbox.q = e.target.value; loadList(); }, 250); };
+  $('#ifilter').onchange = e => { inbox.filter = e.target.value; loadList().catch(fail); };
+  let t; $('#iq').oninput = e => { clearTimeout(t); t = setTimeout(() => { inbox.q = e.target.value; loadList().catch(fail); }, 250); };
   await loadList();
   if (inbox.booking) await openThread(inbox.booking);
+  if (seq !== renderSeq) return;   // the owner left while the thread was loading: no poll for a page that's gone
   // Check for new messages every minute while the inbox is open and visible.
   pageTimer = setInterval(async () => {
     if (document.hidden) return;
@@ -598,7 +661,7 @@ async function loadList() {
   if (!list) return;
   list.innerHTML = (r.error ? `<div class="warn sub">Couldn't fetch new messages: ${esc(r.error)}</div>` : '') + (r.conversations.length ? r.conversations.map(c => `
     <button class="conv ${c.booking_id === inbox.booking ? 'on' : ''} ${c.unread ? 'unread' : ''}" data-conv="${c.booking_id}">
-      <span class="top"><b>${esc(c.guest_name || `Booking ${c.booking_id}`)}</b> ${c.channel ? tag(c.channel) : ''}${c.status === 'inquiry' ? ' <span class="tag request">inquiry</span>' : ''}<span class="sub when">${timeAgo(c.last_time)}</span></span>
+      <span class="top"><b>${esc(c.guest_name || `Booking ${c.booking_id}`)}</b> ${c.channel ? tag(c.channel) : ''}${c.status === 'inquiry' ? ' <span class="tag request">inquiry</span>' : c.status === 'deleted' ? ' ' + statusTag(c.status) : ''}<span class="sub when">${timeAgo(c.last_time)}</span></span>
       <span class="sub">${c.arrival ? `${fmtDate(c.arrival)} → ${fmtDate(c.departure)}` : ''}${c.unread ? ` · <b class="ucount">${c.unread} new</b>` : ''}</span>
       <span class="snip">${c.last_source === 'host' ? 'You: ' : ''}${esc((c.last_body || '').slice(0, 90))}</span></button>`).join('')
     : `<div class="empty" style="padding:20px">${r.connected ? 'No messages yet. New guest messages from Airbnb, Booking.com and VRBO appear here.' : 'Connect Beds24 in Settings to see guest messages.'}</div>`);
@@ -607,6 +670,12 @@ async function loadList() {
 
 async function openThread(id) {
   inbox.booking = id;
+  // The thread gets its own address and history entry, so a phone's back gesture (or ‹) returns to the list and a
+  // reload reopens what was on screen. Moving between threads replaces the entry: back always means the list.
+  if (location.hash !== '#/inbox/' + id) {
+    const inThread = /^#\/inbox\/\d+/.test(location.hash);
+    history[inThread ? 'replaceState' : 'pushState'](inThread ? history.state : { list: true }, '', '#/inbox/' + id);
+  }
   document.querySelector('.inbox')?.classList.add('has-thread');
   document.querySelectorAll('.conv').forEach(el => el.classList.toggle('on', +el.dataset.conv === id));
   let th;
@@ -621,21 +690,28 @@ async function openThread(id) {
   }
   if (inbox.booking !== id) return;   // another conversation was opened meanwhile
   renderThread(th);
-  if (th.messages.some(m => m.source === 'guest' && !m.read)) {
-    api('/inbox/read', { method: 'POST', body: { bookingId: id } }).then(loadList).catch(() => {});
-  }
+  markRead(id, th);
+}
+
+// A guest message the owner has on screen (in a visible tab) counts as read, whether it was there when the thread
+// opened or arrived with the minute poll.
+function markRead(id, th) {
+  if (document.hidden || !th.messages.some(m => m.source === 'guest' && !m.read)) return;
+  api('/inbox/read', { method: 'POST', body: { bookingId: id } }).then(loadList).catch(() => {});
 }
 
 async function loadThreadMessages(id) {
   const th = await api('/inbox/thread?booking=' + id);
-  if (inbox.booking === id && $('#imsgs')) { $('#imsgs').innerHTML = messagesHtml(th); scrollThread(); }
+  if (inbox.booking !== id || !$('#imsgs')) return;
+  $('#imsgs').innerHTML = messagesHtml(th); scrollThread();
+  markRead(id, th);
 }
 
 const scrollThread = () => { const m = $('#imsgs'); if (m) m.scrollTop = m.scrollHeight; };
 const messagesHtml = th => th.messages.map(m => {
   const who = { guest: th.booking?.guest_name?.split(' ')[0] || 'Guest', host: 'You', system: 'Channel notice', internalNote: 'Internal note' }[m.source] || m.source;
   const att = m.attachment_name ? `<a class="att" href="/api/inbox/attachment?id=${m.id}" target="_blank" rel="noopener">📎 ${esc(m.attachment_name)}</a>` : '';
-  return `<div class="msg ${m.source}"><div class="bubble">${esc(m.body).replace(/\n/g, '<br>')}${att}</div>
+  return `<div class="msg ${esc(m.source)}"><div class="bubble">${esc(m.body).replace(/\n/g, '<br>')}${att}</div>
     <div class="meta">${esc(who)} · ${new Date(m.time).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</div></div>`;
 }).join('') || '<div class="empty" style="text-align:center;padding:20px">No messages in this conversation yet.</div>';
 
@@ -648,8 +724,8 @@ function renderThread(th) {
     : b.channel === 'Direct' ? 'Direct bookings: Beds24 may not notify the guest of this message. Email or text them if it\'s urgent.'
     : `Sent to the guest's ${esc(b.channel)} message thread.`;
   pane.innerHTML = `
-    <div class="thead"><button class="back" id="iback">‹</button>
-      <div><b>${esc(b?.guest_name || `Booking ${id}`)}</b> ${b ? tag(b.channel) + ' ' + tag(b.status) : ''}
+    <div class="thead"><button class="back" id="iback" aria-label="Back to conversations">‹</button>
+      <div><b>${esc(b?.guest_name || `Booking ${id}`)}</b> ${b ? tag(b.channel) + ' ' + statusTag(b.status) : ''}
       <div class="sub">${b ? `${fmtDate(b.arrival)} → ${fmtDate(b.departure)} · ${b.nights} night${b.nights === 1 ? '' : 's'}${(b.adults || 0) + (b.children || 0) ? ` · ${(b.adults || 0) + (b.children || 0)} guests` : ''}${b.property_name ? ' · ' + esc(b.property_name) : ''}` : ''}
         ${th.door ? ` · 🔑 <b class="code">${esc(th.door.code)}</b>` : ''}</div></div>
       <button id="ireload" title="Check for new messages" style="margin-left:auto">↻</button></div>
@@ -665,7 +741,9 @@ function renderThread(th) {
       <div id="imgr"></div></div>`
     : `<div class="sub" style="padding:10px">${b ? 'Replies can only be sent on Beds24 bookings (this one was imported from Guesty).' : 'This booking isn\'t in the app yet; press Sync.'}</div>`}`;
   scrollThread();
-  $('#iback').onclick = () => { inbox.booking = null; document.querySelector('.inbox')?.classList.remove('has-thread'); };
+  // Back through history when the list is the previous entry (opened from it); a deep link from a notification has
+  // nothing behind it, so go to the list directly. Either way the hash change redraws the inbox without a thread.
+  $('#iback').onclick = () => { if (history.state?.list) history.back(); else location.hash = '#/inbox'; };
   $('#ireload').onclick = async () => {
     try { const t2 = await api('/inbox/reload', { method: 'POST', body: { bookingId: id } }); if (inbox.booking === id && $('#imsgs')) { $('#imsgs').innerHTML = messagesHtml(t2); scrollThread(); } }
     catch (err) { if (err.message !== 'login') banner(err.message, true); }
@@ -740,7 +818,8 @@ function renderReplyManager(th) {
   });
   box.querySelectorAll('[data-rdel]').forEach(a => a.onclick = async e => {
     e.preventDefault(); const r = inbox.replies.find(x => x.id === +a.dataset.rdel);
-    if (confirm(`Delete the saved reply "${r.title}"?`)) { await api('/replies/delete', { method: 'POST', body: { id: r.id } }); await reload(); }
+    if (!confirm(`Delete the saved reply "${r.title}"?`)) return;
+    try { await api('/replies/delete', { method: 'POST', body: { id: r.id } }); await reload(); } catch (err) { fail(err); }
   });
 }
 
@@ -900,7 +979,9 @@ function signalsPanel(P) {
 async function pricingView() {
   const today = todayISO();
   pr.month ||= today.slice(0, 8) + '01';
+  const live = stamp('pricing');
   const P = await api('/pricing?' + q({ start: pr.month, days: 62, ...(pr.room && { room: pr.room }) }));
+  if (!live()) return;
   if (!P.room) { view.innerHTML = `<div class="card empty">${P.connected === false ? 'Connect Beds24 in Settings first.' : 'No rooms found in Beds24 yet.'}</div>`; return; }
   pr.room = P.room.id;
   const S = P.settings, byDate = Object.fromEntries(P.nights.map(n => [n.date, n]));
@@ -939,7 +1020,7 @@ async function pricingView() {
     <td>${n.current != null ? money(n.current) : '—'}</td><td>${LEVEL_LABEL[n.level] || '—'}${n.score != null ? ` (${n.score})` : ''}</td><td>${esc(n.event || '')}</td></tr>`).join('');
 
   view.innerHTML = `${notice ? `<div class="notice">${notice}</div>` : ''}${P.error ? `<div class="notice">Auto-pricing problem: ${esc(P.error)}</div>` : ''}
-  <div class="toolbar pfilters">${P.rooms.length > 1 ? `<select id="proom">${P.rooms.map(r => `<option value="${r.id}" ${r.id === P.room.id ? 'selected' : ''}>${esc(r.property_name)} · ${esc(r.name)}</option>`).join('')}</select>` : `<b>${esc(P.room.property_name)}</b>`}
+  <div class="toolbar pfilters">${P.rooms.length > 1 ? `<select id="proom" aria-label="Room">${P.rooms.map(r => `<option value="${r.id}" ${r.id === P.room.id ? 'selected' : ''}>${esc(r.property_name)} · ${esc(r.name)}</option>`).join('')}</select>` : `<b>${esc(P.room.property_name)}</b>`}
     <div class="seg" role="group" aria-label="Window">${[30, 60, 90].map(d => `<button data-win="${d}" class="${pr.win === d ? 'on' : ''}" aria-pressed="${pr.win === d}">Next ${d} days</button>`).join('')}</div></div>
   ${P.needsBase ? `<div class="card stack" style="max-width:620px;margin-bottom:14px"><h3>Start here</h3>
     <div>Set a <b>base price</b>: your normal weeknight rate before any adjustments. Everything else builds on it.</div>
@@ -1040,15 +1121,18 @@ async function pricingView() {
   if ($('#pprev')) { $('#pprev').onclick = () => go(addMonths(pr.month, -1)); $('#pnext').onclick = () => go(addMonths(pr.month, 1)); $('#ptoday').onclick = () => go(today.slice(0, 8) + '01'); }
   if ($('#proom')) $('#proom').onchange = e => { pr.room = +e.target.value; pr.selected = null; pr.ai = { busy: false, html: '' }; pricingView(); };
   view.querySelectorAll('[data-pdate]').forEach(el => {
-    const pick = () => { hideTip(); pr.selected = pr.selected === el.dataset.pdate ? null : el.dataset.pdate; pricingView(); };
-    el.onclick = pick; el.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } };
+    // The page redraws around the chosen night; after Enter the keyboard user's place is put back on it.
+    const pick = key => { hideTip(); const d = el.dataset.pdate; pr.selected = pr.selected === d ? null : d; pricingView().then(() => key && view.querySelector(`[data-pdate="${d}"]`)?.focus({ preventScroll: true })); };
+    el.onclick = () => pick(false); el.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(true); } };
   });
   $('#psettings').ontoggle = e => { pr.open.settings = e.target.open; };
   $('#pevents').ontoggle = e => { pr.open.events = e.target.open; };
   if ($('#ptable')) $('#ptable').ontoggle = e => { pr.open.table = e.target.open; };
   // Event scout: a scan takes a minute or two; the page stays usable meanwhile.
   if ($('#pscan')) $('#pscan').onclick = async () => {
-    pr.scanning = true; pricingView();
+    if (pr.scanning) return;
+    pr.scanning = true; $('#pscan').disabled = true;   // before anything is awaited: a second tap must not start a second scan
+    pricingView();
     try {
       const r = await api('/pricing/scout', { method: 'POST' });
       banner(r.added ? `Found ${r.added} new event${r.added === 1 ? '' : 's'} to review.` : `No new events found (${r.found} checked).`, 'ok');
@@ -1108,7 +1192,8 @@ async function pricingView() {
       autoHorizon: v('autoHorizon'), autoThreshold: v('autoThreshold'), autoMaxChangePct: v('autoMaxChangePct') } }));
   };
   $('#psuggest').onclick = async () => {
-    const r = await api('/pricing/suggest', { method: 'POST', body: { roomId: pr.room } });
+    let r;
+    try { r = await api('/pricing/suggest', { method: 'POST', body: { roomId: pr.room } }); } catch (err) { return fail(err); }
     if (!r.enough) { $('#psuggestout').textContent = `Not enough history yet (${r.nights} nights; 20 needed).`; return; }
     f.base.value = r.base;
     r.season.forEach((v, i) => { f['season' + i].value = v; }); r.dow.forEach((v, i) => { f['dow' + i].value = v; });
@@ -1168,24 +1253,26 @@ const ANCHOR_LABELS = { booked: 'After a booking is made', cancelled: 'After a b
 const CHANNEL_LIST = ['Airbnb', 'Booking.com', 'VRBO', 'Direct', 'Other'];
 
 async function automationsView() {
+  const live = stamp('automations');
   const A = await api('/automations');
-  const statusTag = st => ({ sent: '<span class="ok">✓ sent</span>', failed: '<span class="bad">✗ failed</span>', waiting: '<span class="warn">⏳ waiting</span>',
+  if (!live()) return;
+  const sendTag = st => ({ sent: '<span class="ok">✓ sent</span>', failed: '<span class="bad">✗ failed</span>', waiting: '<span class="warn">⏳ waiting</span>',
     pending: '<span class="sub">pending</span>', skipped: '<span class="sub">skipped</span>', scheduled: '<span class="sub">scheduled</span>' })[st] || esc(st);
   const vars = [...A.builtins, ...new Set(A.properties.flatMap(p => Object.keys(p.vars)))];
   const editor = a => {
     const timed = ['arrival', 'departure'].includes(a.anchor);
     return `<form class="stack amform" data-form="${a.id || 'new'}" style="max-width:none;margin-top:10px">
-      <input name="name" value="${esc(a.name || '')}" placeholder="Name, e.g. Wi-Fi details">
-      <div class="toolbar" style="margin:0"><select name="anchor">${Object.entries(ANCHOR_LABELS).map(([k, l]) => `<option value="${k}" ${a.anchor === k ? 'selected' : ''}>${l}</option>`).join('')}</select>
-        <span class="timed" ${timed ? '' : 'hidden'}><input type="number" name="days" min="0" max="30" value="${Math.abs(a.offset_days || 0)}" style="width:4em"> day(s)
-          <select name="dir"><option value="-1" ${(a.offset_days || 0) < 0 ? 'selected' : ''}>before</option><option value="1" ${(a.offset_days || 0) > 0 ? 'selected' : ''}>after</option></select>
-          at <input type="time" name="at_time" value="${a.at_time || '10:00'}"></span>
-        <span class="event" ${timed ? 'hidden' : ''}>wait <input type="number" name="delay" min="0" max="1440" value="${a.delay_minutes ?? 5}" style="width:5em"> minutes</span></div>
+      <input name="name" value="${esc(a.name || '')}" placeholder="Name, e.g. Wi-Fi details" aria-label="Automation name">
+      <div class="toolbar" style="margin:0"><select name="anchor" aria-label="When">${Object.entries(ANCHOR_LABELS).map(([k, l]) => `<option value="${k}" ${a.anchor === k ? 'selected' : ''}>${l}</option>`).join('')}</select>
+        <span class="timed" ${timed ? '' : 'hidden'}><input type="number" name="days" min="0" max="30" value="${Math.abs(a.offset_days || 0)}" style="width:4em" aria-label="Days"> day(s)
+          <select name="dir" aria-label="Before or after"><option value="-1" ${(a.offset_days || 0) < 0 ? 'selected' : ''}>before</option><option value="1" ${(a.offset_days || 0) > 0 ? 'selected' : ''}>after</option></select>
+          at <input type="time" name="at_time" value="${a.at_time || '10:00'}" aria-label="Time of day"></span>
+        <span class="event" ${timed ? 'hidden' : ''}>wait <input type="number" name="delay" min="0" max="1440" value="${a.delay_minutes ?? 5}" style="width:5em" aria-label="Minutes to wait"> minutes</span></div>
       <div class="toolbar" style="margin:0"><span class="sub">Channels:</span>${CHANNEL_LIST.map(c => `<label class="sub"><input type="checkbox" name="ch" value="${c}" ${!a.channels || a.channels.includes(c) ? 'checked' : ''}> ${c}</label>`).join('')}
         <label class="sub">Only stays of at least <input type="number" name="min_nights" min="1" max="60" value="${a.min_nights || ''}" style="width:4em"> nights</label></div>
-      <textarea name="body" rows="6" maxlength="5000">${esc(a.body || '')}</textarea>
+      <textarea name="body" rows="6" maxlength="5000" aria-label="Message">${esc(a.body || '')}</textarea>
       <div class="chips">${vars.map(v => `<button type="button" class="chip" data-var="${v}">{${v}}</button>`).join('')}</div>
-      <div class="toolbar" style="margin:0"><select name="pb"><option value="">Preview with a booking…</option>${A.bookings.map(b => `<option value="${b.id}">${esc(b.guest_name || 'Guest')} · ${fmtDate(b.arrival)}</option>`).join('')}</select>
+      <div class="toolbar" style="margin:0"><select name="pb" aria-label="Preview with a booking"><option value="">Preview with a booking…</option>${A.bookings.map(b => `<option value="${b.id}">${esc(b.guest_name || 'Guest')} · ${fmtDate(b.arrival)}</option>`).join('')}</select>
         <button class="primary">Save</button><button type="button" data-cancel>Cancel</button></div>
       <div class="pvbox" hidden></div></form>`;
   };
@@ -1209,10 +1296,10 @@ async function automationsView() {
           : '<div class="empty">Nothing scheduled. Switch on an automation to see what it will send.</div>'}</div>
         <div class="card" style="overflow-x:auto"><h3>Recently</h3>${A.history.length ? `<table class="pv"><tr><th>Time</th><th>Message</th><th>Guest</th><th>Status</th></tr>${A.history.slice(0, 25).map(h => `<tr>
           <td>${h.updated_at ? new Date(h.updated_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: A.tz }) : ''}</td><td>${esc(h.automation)}</td>
-          <td>${esc(h.guest_name || '')}</td><td>${statusTag(h.status)}${h.error ? `<div class="sub">${esc(h.error)}</div>` : ''}</td></tr>`).join('')}</table>` : '<div class="empty">No automated messages yet.</div>'}</div>
+          <td>${esc(h.guest_name || '')}</td><td>${sendTag(h.status)}${h.error ? `<div class="sub">${esc(h.error)}</div>` : ''}</td></tr>`).join('')}</table>` : '<div class="empty">No automated messages yet.</div>'}</div>
         <div class="card"><h3>Property details</h3><div class="sub">Your own fill-ins for messages, e.g. <code>{wifi_password}</code>. Built in: ${A.builtins.map(b => `<code>{${b}}</code>`).join(' ')}</div>
           ${A.properties.map(p => `<form class="stack pvars" data-prop="${p.id}" style="max-width:none;margin-top:8px"><b>${esc(p.name)}</b>
-            ${[...Object.entries(p.vars), ['', ''], ['', '']].map(([k, v]) => `<div class="toolbar" style="margin:0"><input name="k" value="${esc(k)}" placeholder="name, e.g. wifi_name" style="width:12em"><input name="v" value="${esc(v)}" placeholder="value" style="flex:1;min-width:120px"></div>`).join('')}
+            ${[...Object.entries(p.vars), ['', ''], ['', '']].map(([k, v]) => `<div class="toolbar" style="margin:0"><input name="k" value="${esc(k)}" placeholder="name, e.g. wifi_name" aria-label="Fill-in name" style="width:12em"><input name="v" value="${esc(v)}" placeholder="value" aria-label="Fill-in value" style="flex:1;min-width:120px"></div>`).join('')}
             <button class="primary">Save details</button></form>`).join('')}</div>
       </div></div>`;
 
@@ -1247,7 +1334,8 @@ async function automationsView() {
     const preview = async () => {
       const box = f.querySelector('.pvbox');
       if (!f.pb.value) { box.hidden = true; return; }
-      const r = await api('/automations/preview', { method: 'POST', body: { body: f.body.value, bookingId: +f.pb.value } });
+      let r;
+      try { r = await api('/automations/preview', { method: 'POST', body: { body: f.body.value, bookingId: +f.pb.value } }); } catch (err) { return fail(err); }
       box.hidden = false;
       box.innerHTML = `<div class="bubble" style="white-space:pre-wrap">${esc(r.text)}</div>${r.missing.length ? `<div class="warn sub">Not filled in yet: {${r.missing.join('}, {')}}. A message waits until these are available.</div>` : ''}`;
     };
@@ -1278,13 +1366,15 @@ const fieldInput = (f, val, name) => {
   const v = val ?? '';
   if (f.type === 'select') return `<select name="${name}"><option value=""></option>${f.options.map(o => `<option ${o === v ? 'selected' : ''}>${o}</option>`).join('')}</select>`;
   if (f.type === 'textarea') return `<textarea name="${name}" rows="${f.max > 5000 ? 8 : 4}" maxlength="${f.max}" data-count="${f.max}" data-ai="${f.key}">${esc(v)}</textarea>`;
-  if (f.type === 'int' || f.type === 'money') return `<input name="${name}" type="number" step="${f.type === 'money' ? '0.01' : '1'}" min="${f.min}" max="${f.max}" value="${v}" style="width:9em">`;
+  if (f.type === 'int' || f.type === 'money') return `<input name="${name}" type="number" step="${f.type === 'money' ? '0.01' : '1'}" min="${f.min}" max="${f.max}" value="${esc(v)}" style="width:9em">`;
   return `<input name="${name}" value="${esc(v)}" maxlength="${f.max || 200}" data-count="${f.max || 200}" ${f.key === 'headline' || f.key === 'contentHeadline' ? `data-ai="${f.key}"` : ''}>`;
 };
 const fieldRow = (f, val, name) => `<label class="lfield"><span class="sub">${esc(f.label)}${f.hint ? ` <span class="hint">· ${esc(f.hint)}</span>` : ''}</span>${fieldInput(f, val, name)}<span class="sub count"></span></label>`;
 
 async function listingView() {
+  const live = stamp('listing');
   const L = await api('/listing?' + new URLSearchParams(ls.property ? { property: ls.property } : {}));
+  if (!live()) return;
   if (!L.connected) { view.innerHTML = '<div class="card empty">Connect Beds24 in Settings to edit your listing.</div>'; return; }
   if (!L.listing) { view.innerHTML = '<div class="card empty">No properties found in Beds24 yet.</div>'; return; }
   ls.property = L.listing.id;
@@ -1293,7 +1383,7 @@ async function listingView() {
     <div class="notice" style="background:var(--bg);color:var(--ink);border:1px solid var(--line)">This edits your listing content in Beds24. Whether a change reaches Airbnb, VRBO or Booking.com depends on each channel's content settings in Beds24 (Booking.com content is usually managed in its own extranet). Photos and amenities are managed in Beds24.</div>
     <form id="lform">
       <div class="card stack" style="max-width:none"><div class="toolbar" style="margin:0">
-        ${L.properties.length > 1 ? `<select id="lprop">${L.properties.map(p => `<option value="${p.id}" ${p.id === x.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>` : `<h3 style="margin:0">${esc(x.property.name)}</h3>`}
+        ${L.properties.length > 1 ? `<select id="lprop" aria-label="Property">${L.properties.map(p => `<option value="${p.id}" ${p.id === x.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>` : `<h3 style="margin:0">${esc(x.property.name)}</h3>`}
         <span class="sub" style="margin-left:auto">Changes are previewed before anything is sent.</span></div>
         <h3>Listing text</h3>${F.propertyText.map(f => fieldRow(f, x.propertyText[f.key], `pt.${f.key}`)).join('')}
         <h3>Property details</h3><div class="lgrid">${F.property.map(f => fieldRow(f, x.property[f.key], `p.${f.key}`)).join('')}</div></div>
@@ -1418,7 +1508,9 @@ const delta = (cur, ly, points = false) => {
 const ASK_EXAMPLES = ['How did last month compare with the same month last year?', 'Which channel earns the most per night?', 'How far ahead do guests book in summer?', 'Am I ahead or behind last year for the next three months?'];
 
 async function analyticsView() {
+  const live = stamp('analytics');
   const A = await api('/analytics?' + q({ range: an.range }));
+  if (!live()) return;
   const H = A.headline, M = A.monthly;
   const val = (m, k) => m ? (k === 'occupancy' ? m.occupancy : k === 'adr' ? m.adr : m.revenue) : 0;
   const fmt = (v, k) => k === 'occupancy' ? pct(v) : money(v);
@@ -1441,7 +1533,7 @@ async function analyticsView() {
       : aiSetup('Ask questions in plain English (e.g. "How did October compare with last year?") and get answers from your own booking data.')}</div>
     <div class="grid">${head(H.ytd)}${head(H.trailing12)}${head(H.next90, ' (same dates)')}</div>
     <div class="card"><div class="toolbar"><h3 style="margin:0">By month</h3>
-      <select id="anmetric">${[['revenue', 'Revenue'], ['occupancy', 'Occupancy'], ['adr', 'ADR']].map(([v, l]) => `<option value="${v}" ${an.metric === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      <select id="anmetric" aria-label="Measure">${[['revenue', 'Revenue'], ['occupancy', 'Occupancy'], ['adr', 'ADR']].map(([v, l]) => `<option value="${v}" ${an.metric === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <span class="legend" style="margin:0"><span><span class="sw cy"></span>This year</span><span><span class="sw ly"></span>Same month last year</span><span class="sub">faded = on the books so far</span></span></div>
       <div class="gbars">${M.map(m => `<div class="gbar ${m.future ? 'future' : ''} ${m.current ? 'cur' : ''}" title="${esc(`${MONTHS[+m.month.slice(5) - 1]} ${m.month.slice(0, 4)}: ${fmt(val(m, an.metric), an.metric)}${m.lastYear ? ` (last year ${fmt(val(m.lastYear, an.metric), an.metric)})` : ''}`)}">
         <div class="pair"><i class="ly" style="height:${val(m.lastYear, an.metric) / max * 100}%"></i><i class="cy" style="height:${val(m, an.metric) / max * 100}%"></i></div>
@@ -1455,7 +1547,7 @@ async function analyticsView() {
         ${A.pace.map(p => `<tr><td>${MONTHS[+p.month.slice(5) - 1]}${p.fromToday ? ' <span class="sub">(rest)</span>' : ''}</td><td>${paceCell(p.now)}</td><td>${paceCell(p.lastYearAtThisPoint)}</td><td>${paceCell(p.lastYearFinal)}</td></tr>`).join('')}</table></div>
         <div class="sub">"Same day" counts what had been booked by this date last year, so it's a fair comparison for months still filling up.</div></div>
       <div class="card"><div class="toolbar" style="margin-bottom:6px"><h3 style="margin:0">Stays arriving</h3>
-        <select id="anrange">${Object.entries(A.ranges).map(([v, l]) => `<option value="${v}" ${A.range === v ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
+        <select id="anrange" aria-label="Date range">${Object.entries(A.ranges).map(([v, l]) => `<option value="${v}" ${A.range === v ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
         <span class="sub">${fmtDate(A.from)} – ${fmtDate(addDaysISO(A.to, -1))}</span></div>
         <div class="kv"><span>Stays <b>${W.bookings}</b></span><span>Avg stay <b>${W.stay.average ?? '—'}</b> nights</span><span>Booked <b>${W.lead.median ?? '—'}</b> days ahead (median)</span><span>Party <b>${W.guests.average ?? '—'}</b> guests</span></div>
         <div class="sub" style="margin-top:6px">The sections below use stays arriving in this range.</div></div>
@@ -1523,7 +1615,9 @@ function tailscaleLine(T) {
 }
 
 async function homeView() {
+  const live = stamp('home');
   const H = await api('/home?' + q());
+  if (!live()) return;
   const T = H.tailscale || {};
   if (!H.configured) {
     view.innerHTML = `<div class="card stack"><h3>Connect Home Assistant</h3>
@@ -1637,7 +1731,9 @@ async function homeView() {
   $('#hadev').onclick = () => { hs.devices = !hs.devices; homeView(); };
   view.querySelectorAll('[data-stay]').forEach(b => b.onclick = async () => {
     hs.stay = +b.dataset.stay;
-    const r = await api('/home/stay?booking=' + hs.stay);
+    let r;
+    try { r = await api('/home/stay?booking=' + hs.stay); } catch (err) { return fail(err); }
+    if (hs.stay !== r.booking?.id || !$('#hstay')) return;
     $('#hstay').innerHTML = `<div class="stay"><h3>${esc(r.booking.guest_name || 'Guest')} · ${fmtDate(r.booking.arrival)} → ${fmtDate(r.booking.departure)}</h3>
       ${r.series.map(x => `<div class="sub"><b>${esc(x.name)}</b> (${esc(x.unit)})</div>${sparkline(x.points, x.unit)}`).join('') || '<div class="empty">No readings for this stay.</div>'}
       ${r.alerts.length ? `<div class="sub" style="margin-top:8px"><b>Alerts</b></div><ul class="list">${r.alerts.map(a => `<li><span>${esc(a.name)}: ${esc(a.rule)}${a.peak != null ? ` (worst ${a.peak})` : ''}</span><span class="sub">${new Date(a.since).toLocaleString()}</span></li>`).join('')}</ul>` : ''}
@@ -1682,7 +1778,9 @@ async function shrinkImage(file, max = 2000) {
 }
 
 async function siteView() {
+  const live = stamp('site');
   const S = await api('/site?' + new URLSearchParams(st.property ? { property: st.property } : {}));
+  if (!live()) return;
   if (!S.site) { view.innerHTML = '<div class="card empty">No properties yet. Connect Beds24 in Settings first.</div>'; return; }
   const s = S.site;
   st.property = s.propertyId;
@@ -1692,7 +1790,7 @@ async function siteView() {
     : `<label class="sub">${label}<input name="${name}" value="${esc(s[name])}" ${opts.type ? `type="${opts.type}"` : ''} style="width:${opts.w || '100%'}" ${opts.ph ? `placeholder="${esc(opts.ph)}"` : ''}>${opts.hint ? `<span class="sub">${opts.hint}</span>` : ''}</label>`;
   view.innerHTML = `
     <div class="card stack" style="max-width:none;margin-bottom:14px"><div class="toolbar" style="margin:0">
-      ${S.properties.length > 1 ? `<select id="sprop">${S.properties.map(p => `<option value="${p.id}" ${p.id === s.propertyId ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>` : `<h3 style="margin:0">Direct booking site</h3>`}
+      ${S.properties.length > 1 ? `<select id="sprop" aria-label="Property">${S.properties.map(p => `<option value="${p.id}" ${p.id === s.propertyId ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>` : `<h3 style="margin:0">Direct booking site</h3>`}
       <span style="margin-left:auto"></span><a href="${esc(S.url)}" target="_blank" rel="noopener"><button type="button">Open ${s.enabled ? 'site' : 'preview'} ↗</button></a></div>
       <div>${s.enabled ? `✅ Live at <a href="${esc(S.url)}" target="_blank" rel="noopener">${esc(S.url)}</a>${s.domain ? ` and <a href="https://${esc(s.domain)}" target="_blank" rel="noopener">${esc(s.domain)}</a>` : ''}` : 'Off: only you can see the preview while signed in.'}</div>
       <div class="sub">${S.openNights} nights open for booking in the next 90 days. Availability and nightly prices come from Beds24 (set them on the Rates and Pricing pages). Guests pick dates here, then finish and pay on your Beds24 booking page.</div>
@@ -1773,7 +1871,9 @@ async function siteView() {
 // ---------- Guest guidebook ----------
 const gb = { property: null };
 async function guideView() {
+  const live = stamp('guide');
   const G = await api('/guide?' + new URLSearchParams(gb.property ? { property: gb.property } : {}));
+  if (!live()) return;
   if (!G.guide) { view.innerHTML = '<div class="card empty">No properties yet. Connect Beds24 in Settings first.</div>'; return; }
   const g = G.guide;
   gb.property = g.propertyId;
@@ -1785,7 +1885,7 @@ async function guideView() {
   const first = G.stays.find(s => s.url);
   view.innerHTML = `
     <div class="card stack" style="max-width:none;margin-bottom:14px"><div class="toolbar" style="margin:0">
-      ${G.properties.length > 1 ? `<select id="gprop">${G.properties.map(p => `<option value="${p.id}" ${p.id === g.propertyId ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>` : '<h3 style="margin:0">Guest guidebook</h3>'}
+      ${G.properties.length > 1 ? `<select id="gprop" aria-label="Property">${G.properties.map(p => `<option value="${p.id}" ${p.id === g.propertyId ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>` : '<h3 style="margin:0">Guest guidebook</h3>'}
       <span style="margin-left:auto"></span>${first ? `<a href="${esc(first.url)}" target="_blank" rel="noopener"><button type="button">Preview (${esc(first.guest_name || 'next guest')}) ↗</button></a>` : ''}</div>
       <div class="sub">Each booking gets its own private link. Send it with the <code>{guidebook_link}</code> fill-in in an automated message (e.g. check-in instructions) or a saved reply.
         The door code and address only appear from ${g.codeDaysBefore} day${g.codeDaysBefore === 1 ? '' : 's'} before check-in until checkout.</div></div>
@@ -1849,12 +1949,14 @@ async function fileToDataUrl(file) {
 }
 
 async function moneyView() {
+  const live = stamp('money');
   const M = await api('/money?' + q(mn.year ? { year: mn.year } : {}));
+  if (!live()) return;
   mn.year = M.year;
   const P = M.pnl, T = M.tax;
   const tabs = [['pnl', 'Profit & loss'], ['expenses', 'Expenses'], ['payouts', 'Payouts'], ['tax', 'Taxes']];
   const head = `<div class="toolbar"><div class="seg">${tabs.map(([k, l]) => `<button type="button" data-tab="${k}" class="${mn.tab === k ? 'on' : ''}">${l}</button>`).join('')}</div>
-    ${mn.tab !== 'payouts' ? `<select id="myear">${M.years.map(y => `<option ${y === M.year ? 'selected' : ''}>${y}</option>`).join('')}</select>` : ''}</div>`;
+    ${mn.tab !== 'payouts' ? `<select id="myear" aria-label="Year">${M.years.map(y => `<option ${y === M.year ? 'selected' : ''}>${y}</option>`).join('')}</select>` : ''}</div>`;
   const mlabel = m => MONTHS[+m.slice(5) - 1];
   let body = '';
   if (mn.tab === 'pnl') {
@@ -1977,30 +2079,36 @@ async function moneyView() {
 }
 
 // Runs a change, then reloads. While it runs the page's buttons are disabled, so a double tap can't submit twice.
+// Whatever happens, buttons still on the page come back: a reload that fails must not leave the page dead.
 let acting = false;
 async function act(fn) {
   if (acting) return;
   acting = true;
+  takeDrafts(submitting);
   const btn = $('#sync'), buttons = [...view.querySelectorAll('button:not(:disabled)')];
   btn.disabled = true; buttons.forEach(b => { b.disabled = true; }); banner('Working…');
   try { await fn(); banner(''); await boot(true); }
-  catch (e) { if (e.message !== 'login') banner(e.message, true); buttons.forEach(b => { b.disabled = false; }); }
-  finally { btn.disabled = false; acting = false; }
+  catch (e) { if (e.message !== 'login') banner(e.message, true); }
+  finally { buttons.forEach(b => { if (b.isConnected) b.disabled = false; }); btn.disabled = false; acting = false; }
 }
 
 const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, automations: automationsView, bookings: bookingsView, analytics: analyticsView, home: homeView, site: siteView, guide: guideView, money: moneyView, listing: listingView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
 async function render() {
-  // #/inbox/123 (from a phone notification) opens that conversation.
-  const [r, arg] = location.hash.replace(/^#\/?/, '').split('/');
-  if (r === 'inbox' && /^\d+$/.test(arg || '')) inbox.booking = +arg;
+  // #/inbox/123 (from a phone notification, or a thread opened from the list) is that conversation; #/inbox is the list.
+  const [r, arg] = routeOf();
+  if (r === 'inbox') inbox.booking = /^\d+$/.test(arg || '') ? +arg : null;
   clearInterval(pageTimer); pageTimer = null;
   renderSeq++;
   document.querySelectorAll('a[data-r]').forEach(a => a.classList.toggle('on', a.dataset.r === r));
   setMenu(false);
   try {
-    if (status.empty && r !== 'settings') return location.hash = '#/settings';
+    // Nothing to show until Beds24 is connected or demo data is loaded; a connected account with no stays yet is fine.
+    if (status.empty && !status.connected && !status.demo && r !== 'settings') return location.hash = '#/settings';
     await (routes[r] || dashboard)();
+    restoreDrafts(r);
+    banner(stickyBanner, true);   // the page is up: an earlier page's error has had its say
   } catch (e) { if (e.message !== 'login') banner(e.message, true); }
+  finally { drafts = null; }
 }
 
 async function boot(keepProp) {
@@ -2013,10 +2121,15 @@ async function boot(keepProp) {
     $('#prop').innerHTML = '<option value="">All properties</option>' + props.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
     if (keepProp) $('#prop').value = cur;
     $('#prop').hidden = props.length < 2;   // nothing to filter with a single property
-    banner(status.lastSyncError ? 'Last sync failed: ' + status.lastSyncError : '', true);
-    render();
+    stickyBanner = status.lastSyncError ? 'Last sync failed: ' + status.lastSyncError : '';
+    banner(stickyBanner, true);
+    await render();
   } catch (e) { if (e.message !== 'login') banner(e.message, true); }
 }
+
+// A request that fails in a handler with no catch of its own (a ‹ › tap while offline) still gets the banner; being
+// signed out or having moved on are not errors.
+window.onunhandledrejection = e => { const m = e.reason?.message; if (!m) return; if (m === 'login' || m === 'stale') e.preventDefault(); else banner(m, true); };
 
 // Phone menu: the sidebar slides in; it closes on navigation, the backdrop, or Escape.
 function setMenu(open) {

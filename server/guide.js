@@ -6,6 +6,7 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { getSetting, setSetting } from './db.js';
 import { addDays } from './sync.js';
 import { doorCodesFor, doorSettings, localToday, zonedTimeToUtc } from './doors.js';
+import { siteSettings } from './site.js';
 
 const err = (msg, status = 400) => Object.assign(new Error(msg), { status });
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -133,42 +134,25 @@ export function guideFor(db, bookingId, now = Date.now()) {
   const address = vars.address || [lp.address, lp.city, lp.state, lp.postcode].filter(Boolean).join(', ');
   const needsCheckin = confirmed && g.requireDirect && b.channel === 'Direct' && b.source === 'beds24' && !checkinFor(db, bookingId)?.signed_at;
   const access = phase === 'access' && !needsCheckin;
-  const site = jsonSetting(db, 'site', {})[b.property_id];
+  // The Wi-Fi password only while the guest can be in the house (plus the day after checkout); long after checkout
+  // the link stops being a guidebook at all.
+  const wifi = phase === 'access' || (phase === 'after' && today <= addDays(b.departure, 1));
+  const over = phase === 'after' && today > addDays(b.departure, 60);
+  // The agreement lives on the booking site, whose default web address exists even if the site was never set up.
+  let termsUrl = null;
+  try { termsUrl = `/stay/${siteSettings(db, b.property_id).slug}/terms`; } catch {}
   return {
     booking: { id: b.id, firstName: (b.guest_name || '').split(' ')[0] || 'there', arrival: b.arrival, departure: b.departure, nights: b.nights,
       guests: (b.adults || 0) + (b.children || 0), channel: b.channel },
     property: b.property_name, city: b.city, phase, needsCheckin: phase !== 'cancelled' && phase !== 'after' && needsCheckin,
     checkin: fmtTime(ds.checkin), checkout: fmtTime(ds.checkout), codeFrom: addDays(b.arrival, -g.codeDaysBefore),
     doorCode: access ? doorCodesFor(db, [bookingId], now)[bookingId]?.code || null : null,
-    address: access ? address : null, guide: g, houseRules: listing?.propertyText?.houseRules || '',
-    termsUrl: site?.slug ? `/stay/${site.slug}/terms` : null,
+    address: access ? address : null, guide: { ...g, wifiPassword: wifi ? g.wifiPassword : '' }, houseRules: listing?.propertyText?.houseRules || '',
+    over, termsUrl,
   };
 }
 
-export function renderGuide(G, { token }) {
-  if (!G) return null;
-  const g = G.guide, b = G.booking;
-  const sec = (id, title, body) => body ? `<section id="${id}"><h2>${esc(title)}</h2>${body}</section>` : '';
-  const checklist = g.checkout.split('\n').map(x => x.trim()).filter(Boolean);
-  const byCat = {};
-  for (const p of g.places) (byCat[p.category || 'Recommended'] ||= []).push(p);
-  const nav = [['stay', 'Your stay'], ['arrive', 'Arriving'], ['wifi', 'Wi-Fi'], ['rules', 'House rules'], ['guide', 'House guide'], ['local', 'Local tips'], ['checkout', 'Checkout'], ['help', 'Help']]
-    .filter(([id]) => ({ wifi: g.wifiName || g.wifiPassword, rules: G.houseRules, guide: g.sections.length, local: g.places.length, checkout: checklist.length })[id] ?? true);
-  const access = G.phase === 'access' && !G.needsCheckin;
-  const codeBox = G.phase === 'cancelled' ? '<div class="note">This booking was cancelled.</div>'
-    : G.phase === 'after' ? '<div class="note">Thanks for staying with us! We hope to see you again.</div>'
-    : G.needsCheckin ? `<div class="note warn">Before your door code appears, please complete check-in below.</div>`
-    : access ? `<div class="code"><span>Door code</span>${G.doorCode ? `<b>${esc(G.doorCode)}</b>` : '<strong>Coming soon</strong>'}<small>${G.doorCode ? `Works from ${esc(G.checkin)} on ${esc(longDate(b.arrival))} until ${esc(G.checkout)} on ${esc(longDate(b.departure))}.` : 'We\'ll send it before you arrive.'}</small></div>`
-    : `<div class="note">Your door code and the address appear here on ${esc(longDate(G.codeFrom))}.</div>`;
-  const checkinForm = G.needsCheckin ? `<section id="checkin"><h2>Check in online</h2>
-    <p>For direct bookings we ask every guest to accept the rental agreement and share a photo ID. It's kept privately and deleted after your stay.</p>
-    <form id="ck"><label>Full name (your signature)<input name="fullname" autocomplete="name" required></label>
-    <label class="chk"><input type="checkbox" name="agree" required> I agree to the ${G.termsUrl ? `<a href="${esc(G.termsUrl)}" target="_blank" rel="noopener">rental agreement</a>` : 'rental agreement'}</label>
-    <label>Photo of your ID<input type="file" name="idphoto" accept="image/*" required></label>
-    <button>Check in</button><div class="err" id="ckerr"></div></form></section>` : '';
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex, nofollow"><title>Guidebook · ${esc(G.property)}</title>
-<style>
+const STYLE = `
 :root{--ink:#1b1f24;--mut:#667085;--line:#e4e7ec;--acc:#2563eb;--bg:#f6f7f9;--card:#fff}
 @media (prefers-color-scheme: dark){:root{--ink:#e8eaee;--mut:#9aa3b2;--line:#2a303a;--bg:#0f1216;--card:#181c22}}
 *{box-sizing:border-box}body{margin:0;font:16px/1.55 system-ui,sans-serif;color:var(--ink);background:var(--bg)}
@@ -187,9 +171,39 @@ ul.check{list-style:none;padding:0;margin:0}ul.check li{padding:6px 0;border-top
 .place{padding:6px 0;border-top:1px solid var(--line)}.place:first-child{border-top:0}
 label{display:block;margin:8px 0;font-size:14px;color:var(--mut)}label input:not([type=checkbox]){display:block;width:100%;font:inherit;color:var(--ink);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:9px;margin-top:4px}
 label.chk{display:flex;gap:8px;align-items:center;color:var(--ink)}.err{color:#b91c1c;font-size:14px}
-</style></head><body>
-<header><h1>${esc(G.property)}</h1><p>Hi ${esc(b.firstName)} · ${esc(longDate(b.arrival))} – ${esc(longDate(b.departure))}</p></header>
-<nav>${nav.map(([id, l]) => `<a href="#${id}">${l}</a>`).join('')}</nav>
+`;
+const shell = (G, sub, body) => `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow"><title>Guidebook · ${esc(G.property)}</title>
+<style>${STYLE}</style></head><body>
+<header><h1>${esc(G.property)}</h1>${sub}</header>
+${body}</body></html>`;
+
+export function renderGuide(G, { token }) {
+  if (!G) return null;
+  const g = G.guide, b = G.booking;
+  // A cancelled booking, or one long over, gets a bare page: nothing in the guidebook is that guest's business any more.
+  if (G.phase === 'cancelled' || G.over) {
+    return shell(G, '', `<main><section><div class="note">${G.phase === 'cancelled' ? 'This booking was cancelled.' : 'This stay is over. Thanks for staying with us!'}</div></section></main>`);
+  }
+  const sec = (id, title, body) => body ? `<section id="${id}"><h2>${esc(title)}</h2>${body}</section>` : '';
+  const checklist = g.checkout.split('\n').map(x => x.trim()).filter(Boolean);
+  const byCat = {};
+  for (const p of g.places) (byCat[p.category || 'Recommended'] ||= []).push(p);
+  const nav = [['stay', 'Your stay'], ['arrive', 'Arriving'], ['wifi', 'Wi-Fi'], ['rules', 'House rules'], ['guide', 'House guide'], ['local', 'Local tips'], ['checkout', 'Checkout'], ['help', 'Help']]
+    .filter(([id]) => ({ wifi: g.wifiName || g.wifiPassword, rules: G.houseRules, guide: g.sections.length, local: g.places.length, checkout: checklist.length })[id] ?? true);
+  const access = G.phase === 'access' && !G.needsCheckin;
+  const codeBox = G.phase === 'cancelled' ? '<div class="note">This booking was cancelled.</div>'
+    : G.phase === 'after' ? '<div class="note">Thanks for staying with us! We hope to see you again.</div>'
+    : G.needsCheckin ? `<div class="note warn">Before your door code appears, please complete check-in below.</div>`
+    : access ? `<div class="code"><span>Door code</span>${G.doorCode ? `<b>${esc(G.doorCode)}</b>` : '<strong>Coming soon</strong>'}<small>${G.doorCode ? `Works from ${esc(G.checkin)} on ${esc(longDate(b.arrival))} until ${esc(G.checkout)} on ${esc(longDate(b.departure))}.` : 'We\'ll send it before you arrive.'}</small></div>`
+    : `<div class="note">Your door code and the address appear here on ${esc(longDate(G.codeFrom))}.</div>`;
+  const checkinForm = G.needsCheckin ? `<section id="checkin"><h2>Check in online</h2>
+    <p>For direct bookings we ask every guest to accept the rental agreement and share a photo ID. It's kept privately and deleted after your stay.</p>
+    <form id="ck"><label>Full name (your signature)<input name="fullname" autocomplete="name" required></label>
+    <label class="chk"><input type="checkbox" name="agree" required> I agree to the ${G.termsUrl ? `<a href="${esc(G.termsUrl)}" target="_blank" rel="noopener">rental agreement</a>` : 'rental agreement'}</label>
+    <label>Photo of your ID<input type="file" name="idphoto" accept="image/*" required></label>
+    <button>Check in</button><div class="err" id="ckerr"></div></form></section>` : '';
+  return shell(G, `<p>Hi ${esc(b.firstName)} · ${esc(longDate(b.arrival))} – ${esc(longDate(b.departure))}</p>`, `<nav>${nav.map(([id, l]) => `<a href="#${id}">${l}</a>`).join('')}</nav>
 <main>
 <section id="stay"><h2>Your stay</h2>${codeBox}${paras(g.welcome)}
 <p class="mut">Check-in from ${esc(G.checkin)} · Checkout by ${esc(G.checkout)} · ${b.guests || ''} guest${b.guests === 1 ? '' : 's'}</p></section>
@@ -226,7 +240,7 @@ ${sec('help', 'Help', `${g.phone ? `<p>Call or text: <a href="tel:${esc(g.phone.
     } catch (x) { err.textContent = x.message; btn.disabled = false; btn.textContent = 'Check in'; }
   };
 })();
-</script></body></html>`;
+</script>`);
 }
 
 /** Upcoming and current stays with their links and check-in status, for the owner. */

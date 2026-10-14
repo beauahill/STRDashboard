@@ -149,6 +149,20 @@ test('Beds24 copies of the same stay replace the Guesty ones', () => {
   assert.equal(periodStats(db, '2025-06-01', '2025-07-01').revenue, 550, 'not double counted');
 });
 
+test('a stay Beds24 holds as cancelled under the same reservation id replaces the Guesty copy too', () => {
+  const db = openDb(':memory:');
+  beds24Property(db);
+  importGuesty(db, readGuestyExport(csv(ROWS)).bookings);
+  // Cancelled since the export was taken: the Guesty row would otherwise keep earning June's revenue.
+  upsertBookings(db, [{ id: 1, propertyId: 500, roomId: 600, status: 'cancelled', arrival: '2025-06-01', departure: '2025-06-04', apiReference: 'HMAAAA1', price: 550, cancelTime: '2025-05-20 10:00:00' }]);
+  assert.equal(dedupeImported(db), 1);
+  const guesty = () => db.prepare("SELECT guest_name FROM bookings WHERE source='guesty' ORDER BY arrival").all().map(r => r.guest_name);
+  assert.deepEqual(guesty(), ['Sam "Sammy" Lee', 'Vic', 'Dee', 'Ray']);
+  assert.equal(periodStats(db, '2025-06-01', '2025-07-01').nights, 0, 'a cancelled stay earns nothing');
+  importGuesty(db, readGuestyExport(csv(ROWS)).bookings);   // the other order: imported after the cancellation
+  assert.deepEqual(guesty(), ['Sam "Sammy" Lee', 'Vic', 'Dee', 'Ray']);
+});
+
 test('removing the Guesty import leaves Beds24 data alone', () => {
   const db = openDb(':memory:');
   beds24Property(db);

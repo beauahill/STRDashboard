@@ -96,6 +96,7 @@ test('scan: Claude with web search and fetch reports through a strict tool; paus
   const body = calls[0].body;
   assert.deepEqual(body.tools.map(x => (x.type === 'custom' ? x.name : x.type)), ['web_search_20260209', 'web_fetch_20260209', 'report_events']);
   assert.equal(body.tools[0].max_uses, 12);
+  assert.deepEqual([body.tools[1].max_uses, body.tools[1].max_content_tokens], [8, 15000], 'fetched pages are capped');
   const tool = body.tools.find(x => x.name === 'report_events');
   assert.equal(tool.strict, true);
   assert.equal(body.tool_choice, undefined, 'never forced');
@@ -170,4 +171,33 @@ test('the event Claude names is used, and an event already under way is not a "c
   ], { today: TODAY, end: '2027-05-30' });
   assert.deepEqual(r, { found: 2, added: 1, updated: 0, skipped: 1 });
   assert.equal(listSuggestions(db)[0].replaces_event_id, 5, 'corrects the commencement event Claude pointed at, despite the different name');
+});
+
+test('the scout can correct the dates of an event it suggested, more than once', () => {
+  const db = setup();
+  const opts = { today: TODAY, end: '2027-06-01' };
+  store(db, [ev()], opts);
+  const { eventId } = addSuggestion(db, listSuggestions(db)[0].id);
+  // The organizer moved it a week: reported naming the event, then (next scan) without.
+  assert.deepEqual(store(db, [ev({ first_night: '2026-11-20', last_night: '2026-11-21', matches_event_id: eventId })], opts), { found: 1, added: 1, updated: 0, skipped: 0 });
+  const open = listSuggestions(db);
+  assert.deepEqual(open.map(s => [s.start_date, s.replaces_event_id]), [['2026-11-20', eventId]]);
+  assert.deepEqual(store(db, [ev({ first_night: '2026-11-20', last_night: '2026-11-21' })], opts), { found: 1, added: 0, updated: 1, skipped: 0 }, 'the same correction again refreshes the open one');
+  addSuggestion(db, open[0].id);
+  assert.equal(listEvents(db).find(e => e.id === eventId).start_date, '2026-11-20');
+  assert.equal(listEvents(db).length, 3, 'corrected in place');
+  // Moved again after that correction was accepted.
+  assert.equal(store(db, [ev({ first_night: '2026-11-27', last_night: '2026-11-28' })], opts).added, 1);
+  assert.equal(listSuggestions(db)[0].replaces_event_id, eventId);
+  // The estimated commencement, corrected twice.
+  store(db, [ev({ name: 'UW Commencement', first_night: '2027-05-14', last_night: '2027-05-15', matches_event_id: 5 })], opts);
+  addSuggestion(db, listSuggestions(db).find(s => s.replaces_event_id === 5).id);
+  assert.equal(store(db, [ev({ name: 'UW Commencement', first_night: '2027-05-21', last_night: '2027-05-22', matches_event_id: 5 })], opts).added, 1, 'a second correction is still offered');
+});
+
+test('a named match under another name is a correction only when the nights are close', () => {
+  const db = setup();
+  const r = store(db, [ev({ name: 'UW Graduation', first_night: '2027-08-20', last_night: '2027-08-21', matches_event_id: 5 })], { today: TODAY, end: '2027-09-30' });
+  assert.deepEqual(r, { found: 1, added: 1, updated: 0, skipped: 0 });
+  assert.equal(listSuggestions(db)[0].replaces_event_id, null, 'three months off with another name: a new event, not a correction of the commencement');
 });

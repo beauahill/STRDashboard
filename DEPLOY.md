@@ -148,5 +148,8 @@ toward the same monthly limit.
 
 - **Deploy failed**: open **Deploy Logs**; any `STARTUP ERROR:` line says exactly what's missing.
 - **Forgot the password**: change `APP_PASSWORD` in Variables. Railway redeploys and everyone is signed out.
+- **Signed in on a phone or laptop you no longer have**: signing out there would be enough (it revokes that
+  session), but from any device you're still signed in on, Settings → **Sign out everywhere** signs out every
+  device at once.
 - **Backups**: check the volume's **Backups** tab. Bookings and properties can always be re-synced from
   Beds24, so the main thing to protect is anything you enter only in this app.

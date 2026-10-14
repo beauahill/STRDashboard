@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { openDb, getSetting } from '../server/db.js';
 import { Beds24Client } from '../server/beds24.js';
-import { syncBeds24, mapBooking, normalizeChannel } from '../server/sync.js';
+import { syncBeds24, mapBooking, normalizeChannel, upsertProperties } from '../server/sync.js';
 import { periodStats, summary } from '../server/stats.js';
 import { loadDemo, clearDemo } from '../server/demo.js';
 
@@ -105,4 +105,21 @@ test('calendar returns bookings and nightly prices only for the rooms in view', 
   const onlyB = calendar(db, '2026-11-01', 35, 2);
   assert.deepEqual(onlyB.bookings.map(b => b.id), [2]);
   assert.deepEqual(onlyB.nights, []);
+});
+
+test('a room with quantity 0, or one Beds24 no longer lists, is kept but is not a sellable unit', () => {
+  const db = openDb(':memory:');
+  const rooms = (...r) => [{ id: 500, name: 'P', roomTypes: r }];
+  const qty = id => db.prepare('SELECT qty FROM rooms WHERE id = ?').get(id)?.qty;
+  upsertProperties(db, rooms({ id: 600, name: 'Whole house', qty: 1 }, { id: 601, name: 'Old listing (retired)', qty: 0 }, { id: 602, name: 'Annex' }));
+  assert.deepEqual([qty(600), qty(601), qty(602)], [1, 0, 1], 'qty 0 is stored as given; a missing qty still means one');
+  assert.equal(periodStats(db, '2026-09-01', '2026-10-01').available, 60, 'two sellable units');
+  db.prepare("INSERT INTO rooms(id,property_id,name,qty) VALUES(-1,-1,'Guesty history',1)").run();
+  upsertProperties(db, rooms({ id: 600, name: 'Whole house', qty: 1 }));   // 601 and 602 removed in Beds24
+  assert.deepEqual([qty(600), qty(601), qty(602), qty(-1)], [1, 0, 0, 1], 'kept for their bookings but no longer for sale; local rooms untouched');
+  assert.equal(periodStats(db, '2026-09-01', '2026-10-01', 500).available, 30);
+  upsertProperties(db, []);
+  assert.equal(qty(600), 1, 'an empty reply retires nothing');
+  upsertProperties(db, rooms({ id: 600, name: 'Whole house', qty: 0 }));
+  assert.equal(periodStats(db, '2026-09-01', '2026-10-01', 500).available, 30, 'never fewer than one unit, so nothing divides by zero');
 });

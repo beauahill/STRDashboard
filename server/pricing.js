@@ -313,28 +313,39 @@ export async function applyNightly(db, client, roomId, changes, { label = 'Prici
 /**
  * Once a day, if auto-pricing is on, push recommendations that differ by more than the threshold. Each room is
  * separate (one room's failure doesn't stop the others), and a failed room waits three hours before trying again
- * rather than retrying on every sync. Throws a summary of the failures after trying every room.
+ * rather than retrying on every sync. Throws a summary of the failures after trying every room, and keeps throwing
+ * it while a failed room is waiting, so the Pricing page shows the problem until a retry succeeds.
  */
 export async function autoPrice(db, client, today, now = Date.now()) {
   const results = [], errors = [];
+  let retryAt = Infinity;
   if (client?.canWriteInventory === false) return results;   // a read-only invite code can't change prices
   for (const { id, name } of db.prepare('SELECT id, name FROM rooms WHERE id > 0').all()) {
     const s = pricingSettings(db, id);
     if (!s.auto || !s.base || getSetting(db, `pricing_auto_${id}`) === today) continue;
-    if (Number(getSetting(db, `pricing_auto_retry_${id}`) || 0) > now) continue;
+    const retry = Number(getSetting(db, `pricing_auto_retry_${id}`) || 0), last = getSetting(db, `pricing_auto_error_${id}`);
+    if (retry > now) {
+      if (last) { errors.push(`${name}: ${last}`); retryAt = Math.min(retryAt, retry); }
+      continue;
+    }
     try {
       const rec = recommend(db, id, { days: s.autoHorizon, today });
       const changes = pendingChanges(rec, { threshold: s.autoThreshold, maxChangePct: s.autoMaxChangePct });
       const r = await applyNightly(db, client, id, changes, { label: 'Auto-pricing', today });
       setSetting(db, `pricing_auto_${id}`, today);
       setSetting(db, `pricing_auto_retry_${id}`, null);
+      setSetting(db, `pricing_auto_error_${id}`, null);
       results.push({ roomId: id, ...r });
     } catch (e) {
       setSetting(db, `pricing_auto_retry_${id}`, now + 3 * 3600e3);
-      errors.push(`${name}: ${e.message}`);
+      setSetting(db, `pricing_auto_error_${id}`, e.message);
+      errors.push(`${name}: ${e.message}`); retryAt = Math.min(retryAt, now + 3 * 3600e3);
     }
   }
-  if (errors.length) throw new Error(`Auto-pricing failed (will retry in 3 hours) for ${errors.join('; ')}`);
+  if (errors.length) {
+    const mins = Math.max(1, Math.ceil((retryAt - now) / 60e3)), hours = Math.round(mins / 60);
+    throw new Error(`Auto-pricing failed (will retry in ${mins >= 60 ? `about ${hours} hour${hours === 1 ? '' : 's'}` : `${mins} min`}) for ${errors.join('; ')}`);
+  }
   return results;
 }
 

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { openDb, setSetting } from '../server/db.js';
-import { notifySettings, saveNotifySettings, publicNotify, regenerateTopic, collect, runNotifications, sendTest, fillMissingBookings } from '../server/notify.js';
+import { notifySettings, saveNotifySettings, publicNotify, regenerateTopic, collect, runNotifications, sendTest, fillMissingBookings, boot } from '../server/notify.js';
 
 const NOW = Date.parse('2026-10-13T18:00:00Z');
 const ago = min => new Date(NOW - min * 60e3).toISOString();
@@ -10,6 +10,7 @@ function setup() {
   const db = openDb();
   db.exec("INSERT INTO properties(id,name) VALUES(1,'Laramie House'); INSERT INTO rooms(id,property_id,name) VALUES(10,1,'Whole house');");
   saveNotifySettings(db, { enabled: true }, NOW - 60 * 60e3);   // switched on an hour ago
+  boot.at = NOW - 2 * 3600e3;                                   // the app has been up for two hours
   return db;
 }
 const addBooking = (db, b) => db.prepare(`INSERT INTO bookings(id,property_id,room_id,status,channel,arrival,departure,nights,guest_name,adults,children,price,booked_at,cancelled_at,first_seen,source)
@@ -17,9 +18,13 @@ const addBooking = (db, b) => db.prepare(`INSERT INTO bookings(id,property_id,ro
   b.guest || 'Sam Rivers', b.adults ?? 2, b.children ?? 0, b.price ?? 600, b.booked_at ?? null, b.cancelled_at ?? null, b.first_seen ?? ago(5), b.source || 'beds24');
 const addMessage = (db, id, bookingId, body, time, { source = 'guest', read = 0 } = {}) =>
   db.prepare('INSERT INTO messages(id,booking_id,source,body,time,read) VALUES(?,?,?,?,?,?)').run(id, bookingId, source, body, time, read);
-function fakeFetch({ fail = false } = {}) {
+function fakeFetch({ fail = false, retryAfter = null } = {}) {
   const calls = [];
-  const fn = async (url, opts) => { calls.push({ url, headers: opts.headers, body: JSON.parse(opts.body) }); return fail ? { ok: false, status: 429, text: async () => 'limit reached' } : { ok: true, status: 200, text: async () => '' }; };
+  const fn = async (url, opts) => {
+    calls.push({ url, headers: opts.headers, body: JSON.parse(opts.body) });
+    if (!fail) return { ok: true, status: 200, text: async () => '' };
+    return { ok: false, status: 429, text: async () => 'limit reached', headers: new Headers(retryAfter ? { 'retry-after': String(retryAfter) } : {}) };
+  };
   return { fn, calls };
 }
 
@@ -109,6 +114,7 @@ test('problems: failed automated message, door code not working before arrival, 
     INSERT INTO automation_sends(automation_id,booking_id,key,status,error,updated_at) VALUES(1,1,'','failed','Beds24 rejected it','${ago(3)}');
     INSERT INTO locks(device_id,name,room_id) VALUES('d1','Front door',10);`);
   setSetting(db, 'door_auto', '1');
+  setSetting(db, 'door_last_run', ago(10));
   setSetting(db, 'beds24_refresh_token', 'r');
   setSetting(db, 'last_sync', ago(90));
   setSetting(db, 'last_sync_error', 'Beds24 returned 500');
@@ -122,20 +128,36 @@ test('problems: failed automated message, door code not working before arrival, 
   assert.equal(collect(db, NOW).length, 0);
 });
 
-test('failed sends are retried, then given up on; the test message uses the same settings', async () => {
+test('failed sends are retried with growing gaps for a day and honour Retry-After; the test message uses the same settings', async () => {
   const db = setup();
   addBooking(db, { id: 1, booked_at: ago(5) });
   const bad = fakeFetch({ fail: true });
-  for (let i = 0; i < 5; i++) assert.deepEqual(await runNotifications(db, { now: NOW, fetchImpl: bad.fn }), { sent: 0, failed: 1 });
+  const run = (min, f) => runNotifications(db, { now: NOW + min * 60e3, fetchImpl: f.fn });
+  // Tried again after 1, 2, 5 and 10 minutes, then every 15.
+  for (const [min, tried] of [[0, 1], [0.5, 0], [1, 1], [2, 0], [3, 1], [8, 1], [17, 0], [18, 1]]) assert.deepEqual(await run(min, bad), { sent: 0, failed: tried }, `at ${min} min`);
   assert.equal(db.prepare("SELECT value FROM settings WHERE key = 'notify_error'").get().value, 'ntfy answered 429: limit reached');
-  assert.deepEqual(await runNotifications(db, { now: NOW, fetchImpl: bad.fn }), { sent: 0, failed: 0 }, 'given up after 5 attempts');
+  const good = fakeFetch();
+  assert.deepEqual(await run(20, good), { sent: 0, failed: 0 }, 'not every minute');
+  assert.deepEqual(await run(48, good), { sent: 1, failed: 0 }, 'delivered once ntfy is back half an hour later');
+  assert.equal(good.calls[0].body.title, 'New booking: Sam Rivers');
+  assert.equal(db.prepare("SELECT value FROM settings WHERE key = 'notify_error'").get().value, null);
+
+  // ntfy's own "come back in two minutes" is respected for everything.
+  addBooking(db, { id: 2, guest: 'Later Guest', booked_at: ago(-60) });
+  const limited = fakeFetch({ fail: true, retryAfter: 120 });
+  assert.deepEqual(await run(60, limited), { sent: 0, failed: 1 });
+  assert.deepEqual(await run(61, good), { sent: 0, failed: 0 }, 'holds off');
+  assert.deepEqual(await run(62, good), { sent: 1, failed: 0 });
+  // After about a day of failures it is dropped.
+  db.prepare("UPDATE notification_log SET ok = 0, attempts = 100, at = ? WHERE ref = '2'").run(ago(-30));
+  assert.deepEqual(await run(90, good), { sent: 0, failed: 0 }, 'given up');
 
   saveNotifySettings(db, { server: 'https://ntfy.example.com', token: 'tk_abc' });
-  const good = fakeFetch();
-  await sendTest(db, good.fn);
-  assert.equal(good.calls[0].url, 'https://ntfy.example.com');
-  assert.equal(good.calls[0].headers.authorization, 'Bearer tk_abc');
-  assert.equal(good.calls[0].body.title, 'STR Dashboard test');
+  const probe = fakeFetch();
+  await sendTest(db, probe.fn);
+  assert.equal(probe.calls[0].url, 'https://ntfy.example.com');
+  assert.equal(probe.calls[0].headers.authorization, 'Bearer tk_abc');
+  assert.equal(probe.calls[0].body.title, 'STR Dashboard test');
   assert.equal(db.prepare("SELECT value FROM settings WHERE key = 'notify_error'").get().value, null);
 });
 
@@ -153,4 +175,64 @@ test('messages for bookings not synced yet: the booking is fetched so the alert 
   await fillMissingBookings(db, none);
   await fillMissingBookings(db, none);
   assert.deepEqual(asked.slice(1), [['/bookings', [88]]], 'asked once, not every minute');
+});
+
+test('a door alert is sent again after the code was fine in between, and once more on check-in day', async () => {
+  const db = setup();
+  db.exec("INSERT INTO locks(device_id,name,room_id) VALUES('d1','Front door',10)");
+  setSetting(db, 'door_auto', '1');
+  setSetting(db, 'door_last_run', ago(5));
+  addBooking(db, { id: 1, arrival: '2026-10-14', departure: '2026-10-16', first_seen: ago(60 * 24) });
+  const f = fakeFetch();
+  await runNotifications(db, { now: NOW, fetchImpl: f.fn });
+  assert.deepEqual(f.calls.map(c => c.body.message), ['No door code yet']);
+  // The code is created and scheduled: all fine, so the alert is forgotten.
+  db.prepare("INSERT INTO door_codes(booking_id,code,starts_at,ends_at) VALUES(1,'4242','2026-10-14T22:00:00.000Z','2026-10-16T17:00:00.000Z')").run();
+  const dev = errors => db.prepare("INSERT OR REPLACE INTO door_code_devices(booking_id,device_id,access_code_id,status,scheduled,errors,warnings) VALUES(1,'d1','ac1','unset',1,?,'[]')").run(errors);
+  dev('[]');
+  assert.deepEqual(await runNotifications(db, { now: NOW + 60e3, fetchImpl: f.fn }), { sent: 0, failed: 0 });
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM notification_log WHERE kind = 'door'").get().n, 0);
+  // Check-in day, noon: the lock reports an error. A new problem, so it is pushed again.
+  const checkin = NOW + 24 * 3600e3;
+  dev(JSON.stringify([{ error_code: 'august_lock_temporarily_offline', message: 'Lock is offline' }]));
+  await runNotifications(db, { now: checkin, fetchImpl: f.fn });
+  assert.deepEqual(f.calls.map(c => [c.body.title, c.body.message]), [['Door code problem: Sam Rivers arrives Oct 14', 'No door code yet'], ['Door code problem: Sam Rivers arrives today', 'Lock is offline']]);
+  await runNotifications(db, { now: checkin + 3600e3, fetchImpl: f.fn });
+  assert.equal(f.calls.length, 2, 'the same problem is not repeated');
+
+  // A problem pushed the day before and still there at check-in is said once more that day.
+  const db2 = setup();
+  db2.exec("INSERT INTO locks(device_id,name,room_id) VALUES('d1','Front door',10)");
+  setSetting(db2, 'door_auto', '1'); setSetting(db2, 'door_last_run', ago(5));
+  addBooking(db2, { id: 1, arrival: '2026-10-14', departure: '2026-10-16', first_seen: ago(60 * 24) });
+  const g = fakeFetch();
+  await runNotifications(db2, { now: NOW, fetchImpl: g.fn });
+  await runNotifications(db2, { now: NOW + 3600e3, fetchImpl: g.fn });
+  await runNotifications(db2, { now: checkin, fetchImpl: g.fn });
+  await runNotifications(db2, { now: checkin + 3600e3, fetchImpl: g.fn });
+  assert.deepEqual(g.calls.map(c => c.body.title), ['Door code problem: Sam Rivers arrives Oct 14', 'Door code problem: Sam Rivers arrives today']);
+});
+
+test('a changed booking is not reported as having no code until a door-code run has looked at it', () => {
+  const db = setup();
+  db.exec("INSERT INTO locks(device_id,name,room_id) VALUES('d1','Front door',10)");
+  setSetting(db, 'door_auto', '1');
+  addBooking(db, { id: 1, arrival: '2026-10-14', departure: '2026-10-16', first_seen: ago(60 * 24) });
+  db.prepare('UPDATE bookings SET modified_at = ? WHERE id = 1').run(ago(1));   // dates just changed in Beds24
+  const door = () => collect(db, NOW).filter(i => i.refs[0][0] === 'door');
+  assert.deepEqual(door(), [], 'no run yet');
+  setSetting(db, 'door_last_run', ago(5));
+  assert.deepEqual(door(), [], 'the last run was before the change');
+  setSetting(db, 'door_last_run', new Date(NOW).toISOString());
+  assert.equal(door()[0].message, 'No door code yet');
+});
+
+test("a restart after downtime doesn't raise the 'Beds24 hasn't synced' alarm", () => {
+  const db = setup();
+  setSetting(db, 'beds24_refresh_token', 'r');
+  setSetting(db, 'last_sync', ago(120));
+  boot.at = NOW - 60e3;   // the app came back a minute ago
+  assert.deepEqual(collect(db, NOW).filter(i => i.refs[0][0] === 'sync'), []);
+  boot.at = NOW - 61 * 60e3;
+  assert.equal(collect(db, NOW).filter(i => i.refs[0][0] === 'sync').length, 1, 'up for an hour without a sync is a problem');
 });

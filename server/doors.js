@@ -51,7 +51,7 @@ const weak = c => /^(\d)\1+$/.test(c) || '01234567890'.includes(c) || '098765432
 export function codeCandidates(booking) {
   const digits = (booking.phone || '').replace(/\D/g, '');
   const out = [];
-  for (const n of [4, 5, 6]) if (digits.length >= n) out.push(digits.slice(-n));
+  for (const n of [4, 5, 6]) if (digits.length >= n && !weak(digits.slice(-n))) out.push(digits.slice(-n));
   for (let i = 0; out.length < 60 && i < 500; i++) {
     const c = String(parseInt(createHash('sha256').update(`${booking.id}:${i}`).digest('hex').slice(0, 8), 16) % 10000).padStart(4, '0');
     if (!weak(c) && !out.includes(c)) out.push(c);
@@ -72,19 +72,24 @@ async function readLockCodes(seam, deviceIds) {
   return out;
 }
 
-/** Refresh the lock list from Seam, keeping each lock's room assignment. */
+/**
+ * Refresh the lock list from Seam, keeping each lock's room assignment. A lock Seam stops listing is flagged `missing`
+ * (and left alone) rather than deleted, and a list with no locks at all is refused while locks are known: a key for
+ * another workspace, or a Yale account that came unlinked, mustn't wipe the setup and silence every door alert.
+ */
 export async function refreshLocks(db, seam) {
   const devices = (await seam.devices()).filter(d => d.can_program_online_access_codes === true || /lock/i.test(d.device_type || ''));
+  if (!devices.length && db.prepare('SELECT 1 FROM locks').get()) throw userError('Seam listed no locks — is this the right workspace key, and is the Yale account still connected? Nothing was changed.');
   const now = new Date().toISOString();
-  const upsert = db.prepare(`INSERT INTO locks(device_id,name,online,battery,can_program,updated_at) VALUES(?,?,?,?,?,?)
+  const upsert = db.prepare(`INSERT INTO locks(device_id,name,online,battery,can_program,missing,updated_at) VALUES(?,?,?,?,?,0,?)
     ON CONFLICT(device_id) DO UPDATE SET name=excluded.name, online=excluded.online, battery=excluded.battery,
-    can_program=excluded.can_program, updated_at=excluded.updated_at`);
+    can_program=excluded.can_program, missing=0, updated_at=excluded.updated_at`);
   for (const d of devices) {
     upsert.run(d.device_id, d.display_name || d.properties?.name || d.device_id, d.properties?.online ? 1 : 0,
       d.properties?.battery_level ?? null, d.can_program_online_access_codes === false ? 0 : 1, now);
   }
   const ids = devices.map(d => d.device_id);
-  db.prepare(`DELETE FROM locks WHERE device_id NOT IN (${ids.map(() => '?').join(',') || "''"})`).run(...ids);
+  db.prepare(`UPDATE locks SET missing = 1, online = 0 WHERE device_id NOT IN (${ids.map(() => '?').join(',') || "''"})`).run(...ids);
   return devices.length;
 }
 
@@ -102,7 +107,10 @@ export async function reconcileDoorCodes(db, seam, beds24, now = Date.now()) {
   const s = doorSettings(db);
   const result = { created: 0, updated: 0, removed: 0, problems: [] };
   if (!s.auto || !seam?.apiKey) return { ...result, skipped: !s.auto ? 'automatic codes are off' : 'no Seam API key' };
-  const locks = db.prepare('SELECT * FROM locks WHERE room_id IS NOT NULL ORDER BY name').all();
+  // A lock Seam has stopped listing keeps its room but is out of reach: nothing is written to it or removed from it.
+  const assigned = db.prepare('SELECT * FROM locks WHERE room_id IS NOT NULL ORDER BY name').all();
+  const locks = assigned.filter(l => !l.missing);
+  const missing = new Set(db.prepare('SELECT device_id FROM locks WHERE missing = 1').all().map(l => l.device_id));
   if (!locks.length) return { ...result, skipped: 'no locks assigned to a room' };
 
   const today = localToday(s.tz, now);
@@ -126,6 +134,7 @@ export async function reconcileDoorCodes(db, seam, beds24, now = Date.now()) {
   // Delete one booking's code from one lock. A lock no longer assigned to a room isn't in lockCodes, so its code is
   // deleted directly; Seam saying it's already gone counts as done. Returns false if it had to stay.
   const removeFromLock = async dev => {
+    if (missing.has(dev.device_id)) return false;   // out of Seam's sight: the code comes off once the lock is listed again
     const known = lockCodes[dev.device_id];
     const there = dev.access_code_id && (known ? known.managed.some(c => c.access_code_id === dev.access_code_id) : true);
     if (there) {
@@ -138,12 +147,21 @@ export async function reconcileDoorCodes(db, seam, beds24, now = Date.now()) {
     return true;
   };
 
-  // 1. Remove codes for stays that were cancelled, moved to a room without locks, or have ended.
+  // 1. Remove codes for stays that were cancelled (or gone from Beds24), moved to a room without locks, or have ended.
   for (const row of db.prepare('SELECT * FROM door_codes').all()) {
     if (targetIds.has(row.booking_id)) continue;
     for (const dev of db.prepare('SELECT * FROM door_code_devices WHERE booking_id = ?').all(row.booking_id)) await removeFromLock(dev);
     if (!db.prepare('SELECT 1 FROM door_code_devices WHERE booking_id = ?').get(row.booking_id)) {
       db.prepare('DELETE FROM door_codes WHERE booking_id = ?').run(row.booking_id);
+    }
+  }
+  // Codes with this app's naming that nothing tracks (a create whose answer was lost) are deleted once their window is over.
+  for (const lock of locks) {
+    const codes = lockCodes[lock.device_id];
+    for (const c of codes.managed) {
+      if (owner.has(c.access_code_id) || !OWN_NAME.test(c.name || '') || !c.ends_at || Date.parse(c.ends_at) > now) continue;
+      try { await seam.deleteCode(c.access_code_id); result.removed++; codes.managed = codes.managed.filter(x => x !== c); }
+      catch (e) { if (!/not_found/.test(e.seamType || '') && !/not found/i.test(e.message)) result.problems.push({ lock: lock.name, message: e.message }); }
     }
   }
 
@@ -152,48 +170,73 @@ export async function reconcileDoorCodes(db, seam, beds24, now = Date.now()) {
     const roomLocks = locks.filter(l => l.room_id === b.room_id);
     // The stay moved to another room (or a lock was reassigned): its code comes off locks that no longer serve it.
     for (const dev of db.prepare('SELECT * FROM door_code_devices WHERE booking_id = ?').all(b.id)) {
-      if (!roomLocks.some(l => l.device_id === dev.device_id)) await removeFromLock(dev);
+      if (!assigned.some(l => l.room_id === b.room_id && l.device_id === dev.device_id)) await removeFromLock(dev);
     }
-    const ours = new Set(db.prepare('SELECT access_code_id FROM door_code_devices WHERE booking_id = ?').all(b.id).map(r => r.access_code_id));
-    // Codes this stay must avoid: everything on its locks except other guests' codes, plus the codes of guests
-    // handled before it (earlier arrivals keep theirs; only the later stay moves when two clash).
-    const inUse = new Set([
-      ...roomLocks.flatMap(l => [...lockCodes[l.device_id].managed.filter(c => !ours.has(c.access_code_id) && !owner.has(c.access_code_id)), ...lockCodes[l.device_id].unmanaged])
-        .map(c => c.code),
-      ...db.prepare('SELECT d.booking_id, d.code FROM door_codes d JOIN bookings x ON x.id = d.booking_id WHERE x.room_id = ? AND d.booking_id != ?')
-        .all(b.room_id, b.id).filter(r => !order.has(r.booking_id) || order.get(r.booking_id) < order.get(b.id)).map(r => r.code),
-    ].filter(Boolean));
     let row = db.prepare('SELECT * FROM door_codes WHERE booking_id = ?').get(b.id);
+    const startsAt = zonedTimeToUtc(b.arrival, s.checkin, s.tz), endsAt = zonedTimeToUtc(b.departure, s.checkout, s.tz);
+    const over = Date.parse(endsAt) <= now;
+    if (!row && over) continue;   // checkout time has passed: nothing to put on the lock
+    const name = `${(b.guest_name || 'Guest').slice(0, 24)} ${b.arrival}`;
+    const ours = new Set(db.prepare('SELECT access_code_id FROM door_code_devices WHERE booking_id = ?').all(b.id).map(r => r.access_code_id));
+    // Codes this stay must avoid, and whose they are: everything on its locks except other guests' codes (and a code of
+    // its own whose creation went unrecorded, adopted below), plus every other stay's code on this room. When two stays
+    // hold the same code the earlier arrival keeps it and the later one moves.
+    const inUse = new Map();
+    for (const l of roomLocks) {
+      const { managed, unmanaged } = lockCodes[l.device_id];
+      for (const c of [...managed.filter(c => !ours.has(c.access_code_id) && !owner.has(c.access_code_id) && !(c.name === name && c.code === row?.code)), ...unmanaged]) {
+        if (c.code) inUse.set(c.code, c.name || 'another code');
+      }
+    }
+    for (const r of db.prepare('SELECT d.booking_id, d.code, x.guest_name FROM door_codes d JOIN bookings x ON x.id = d.booking_id WHERE x.room_id = ? AND d.booking_id != ?').all(b.room_id, b.id)) {
+      if (r.code !== row?.code || !order.has(r.booking_id) || order.get(r.booking_id) < order.get(b.id)) inUse.set(r.code, r.guest_name || 'another guest');
+    }
 
     // A lock refusing the code as a duplicate (e.g. the same code exists on the lock but isn't visible to
     // Seam) means: pick the next option now, based on what Seam reports at this moment.
     const refused = roomLocks.some(l => lockCodes[l.device_id].managed.some(c => ours.has(c.access_code_id) &&
       (c.errors || []).some(e => /duplicate_code_on_device|code_constraints_violated/.test(e.error_code))));
+    // A guest who already has the code (the stay has begun, or it's on the Beds24 booking with check-in within a day,
+    // so the check-in message may have gone out) is never moved to another code behind their back: the owner is told
+    // to change the other code instead, on the dashboard and the phone.
+    const told = !!row && (Date.parse(startsAt) <= now || (row.beds24_written === row.code && b.arrival <= addDays(today, 1)));
+    let clash = null;
     if (!row || refused || inUse.has(row.code)) {
-      const code = codeCandidates(b).find(c => !inUse.has(c) && c !== row?.code);
-      if (!code) { result.problems.push({ bookingId: b.id, message: 'No free door code could be found for this stay.' }); continue; }
-      if (!row) {
-        db.prepare('INSERT INTO door_codes(booking_id,code,created_at,updated_at) VALUES(?,?,?,?)').run(b.id, code, stamp, stamp);
+      if (told) {
+        clash = `Code ${row.code} clashes with ${inUse.has(row.code) ? `"${inUse.get(row.code)}"` : 'another code the lock can see'}; the guest already has it, so change the other code.`;
+        result.problems.push({ bookingId: b.id, message: clash });
       } else {
-        db.prepare('UPDATE door_codes SET code = ?, updated_at = ? WHERE booking_id = ?').run(code, stamp, b.id);
+        const code = codeCandidates(b).find(c => !inUse.has(c) && c !== row?.code);
+        if (!code) { result.problems.push({ bookingId: b.id, message: 'No free door code could be found for this stay.' }); continue; }
+        if (!row) {
+          db.prepare('INSERT INTO door_codes(booking_id,code,created_at,updated_at) VALUES(?,?,?,?)').run(b.id, code, stamp, stamp);
+        } else {
+          db.prepare('UPDATE door_codes SET code = ?, updated_at = ? WHERE booking_id = ?').run(code, stamp, b.id);
+        }
+        row = db.prepare('SELECT * FROM door_codes WHERE booking_id = ?').get(b.id);
       }
-      row = db.prepare('SELECT * FROM door_codes WHERE booking_id = ?').get(b.id);
     }
-    const startsAt = zonedTimeToUtc(b.arrival, s.checkin, s.tz), endsAt = zonedTimeToUtc(b.departure, s.checkout, s.tz);
     db.prepare('UPDATE door_codes SET starts_at = ?, ends_at = ? WHERE booking_id = ?').run(startsAt, endsAt, b.id);
-    const name = `${(b.guest_name || 'Guest').slice(0, 24)} ${b.arrival}`;
+    // Seam wants a start in the future: a stay already under way starts a minute from now (the real time is kept above).
+    const sendStart = new Date(Math.max(Date.parse(startsAt), now + 60e3)).toISOString();
 
     for (const lock of roomLocks) {
       const dev = db.prepare('SELECT * FROM door_code_devices WHERE booking_id = ? AND device_id = ?').get(b.id, lock.device_id);
-      const current = dev?.access_code_id && lockCodes[lock.device_id].managed.find(c => c.access_code_id === dev.access_code_id);
-      let code = current, error = null;
+      const { managed } = lockCodes[lock.device_id];
+      // A code this app created for the stay but never recorded (the answer was lost) is adopted, not made twice.
+      const current = (dev?.access_code_id && managed.find(c => c.access_code_id === dev.access_code_id))
+        || managed.find(c => c.name === name && c.code === row.code && !owner.has(c.access_code_id));
+      let code = current, error = clash;
       try {
         if (!current) {
-          code = await seam.createCode({ device_id: lock.device_id, name, code: row.code, starts_at: startsAt, ends_at: endsAt });
+          if (over) continue;
+          code = await seam.createCode({ device_id: lock.device_id, name, code: row.code, starts_at: sendStart, ends_at: endsAt });
           result.created++;
-        } else if (current.code !== row.code || !sameTime(current.starts_at, startsAt) || !sameTime(current.ends_at, endsAt)) {
-          await seam.updateCode({ access_code_id: current.access_code_id, code: row.code, starts_at: startsAt, ends_at: endsAt, name });
-          code = { ...current, code: row.code, starts_at: startsAt, ends_at: endsAt, errors: [], status: 'setting' };
+        } else if (current.code !== row.code || !sameTime(current.starts_at, startsAt, now + 60e3) || !sameTime(current.ends_at, endsAt)) {
+          // A start that has passed isn't sent as a past instant either: the lock keeps the start it has, or gets "a minute from now".
+          const start = Date.parse(startsAt) > now ? startsAt : Date.parse(current.starts_at) <= now ? current.starts_at : sendStart;
+          await seam.updateCode({ access_code_id: current.access_code_id, code: row.code, starts_at: start, ends_at: endsAt, name });
+          code = { ...current, code: row.code, starts_at: start, ends_at: endsAt, errors: [], status: 'setting' };
           result.updated++;
         }
       } catch (e) {
@@ -225,7 +268,9 @@ export async function reconcileDoorCodes(db, seam, beds24, now = Date.now()) {
   return result;
 }
 
-const sameTime = (a, b) => !!a && !!b && Date.parse(a) === Date.parse(b);
+// The same instant; or, given `by`, both at or before it (a start that has passed, or was sent as "a minute from now", needn't be re-sent).
+const sameTime = (a, b, by) => !!a && !!b && (Date.parse(a) === Date.parse(b) || (by != null && Date.parse(a) <= by && Date.parse(b) <= by));
+const OWN_NAME = /^.{1,24} \d{4}-\d{2}-\d{2}$/;   // how this app names its codes: guest name and arrival date
 
 /** How a booking's code stands on each lock: set, scheduled (normal before check-in), pending, error or missing. */
 export function codeState(dev, startsAt, now = Date.now()) {
@@ -255,19 +300,45 @@ export function doorCodesFor(db, bookingIds, now = Date.now()) {
 }
 
 /**
- * Confirmed Beds24 stays arriving in the next `days` days (within the code window) at a room with a lock, that
- * don't yet have a working code on every lock. Empty when automatic guest codes are off.
+ * Confirmed Beds24 stays at a room with a lock that are under way or arrive in the next `days` days (within the code
+ * window) and don't have a working code on every lock; or one alert when automatic codes are on, a guest is coming and
+ * no lock is assigned to a room (or Seam no longer lists any). Empty when automatic guest codes are off.
  */
 export function doorAlerts(db, { days = 3, now = Date.now() } = {}) {
   const ds = doorSettings(db);
   if (!ds.auto) return [];
   const today = localToday(ds.tz, now), limit = addDays(today, Math.min(days, ds.lookahead));
-  const lockRooms = new Set(db.prepare('SELECT DISTINCT room_id FROM locks WHERE room_id IS NOT NULL').all().map(r => r.room_id));
-  const soon = db.prepare(`SELECT id, guest_name, arrival, room_id, first_seen FROM bookings WHERE status IN ('confirmed','new')
-    AND source = 'beds24' AND arrival >= ? AND arrival <= ? ORDER BY arrival`).all(today, limit).filter(b => lockRooms.has(b.room_id));
-  const codes = doorCodesFor(db, soon.map(b => b.id), now);
-  return soon.filter(b => !codes[b.id]?.ok).map(b => ({ id: b.id, guest: b.guest_name, arrival: b.arrival, firstSeen: b.first_seen,
-    problem: codes[b.id]?.perLock.find(l => !['set', 'scheduled'].includes(l.state))?.label || 'No door code yet' }));
+  const locks = db.prepare('SELECT room_id, missing FROM locks WHERE room_id IS NOT NULL').all();
+  const lockRooms = new Set(locks.map(l => l.room_id)), present = new Set(locks.filter(l => !l.missing).map(l => l.room_id));
+  const soon = db.prepare(`SELECT id, guest_name, arrival, departure, room_id, first_seen, modified_at FROM bookings WHERE status IN ('confirmed','new')
+    AND source = 'beds24' AND departure >= ? AND arrival <= ? ORDER BY arrival, id`).all(today, limit)
+    .filter(b => Date.parse(zonedTimeToUtc(b.departure, ds.checkout, ds.tz)) > now);   // checked out already: nothing to open
+  const item = (b, problem) => ({ id: b.id, guest: b.guest_name, arrival: b.arrival, firstSeen: b.first_seen, inHouse: b.arrival < today, checkin: b.arrival === today, problem });
+  if (!present.size) return soon.length ? [item(soon[0], lockRooms.size ? 'Seam no longer lists any lock' : 'No lock is assigned to a room')] : [];
+  const stays = soon.filter(b => lockRooms.has(b.room_id));
+  const codes = doorCodesFor(db, stays.map(b => b.id), now);
+  // A stay changed since the last code run hasn't had its turn yet: no code isn't a problem until a run has looked.
+  const lastRun = Date.parse(getSetting(db, 'door_last_run'));
+  const looked = b => lastRun >= (Date.parse(b.modified_at) || Date.parse(b.first_seen) || 0);
+  const out = [];
+  for (const b of stays) {
+    const c = codes[b.id];
+    if (c?.ok) continue;
+    const failing = c?.perLock.find(l => !['set', 'scheduled'].includes(l.state))?.label;
+    if (failing) out.push(item(b, failing));
+    else if (!present.has(b.room_id)) out.push(item(b, "Seam no longer lists this room's lock"));
+    else if (looked(b)) out.push(item(b, 'No door code yet'));
+  }
+  return out;
+}
+
+/** Refuse a code that a current or upcoming guest has on a lock of the same room: it would be swapped from under them. */
+function refuseGuestCode(db, code, deviceIds) {
+  const g = db.prepare(`SELECT b.guest_name, b.arrival FROM door_codes d JOIN bookings b ON b.id = d.booking_id
+    WHERE d.code = ? AND b.status IN ('confirmed','new') AND b.departure >= ? AND b.room_id IN
+      (SELECT room_id FROM locks WHERE room_id IS NOT NULL AND device_id IN (${deviceIds.map(() => '?').join(',') || "''"}))`)
+    .get(code, localToday(doorSettings(db).tz), ...deviceIds);
+  if (g) throw userError(`${code} is ${g.guest_name || 'a guest'}'s door code (stay starting ${g.arrival}). Choose another code.`);
 }
 
 /**
@@ -287,10 +358,11 @@ export function setBookingCode(db, bookingId, code, otherCodes = []) {
 /** Everything on each assigned lock, with guest codes linked to their booking and other codes grouped across locks. */
 export async function lockOverview(db, seam) {
   const locks = db.prepare(`SELECT l.*, r.name room_name FROM locks l LEFT JOIN rooms r ON r.id = l.room_id ORDER BY l.name`).all();
-  const codes = await readLockCodes(seam, locks.map(l => l.device_id));
+  const codes = await readLockCodes(seam, locks.filter(l => !l.missing).map(l => l.device_id));
   const guestIds = new Set(db.prepare('SELECT access_code_id FROM door_code_devices WHERE access_code_id IS NOT NULL').all().map(r => r.access_code_id));
   const groups = new Map();
   for (const l of locks) {
+    if (!codes[l.device_id]) continue;   // missing from Seam: nothing to read
     for (const c of [...codes[l.device_id].managed, ...codes[l.device_id].unmanaged]) {
       if (guestIds.has(c.access_code_id)) continue;
       const key = `${c.name || ''}|${c.code || ''}`;
@@ -302,9 +374,13 @@ export async function lockOverview(db, seam) {
   return { locks, otherCodes: [...groups.values()].sort((a, b) => a.name.localeCompare(b.name)) };
 }
 
-/** Change the digits (and optionally name) of a non-guest code on every lock it's on. Yale-app codes are taken over by Seam first. */
-export async function changeOtherCode(seam, entries, { code, name }) {
+/**
+ * Change the digits (and optionally name) of a non-guest code on every lock it's on. Yale-app codes are taken over by
+ * Seam first. With `db`, a guest's current code is refused.
+ */
+export async function changeOtherCode(seam, entries, { code, name }, db = null) {
   if (!/^\d{4,8}$/.test(code || '')) throw userError('Door codes must be 4 to 8 digits.');
+  if (db) refuseGuestCode(db, code, entries.map(e => e.deviceId));
   for (const e of entries) {
     if (!e.managed) await seam.convertToManaged(e.accessCodeId);
     await seam.updateCode({ access_code_id: e.accessCodeId, code, ...(name && { name }) });
@@ -327,6 +403,7 @@ export async function addCode(db, seam, { name, code, deviceIds, startsAt, endsA
   if (!/^\d{4,8}$/.test(code || '')) throw userError('Door codes must be 4 to 8 digits.');
   if (!Array.isArray(deviceIds) || !deviceIds.length) throw userError('Choose at least one lock.');
   for (const id of deviceIds) if (!db.prepare('SELECT 1 FROM locks WHERE device_id = ?').get(id)) throw userError('Unknown lock.');
+  refuseGuestCode(db, code, deviceIds);
   if ((startsAt && !endsAt) || (!startsAt && endsAt)) throw userError('Give both a start and an end, or neither for a permanent code.');
   if (startsAt && !(Date.parse(endsAt) > Date.parse(startsAt))) throw userError('The end must be after the start.');
   for (const id of deviceIds) {

@@ -24,9 +24,14 @@ to inventory (for the Rates page), and paste it in. Invite codes are single-use,
 The app exchanges the code for a refresh token, does a full sync (1 year back), then syncs incrementally every
 15 minutes (or press **Sync**).
 
-Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only), `DB_PATH` (`data/str.db`, or
-`$RAILWAY_VOLUME_MOUNT_PATH/str.db` on Railway), `ANTHROPIC_API_KEY` (optional; the key can also be pasted in
-Settings). Failed logins are rate-limited (10 per IP per 15 minutes).
+Env vars: `PORT` (3000), `APP_PASSWORD` (if unset, binds to localhost only; 12+ characters, or the log warns),
+`DB_PATH` (`data/str.db`, or `$RAILWAY_VOLUME_MOUNT_PATH/str.db` on Railway), `ANTHROPIC_API_KEY` (optional; the key
+can also be pasted in Settings), `STR_DEMO=1` (load the sample data at startup while not connected to Beds24; what
+`npm run demo` sets), `TS_AUTHKEY` / `TS_HOSTNAME` (`str-dashboard`) / `TS_DIRECT=1` (Tailscale, see DEPLOY.md),
+`BEDS24_BASE` and `SEAM_BASE` (the Beds24 and Seam API base URLs; only the tests point them at fakes).
+Failed logins are rate-limited (10 per IP per 15 minutes; past 100 failures from everywhere within 15 minutes, wrong
+answers are slowed to one per 1.5 s, but the right password always gets in). Signing out revokes that session, and
+Settings → "Sign out everywhere" (`POST /api/logout-all`) signs out every browser and phone at once.
 
 ## What's in it
 

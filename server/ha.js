@@ -433,12 +433,17 @@ export async function freezeProtect(db, c, now = Date.now(), skip = new Set()) {
     if (!cfg.enabled) continue;
     for (const id of cfg.thermostats) {
       const row = stateOf(db, id);
+      // Per thermostat: when it was last turned up (`at`, at most every 6 hours), and the failed tries since (`failedAt`,
+      // `fails`; tried again every 10 minutes, the phone told once per episode). Older entries are a bare timestamp.
+      const r = typeof recent[id] === 'object' && recent[id] ? recent[id] : { at: recent[id] || 0 };
       // Thermostats the schedule just set are judged on the next reading, not this (now outdated) one.
-      if (skip.has(id) || !row || ['unavailable', 'unknown'].includes(row.state) || now - (recent[id] || 0) < 6 * 3600e3) continue;
+      if (skip.has(id) || !row || ['unavailable', 'unknown'].includes(row.state) || now - (r.at || 0) < 6 * 3600e3 || now - (r.failedAt || 0) < 10 * 60e3) continue;
       const cur = toF(num(row.attributes.current_temperature), s.unit);
       const set = toF(num(row.attributes.temperature ?? row.attributes.target_temp_low), s.unit);
-      if (cur == null || cur >= cfg.freezeFloor + 2 || (row.state !== 'off' && row.state !== 'cool' && set != null && set >= cfg.freezeFloor)) continue;
-      recent[id] = now;
+      if (cur == null || cur >= cfg.freezeFloor + 2 || (row.state !== 'off' && row.state !== 'cool' && set != null && set >= cfg.freezeFloor)) {
+        if (r.fails) recent[id] = { at: r.at };   // warm again without us: the next failure is a new episode
+        continue;
+      }
       try {
         const range = row.state === 'heat_cool' || row.state === 'auto';
         if (row.state !== 'heat' && !range) await c.call('climate', 'set_hvac_mode', { entity_id: id, hvac_mode: 'heat' });
@@ -448,7 +453,12 @@ export async function freezeProtect(db, c, now = Date.now(), skip = new Set()) {
           await c.call('climate', 'set_temperature', { entity_id: id, target_temp_low: fromF(cfg.freezeFloor, s.unit), target_temp_high: fromF(high, s.unit) });
         } else await c.call('climate', 'set_temperature', { entity_id: id, temperature: fromF(cfg.freezeFloor, s.unit) });
         logAction(db, now, id, 'freeze', `Freeze protection: the house was at ${cur}°F, so the heat was set to ${cfg.freezeFloor}°F`, true, true);
-      } catch (e) { logAction(db, now, id, 'freeze', `Freeze protection couldn't turn the heat on (${e.message})`, false, true); }
+        recent[id] = { at: now };
+      } catch (e) {
+        const fails = (r.fails || 0) + 1;
+        recent[id] = { at: r.at, failedAt: now, fails };
+        logAction(db, now, id, 'freeze', `Freeze protection couldn't turn the heat on (${e.message})`, false, fails === 1);
+      }
     }
   }
   setSetting(db, 'ha_freeze_last', JSON.stringify(recent));

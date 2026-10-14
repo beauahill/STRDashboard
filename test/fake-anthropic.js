@@ -1,11 +1,11 @@
 // Stand-in for the Anthropic Messages API, used by the tests (and handy for trying the UI without a key).
 // Records every request; answers tool-using requests by calling the first client tool once (or the one `toolCall`
 // picks), then replying with text. `pauseFirst` makes the first reply a paused server-tool turn; `searches` adds
-// web-search counts to the usage.
+// web-search counts to the usage; `delay` (ms) holds every answer back, to try client timeouts.
 import { createServer } from 'node:http';
 
 export function fakeAnthropic({ reply = req => `Draft for: ${JSON.stringify(req.messages.at(-1).content).slice(0, 80)}`, refuse = false,
-  toolCall = null, pauseFirst = false, searches = 0, alwaysTool = false } = {}) {
+  toolCall = null, pauseFirst = false, searches = 0, alwaysTool = false, delay = 0 } = {}) {
   const requests = [];
   const server = createServer((req, res) => {
     let body = '';
@@ -13,7 +13,7 @@ export function fakeAnthropic({ reply = req => `Draft for: ${JSON.stringify(req.
     req.on('end', () => {
       const json = body ? JSON.parse(body) : null;
       requests.push({ method: req.method, url: req.url, headers: req.headers, body: json });
-      const send = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
+      const send = (code, obj) => setTimeout(() => { if (!res.destroyed) { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); } }, delay);
       if ((req.headers['x-api-key'] || '').includes('bad')) return send(401, { type: 'error', error: { type: 'authentication_error', message: 'invalid x-api-key' } });
       if (req.method === 'GET' && req.url.startsWith('/v1/models/')) return send(200, { type: 'model', id: req.url.split('/').pop(), display_name: 'Claude', created_at: '2026-01-01T00:00:00Z' });
       if (req.method !== 'POST' || !req.url.startsWith('/v1/messages')) return send(404, { type: 'error', error: { type: 'not_found_error', message: 'nope' } });

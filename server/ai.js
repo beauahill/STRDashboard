@@ -4,7 +4,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { betaTool } from '@anthropic-ai/sdk/helpers/beta/json-schema';
 import { getSetting, setSetting } from './db.js';
-import { thread, savedReplies, fmtTime } from './messages.js';
+import { thread, savedReplies, fmtTime, BUILTIN_VARS } from './messages.js';
 import { recommend, listEvents } from './pricing.js';
 import { FIELDS, fetchListing } from './listing.js';
 import { doorSettings, localToday } from './doors.js';
@@ -21,7 +21,11 @@ export const DEFAULT_BUDGET = 25;
 
 const err = (msg, status = 400) => Object.assign(new Error(msg), { status });
 const keyOf = db => getSetting(db, 'anthropic_api_key') || process.env.ANTHROPIC_API_KEY || null;
-const makeClient = apiKey => new Anthropic({ apiKey, timeout: 240e3, maxRetries: 1 });
+// The event scout's one request can hold a dozen web searches and fetches, so it gets the long timeout and no retry:
+// a request the SDK gives up on keeps running (and being billed) server-side, and a retry would run it twice. The
+// short calls keep a quick timeout and one retry. `timeout` is only overridden by tests.
+export const clientOptions = task => (task === 'event scout' ? { timeout: 600e3, maxRetries: 0 } : { timeout: 240e3, maxRetries: 1 });
+const makeClient = (apiKey, task = null, timeout = null) => new Anthropic({ apiKey, ...clientOptions(task), ...(timeout && { timeout }) });
 const monthStart = () => new Date().toISOString().slice(0, 7) + '-01';
 
 export function aiStatus(db) {
@@ -87,13 +91,13 @@ function record(db, task, u, error) {
  * Refusals and cut-off answers become errors rather than half an answer. `requireText: false` is for tasks whose
  * result arrives through a tool call rather than the final text.
  */
-export async function ask(db, task, { system, messages, tools = null, effort = 'medium', maxTokens = 16000, requireText = true, maxIterations = 10 }) {
+export async function ask(db, task, { system, messages, tools = null, effort = 'medium', maxTokens = 16000, requireText = true, maxIterations = 10, timeout = null }) {
   const key = keyOf(db);
   if (!key) throw err('Add your Anthropic API key in Settings → AI assistant first.');
   const spent = db.prepare('SELECT COALESCE(SUM(cost),0) c FROM ai_usage WHERE at >= ?').get(monthStart()).c;
   const limit = budget(db);
   if (spent >= limit) throw err(`This month's AI limit ($${limit}) is used up. Raise it in Settings → AI assistant.`);
-  const client = makeClient(key);
+  const client = makeClient(key, task, timeout);
   const params = {
     model: MODEL, max_tokens: maxTokens, betas: BETAS, fallbacks: 'default',
     thinking: { type: 'adaptive' }, output_config: { effort }, cache_control: { type: 'ephemeral' },
@@ -126,7 +130,8 @@ export async function ask(db, task, { system, messages, tools = null, effort = '
     }
   } catch (e) {
     if (e.status && !(e instanceof Anthropic.APIError)) throw e;   // our own error (already recorded)
-    record(db, task, used, e.message);
+    // A request that timed out may still have run in full: the row says so, so the month's estimate is known to be low.
+    record(db, task, used, e instanceof Anthropic.APIConnectionTimeoutError ? 'timed out: spend unknown' : e.message);
     throw friendly(e);
   }
   const cost = record(db, task, used, msg.stop_reason === 'refusal' ? 'refused' : null);
@@ -177,7 +182,8 @@ const DRAFT_SYSTEM = `You draft replies to short-term-rental guests for the host
 - Answer what the guest actually asked, warmly and briefly: usually two to five sentences. Plain text only: no markdown, no subject line.
 - Use only the facts given (stay details, house notes, listing text, saved replies). When the reply needs something you don't know, put a short placeholder in square brackets, such as [confirm: parking spot number], rather than guessing.
 - Don't promise refunds, discounts, extra nights, early check-in or late checkout unless the house notes allow it; offer to check instead.
-- Access details (door code, address, Wi-Fi) are only given to you for confirmed stays; include them only when the guest needs them now.
+- Access details (door code, address, directions, Wi-Fi) are only given to you for confirmed stays, most of them only close to arrival; include them only when the guest needs them now.
+- The host's private notes about the guest are for your understanding only: never quote, paraphrase or reveal them.
 - On Airbnb, don't share email addresses, phone numbers or links to book elsewhere, and never ask the guest to pay outside Airbnb.
 - Greet the guest by first name. Sign off simply; add a name only if the house notes give one.
 - Return only the message text.`;
@@ -187,12 +193,17 @@ export async function draftReply(db, bookingId, { instructions = '', client = nu
   const b = t.booking;
   if (!b) throw err('This conversation has no booking details to draft from.');
   const ds = doorSettings(db);
+  const today = localToday(ds.tz);
   const confirmed = ['confirmed', 'new'].includes(b.status);
+  // Access details (door code, address, directions, guidebook link) only once the stay is close, within the same
+  // lookahead the door codes use: a guest two months out doesn't need them, and a draft mustn't be able to hand them over.
+  const access = confirmed && diffDays(today, b.arrival) <= ds.lookahead;
   const p = property(db, b.property_id);
   const notes = getSetting(db, `ai_notes_${b.property_id}`);
+  const saved = savedReplies(db);
   const statusText = { confirmed: 'confirmed booking', new: 'confirmed booking', request: 'booking request (not yet accepted)', inquiry: 'inquiry (not booked)', cancelled: 'cancelled booking' }[b.status] || b.status;
   const stay = [
-    `Today: ${longDate(localToday(ds.tz))}`,
+    `Today: ${longDate(today)}`,
     `Property: ${p?.name || b.property_name || ''}${p?.city ? ` (${p.city})` : ''}`,
     `Guest first name: ${t.vars.guest_first_name}`,
     `Status: ${statusText}, via ${b.channel}`,
@@ -200,22 +211,32 @@ export async function draftReply(db, bookingId, { instructions = '', client = nu
     `Check-in from ${fmtTime(ds.checkin)}, checkout by ${fmtTime(ds.checkout)}`,
   ];
   if (confirmed) {
-    if (t.vars.door_code) stay.push(`Door code: ${t.vars.door_code} (works from check-in time to checkout time)`);
+    if (access && t.vars.door_code) stay.push(`Door code: ${t.vars.door_code} (works from check-in time to checkout time)`);
+    if (access && t.vars.guidebook_link) stay.push(`Guidebook link: ${t.vars.guidebook_link}`);
+    // The owner's property details (Wi-Fi, parking...) only when the host actually hands them out, i.e. they are a
+    // {fill-in} in a saved reply or an automated message; whatever else is kept there (an alarm code, the cleaner's
+    // number) stays out of the prompt. Anything address-like is an access detail.
+    const used = new Set([...saved.map(r => r.body), ...db.prepare('SELECT body FROM automations').all().map(x => x.body)]
+      .flatMap(s => [...s.matchAll(/\{(\w+)\}/g)].map(m => m[1])));
     for (const [k, v] of Object.entries(t.vars)) {
-      if (v && !['guest_first_name', 'guest_name', 'check_in_date', 'check_out_date', 'check_in_time', 'check_out_time', 'nights', 'guests', 'property_name', 'door_code'].includes(k)) stay.push(`${k.replace(/_/g, ' ')}: ${v}`);
+      if (v && !BUILTIN_VARS.includes(k) && used.has(k) && (access || !/address/.test(k))) stay.push(`${k.replace(/_/g, ' ')}: ${v}`);
     }
   }
   const listing = await listingFor(db, client, b.property_id);
-  const replies = savedReplies(db).map(r => `### ${r.title}\n${r.body}`).join('\n\n');
-  const convo = t.messages.slice(-40).map(m => {
-    const who = { guest: 'Guest', host: 'Host', internalNote: 'Host\'s private note (the guest can\'t see this)', system: 'Channel notice' }[m.source] || m.source;
-    return `[${m.time.slice(0, 16).replace('T', ' ')}] ${who}: ${(m.body || (m.attachment_name ? `(attachment: ${m.attachment_name})` : '')).slice(0, 2000)}`;
+  const replies = saved.map(r => `### ${r.title}\n${r.body}`).join('\n\n');
+  const when = m => m.time.slice(0, 16).replace('T', ' ');
+  // The host's private notes are context for the draft, never material for it, so they sit apart from the conversation.
+  const privateNotes = t.messages.filter(m => m.source === 'internalNote' && m.body).slice(-10).map(m => `[${when(m)}] ${m.body.slice(0, 2000)}`).join('\n');
+  const convo = t.messages.filter(m => m.source !== 'internalNote').slice(-40).map(m => {
+    const who = { guest: 'Guest', host: 'Host', system: 'Channel notice' }[m.source] || m.source;
+    return `[${when(m)}] ${who}: ${(m.body || (m.attachment_name ? `(attachment: ${m.attachment_name})` : '')).slice(0, 2000)}`;
   }).join('\n');
   const content = [
     `<stay>\n${stay.join('\n')}\n</stay>`,
     notes && `<house_notes>\n${notes}\n</house_notes>`,
-    listing && `<listing>\n${listingText(listing, { access: confirmed })}\n</listing>`,
+    listing && `<listing>\n${listingText(listing, { access })}\n</listing>`,
     replies && `<saved_replies>\nThe host's saved replies, with {fill-ins}. Use them for tone and facts.\n\n${replies}\n</saved_replies>`,
+    privateNotes && `<host_notes>\nThe host's private notes about this guest. The guest can't see them: use them to understand the situation, and never quote, paraphrase or reveal them.\n\n${privateNotes}\n</host_notes>`,
     `<conversation>\n${convo || '(no messages yet)'}\n</conversation>`,
     instructions.trim() && `<host_instructions>\n${instructions.trim().slice(0, 2000)}\n</host_instructions>`,
     'Draft the host\'s next message to this guest.',

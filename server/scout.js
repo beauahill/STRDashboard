@@ -119,7 +119,7 @@ export async function scanEvents(db, { today, propertyId = null } = {}) {
   try {
     res = await ask(db, 'event scout', {
       system: SYSTEM, messages: [{ role: 'user', content }], effort: 'medium', requireText: false, maxIterations: 14,
-      tools: [{ type: 'web_search_20260209', name: 'web_search', max_uses: 12 }, { type: 'web_fetch_20260209', name: 'web_fetch', max_uses: 8 }, report],
+      tools: [{ type: 'web_search_20260209', name: 'web_search', max_uses: 12 }, { type: 'web_fetch_20260209', name: 'web_fetch', max_uses: 8, max_content_tokens: 15000 }, report],
     });
   } catch (e) {
     setSetting(db, 'scout_last', JSON.stringify({ at: started, error: e.message }));
@@ -174,15 +174,19 @@ export function store(db, events, { today, end, existing = listEvents(db), found
       IMPACTS.includes(e.impact) ? e.impact : 'medium', pct, minStay, CONFIDENCE.includes(e.confidence) ? e.confidence : 'likely',
       String(e.evidence || '').trim().slice(0, 400) || null, url];
     // An existing event: skip it if the nights already match; otherwise this is a date correction. When Claude
-    // names the event it means, that's used; otherwise names are compared. Nights are compared as reported, before
-    // an event under way is trimmed to start today.
+    // names the event it means, that's used as long as the names agree or the nights are close (a far-off date under
+    // another name is a new event, so names are compared instead); otherwise names are compared. Nights are compared
+    // as reported, before an event under way is trimmed to start today.
+    const byName = () => existing.find(x => near(x.start_date, x.end_date, start, last) && sameEvent(x.name, name));
     const named = e.matches_event_id > 0 ? existing.find(x => x.id === e.matches_event_id) : null;
-    const match = named || (e.matches_event_id > 0 ? null : existing.find(x => near(x.start_date, x.end_date, start, last) && sameEvent(x.name, name)));
+    const match = named ? (sameEvent(named.name, name) || near(named.start_date, named.end_date, start, last) ? named : byName()) : e.matches_event_id > 0 ? null : byName();
     if (match && (match.start_date === start || (start < today && match.start_date <= today)) && match.end_date === last) { skipped++; continue; }
     const replaces = match ? match.id : null;
-    // Already suggested (or dismissed, or added) before: refresh an open suggestion, leave the others alone.
-    const prior = all.find(x => (x.replaces_event_id && x.replaces_event_id === replaces)
-      || (near(x.start_date, x.end_date, first, last) && sameEvent(x.name, name)));
+    // Already suggested (or dismissed, or added) before: refresh an open suggestion, leave the others alone. The
+    // accepted suggestion that made (or last corrected) the very event being corrected doesn't count, or the scout
+    // could never fix the dates of an event it suggested itself.
+    const prior = all.find(x => !(x.status === 'added' && replaces && (x.event_id === replaces || x.replaces_event_id === replaces))
+      && ((x.replaces_event_id && x.replaces_event_id === replaces) || (near(x.start_date, x.end_date, first, last) && sameEvent(x.name, name))));
     if (prior) {
       if (prior.status !== 'new') { skipped++; continue; }
       upd.run(...fields, replaces, foundAt, prior.id); updated++;

@@ -1,18 +1,20 @@
 // Guest messaging through Beds24, which relays to Airbnb, Booking.com and VRBO message threads.
 import { getSetting, setSetting } from './db.js';
-import { doorCodesFor, doorSettings } from './doors.js';
+import { doorCodesFor, doorSettings, localToday } from './doors.js';
 import { guideUrl } from './guide.js';
 
 const userError = msg => Object.assign(new Error(msg), { status: 400 });
 export const MAX_MESSAGE = 5000;
 
 /**
- * Pull messages from Beds24 into the local copy. The first run looks back a year; later runs only the last
- * few days (new messages and read-state changes). Attachments aren't stored; they're fetched when opened.
+ * Pull messages from Beds24 into the local copy. The first run looks back a year; later runs back to the last
+ * successful pull plus a day of slack (a few days at least, so read-state changes come through too), so nothing
+ * that arrived while the app was down is missed. Attachments aren't stored; they're fetched when opened.
  */
 export async function syncMessages(db, client, { maxAge } = {}) {
-  const first = !getSetting(db, 'messages_synced');
-  const rows = await client.getAll('/bookings/messages', { maxAge: maxAge ?? (first ? 365 : 3) });
+  const since = getSetting(db, 'messages_synced');
+  const days = since ? Math.min(365, Math.max(3, Math.ceil((Date.now() - Date.parse(since)) / 86400e3) + 1)) : 365;
+  const rows = await client.getAll('/bookings/messages', { maxAge: maxAge ?? days });
   const put = db.prepare(`INSERT INTO messages(id,booking_id,source,body,time,read,attachment_name,attachment_mime)
     VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET read=excluded.read, body=excluded.body`);
   db.exec('BEGIN');
@@ -31,7 +33,7 @@ export async function syncMessages(db, client, { maxAge } = {}) {
 export const unreadCount = db => db.prepare("SELECT COUNT(*) n FROM messages WHERE source = 'guest' AND read = 0").get().n;
 
 /** One row per booking with messages, newest activity first. */
-export function conversations(db, { filter = 'all', q = '' } = {}) {
+export function conversations(db, { filter = 'all', q = '', now = Date.now() } = {}) {
   const rows = db.prepare(`
     SELECT m.booking_id, b.guest_name, b.channel, b.status, b.arrival, b.departure, p.name property_name,
       MAX(m.time) last_time,
@@ -40,7 +42,7 @@ export function conversations(db, { filter = 'all', q = '' } = {}) {
       (SELECT source FROM messages x WHERE x.booking_id = m.booking_id ORDER BY x.time DESC, x.id DESC LIMIT 1) last_source
     FROM messages m LEFT JOIN bookings b ON b.id = m.booking_id LEFT JOIN properties p ON p.id = b.property_id
     GROUP BY m.booking_id ORDER BY unread > 0 DESC, last_time DESC`).all();
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localToday(doorSettings(db).tz, now);   // a guest checking out today is still current all evening
   const needle = q.trim().toLowerCase();
   return rows.filter(r =>
     (filter !== 'unread' || r.unread > 0) &&
@@ -179,5 +181,10 @@ export function saveReply(db, { id, title, body }) {
 
 export const deleteReply = (db, id) => db.prepare('DELETE FROM saved_replies WHERE id = ?').run(id);
 
-/** Replace {variables}; unknown ones are left visible so they get noticed before sending. */
-export const fillTemplate = (body, vars) => body.replace(/\{(\w+)\}/g, (m, k) => (k in vars && vars[k] !== '' ? String(vars[k]) : m));
+/**
+ * Replace {variables}; unknown ones are left visible so they get noticed before sending. Braces inside a value (a
+ * guest named "{door_code} Smith") are dropped, so the result never looks as if it still had a fill-in.
+ */
+export const fillTemplate = (body, vars) => body.replace(/\{(\w+)\}/g, (m, k) => (k in vars && vars[k] !== '' ? String(vars[k]).replace(/[{}]/g, '') : m));
+/** The template's own fill-ins that have no value yet. */
+export const missingVars = (body, vars) => [...new Set([...body.matchAll(/\{(\w+)\}/g)].map(m => m[1]))].filter(k => !(k in vars && vars[k] !== ''));

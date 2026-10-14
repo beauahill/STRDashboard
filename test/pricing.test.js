@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { openDb, setSetting } from '../server/db.js';
+import { openDb, setSetting, getSetting } from '../server/db.js';
 import { upsertProperties, upsertBookings, addDays } from '../server/sync.js';
 import { syncCalendar } from '../server/rates.js';
 import {
@@ -244,8 +244,30 @@ test('auto-pricing: one room failing doesn\'t stop the others, and it waits befo
   await assert.rejects(autoPrice(db, cal, TODAY, now), /Unit 1: .*rejected/);
   assert.ok(cal.days.size > 0, 'Unit 2 was still priced');
   const calls = cal.posts.length;
-  assert.deepEqual(await autoPrice(db, cal, TODAY, now + 15 * 60e3), [], 'the failed room waits; the done room is done for today');
-  assert.equal(cal.posts.length, calls);
+  await assert.rejects(autoPrice(db, cal, TODAY, now + 15 * 60e3), /Unit 1: .*rejected/, 'the failed room waits, and its failure is still reported; the done room is done for today');
+  assert.equal(cal.posts.length, calls, 'nothing retried yet');
   await assert.rejects(autoPrice(db, cal, TODAY, now + 4 * 3600e3), /Unit 1/, 'tried again after 3 hours');
   assert.deepEqual(await autoPrice(db, { ...cal, canWriteInventory: false }, '2026-10-13', now + 30 * 3600e3), [], 'a read-only code never tries');
+});
+
+test('a failed auto-pricing push stays on the Pricing page while the room waits, and clears once a retry succeeds', async () => {
+  const db = setup({ auto: true, autoHorizon: 7, autoThreshold: 1 });
+  const cal = new FakeCal();
+  let fail = true, tries = 0;
+  const post = cal.post.bind(cal);
+  cal.post = async (path, body) => { tries++; if (fail) throw new Error('Beds24 rejected the change'); return post(path, body); };
+  // What runSync() in index.js does around autoPrice: the error setting follows the throw.
+  const sync = async now => {
+    try { await autoPrice(db, cal, TODAY, now); setSetting(db, 'pricing_error', null); } catch (e) { setSetting(db, 'pricing_error', e.message); }
+    return getSetting(db, 'pricing_error');
+  };
+  const t0 = Date.parse('2026-10-12T15:00:00Z');
+  assert.match(await sync(t0), /Whole house: Beds24 rejected/);
+  assert.match(await sync(t0 + 15 * 60e3), /Whole house: Beds24 rejected/, 'still shown while the room waits');
+  assert.equal(tries, 1, 'not retried yet');
+  fail = false;
+  assert.match(await sync(t0 + 2 * 3600e3), /rejected/, 'still waiting');
+  assert.equal(await sync(t0 + 3.1 * 3600e3), null, 'cleared by the successful retry');
+  assert.equal(tries, 2);
+  assert.equal(getSetting(db, 'pricing_auto_error_600'), null);
 });

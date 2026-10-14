@@ -89,3 +89,17 @@ test('save: sends the changes, confirms by re-reading, logs, and updates local n
   await assert.rejects(saveListing(db, c, 500, edited), /rejected the change: headline contains a phone number/);
   assert.equal(listingLog(db, 500)[0].ok, 0);
 });
+
+test('a number Beds24 returns as a string is not a change', async () => {
+  const c = new FakeProps();
+  Object.assign(c.p.roomTypes[0], { cleaningFee: '95.00', maxPeople: '6' });
+  c.p.postcode = '02070';
+  const cur = await fetchListing(c, 500);
+  assert.deepEqual(diffListing(cur, structuredClone(cur)).changes, [], 'an untouched form has nothing to push');
+  const edited = structuredClone(cur);
+  edited.rooms[0].cleaningFee = '120';
+  assert.deepEqual(diffListing(cur, edited).changes.map(x => [x.field, x.before, x.after]), [['cleaningFee', '95.00', 120]]);
+  edited.rooms[0].cleaningFee = '95';
+  edited.property.postcode = '2070';   // text stays text: a ZIP that lost its leading zero is a change
+  assert.deepEqual(diffListing(cur, edited).changes.map(x => x.field), ['postcode']);
+});

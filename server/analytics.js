@@ -111,7 +111,7 @@ export function bookingWindow(db, from, to, propertyId = null) {
 /** Occupancy and ADR by night of the week for nights in [from, to). */
 export function byWeekday(db, from, to, propertyId = null) {
   const rows = DOW.map(day => ({ day, nights: 0, available: 0, revenue: 0 }));
-  const units = db.prepare(`SELECT COALESCE(SUM(qty),0) n FROM rooms ${propertyId ? 'WHERE property_id = ?' : ''}`).get(...(propertyId ? [propertyId] : [])).n;
+  const units = Math.max(1, db.prepare(`SELECT COALESCE(SUM(qty),0) n FROM rooms ${propertyId ? 'WHERE property_id = ?' : ''}`).get(...(propertyId ? [propertyId] : [])).n);
   for (let d = from; d < to; d = addDays(d, 1)) rows[new Date(d + 'T00:00:00Z').getUTCDay()].available += units;
   const list = db.prepare(`SELECT arrival, departure, nights, price FROM bookings WHERE ${ACTIVE} AND arrival < ? AND departure > ?
     ${propertyId ? 'AND property_id = ?' : ''}`).all(to, from, ...(propertyId ? [propertyId] : []));
@@ -146,7 +146,7 @@ export function cancellations(db, from, to, propertyId = null) {
 /** On the books for each of the next `months` months, versus what was on the books for the same month at this point last year. */
 export function pace(db, today, propertyId = null, months = 6) {
   const lastYearToday = addDays(today, -364) + 'T23:59:59';
-  const units = db.prepare(`SELECT COALESCE(SUM(qty),0) n FROM rooms ${propertyId ? 'WHERE property_id = ?' : ''}`).get(...(propertyId ? [propertyId] : [])).n;
+  const units = Math.max(1, db.prepare(`SELECT COALESCE(SUM(qty),0) n FROM rooms ${propertyId ? 'WHERE property_id = ?' : ''}`).get(...(propertyId ? [propertyId] : [])).n);
   const sum = (from, to, bookedBy) => db.prepare(`SELECT arrival, departure, nights, price FROM bookings
       WHERE arrival < ? AND departure > ? ${propertyId ? 'AND property_id = ?' : ''}
       ${bookedBy ? "AND booked_at IS NOT NULL AND booked_at <= ? AND (status IN ('confirmed','new') OR (status = 'cancelled' AND cancelled_at > ?))" : `AND ${ACTIVE}`}`)

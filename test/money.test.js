@@ -116,3 +116,11 @@ test('a checkout on January 1 is counted in that year\'s estimated cleaning', ()
   assert.equal(y27.months[0].gross, 0, 'no nights in 2027');
   assert.equal(y26.months[11].gross, 800, 'all four nights in December');
 });
+
+test('a payout marked received with no date gets the property\'s date, not the UTC one', () => {
+  const db = setup();
+  const realNow = Date.now;
+  Date.now = () => Date.parse('2026-12-25T01:00:00Z');   // 6 pm on Christmas Eve in Wyoming
+  try { assert.equal(markPayout(db, 2, { amount: 380 }).receivedOn, '2026-12-24'); } finally { Date.now = realNow; }
+  assert.equal(db.prepare('SELECT received_on FROM payouts_received WHERE booking_id = 2').get().received_on, '2026-12-24');
+});

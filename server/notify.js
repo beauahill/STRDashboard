@@ -13,10 +13,12 @@ export const NOTIFY_DEFAULTS = {
   messages: true, bookings: true, cancellations: true, problems: true, home: true, pricing: true, enabledAt: null,
 };
 const MAX_AGE = 24 * 3600e3;   // never send about anything older than this (e.g. after the app was down)
-const MAX_ATTEMPTS = 5;        // a notification that fails this often is given up on
+const BACKOFF = [1, 2, 5, 10, 15];   // minutes before a failed send is tried again, then every 15 for about a day
 const PER_RUN = 10;            // the rest wait for the next minute
 const EVENTS = ['messages', 'bookings', 'cancellations', 'problems', 'home', 'pricing'];
 const URGENT = ['home', 'door'];
+/** When this process started: "hasn't synced for an hour" only counts an hour the app was actually up for. */
+export const boot = { at: Date.now() };
 
 // The topic is the only thing protecting a ntfy.sh topic, so it's long and random.
 export const newTopic = () => 'str-' + randomBytes(15).toString('base64url');
@@ -78,7 +80,11 @@ export async function publish(s, n, fetchImpl = fetch) {
   });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
-    throw new Error(`ntfy answered ${res.status}${text ? `: ${text.slice(0, 200)}` : ''}`);
+    const err = new Error(`ntfy answered ${res.status}${text ? `: ${text.slice(0, 200)}` : ''}`);
+    // ntfy's rate limit says how long to hold off (seconds, or a date).
+    const ra = res.status === 429 && res.headers?.get?.('retry-after');
+    if (ra) err.retryAfter = Math.min(/^\d+$/.test(ra) ? ra * 1000 : Date.parse(ra) - Date.now(), 3600e3);
+    throw err;
   }
 }
 
@@ -95,14 +101,15 @@ export function collect(db, now = Date.now()) {
   const origin = appOrigin(db);
   const link = path => (origin ? origin + path : undefined);
   const logged = db.prepare('SELECT ok, attempts, at FROM notification_log WHERE kind = ? AND ref = ?');
-  // Most notifications give up after a few failed tries. Leak, alarm, freeze and door-code alerts keep trying every
-  // five minutes for about a day while they're still active: an ntfy outage mustn't swallow a leak.
+  // A failed send is tried again after 1, 2, 5 and 10 minutes, then every 15 for about a day (every 5 for leak, alarm,
+  // freeze and door-code alerts while they're still active): an ntfy outage mustn't swallow a booking request or a leak.
   const pending = (kind, ref) => {
     const r = logged.get(kind, String(ref));
     if (!r) return true;
-    if (r.ok) return false;
-    if (r.attempts < MAX_ATTEMPTS) return true;
-    return URGENT.includes(kind) && r.attempts < 300 && now - Date.parse(r.at) >= 5 * 60e3;
+    const urgent = URGENT.includes(kind);
+    if (r.ok || r.attempts >= (urgent ? 300 : 100)) return false;
+    const wait = Math.min(BACKOFF[Math.min(r.attempts, BACKOFF.length) - 1], urgent ? 5 : 15);
+    return now - Date.parse(r.at) >= wait * 60e3;
   };
   const out = [];
 
@@ -151,17 +158,26 @@ export function collect(db, now = Date.now()) {
       out.push({ title: 'Automated message failed', message: `${f.name} to ${f.guest_name || 'a guest'}: ${f.error || 'not sent'}`, tags: ['warning'], priority: 4,
         click: link('/#/automations'), refs: [['automation', ref]], time: at(f.updated_at) });
     }
-    // A code still being programmed right after a booking isn't a problem yet; give it 30 minutes.
-    for (const d of doorAlerts(db, { days: 2, now })) {
-      const ref = `${d.id}:${d.arrival}`;
+    const alerts = doorAlerts(db, { days: 2, now });
+    // A stay whose code is fine again forgets its door alerts, so a later problem (say, at check-in) is pushed afresh.
+    const live = new Set(alerts.map(d => String(d.id)));
+    for (const r of db.prepare("SELECT ref FROM notification_log WHERE kind = 'door'").all()) {
+      if (!live.has(r.ref.split(':')[0])) db.prepare("DELETE FROM notification_log WHERE kind = 'door' AND ref = ?").run(r.ref);
+    }
+    // A code still being programmed right after a booking isn't a problem yet; give it 30 minutes. On check-in day a
+    // problem that is still there is said once more.
+    for (const d of alerts) {
+      const ref = `${d.id}:${d.arrival}${d.checkin ? ':checkin' : ''}`;
       if ((d.firstSeen && at(d.firstSeen) > now - 30 * 60e3) || !pending('door', ref)) continue;
-      out.push({ title: `Door code problem: ${d.guest || 'guest'} arrives ${short(d.arrival)}`, message: d.problem, tags: ['key', 'warning'], priority: 4,
+      const when = d.inHouse ? 'is staying now' : d.checkin ? 'arrives today' : `arrives ${short(d.arrival)}`;
+      out.push({ title: `Door code problem: ${d.guest || 'guest'} ${when}`, message: d.problem, tags: ['key', 'warning'], priority: 4,
         click: link('/#/locks'), refs: [['door', ref]], time: now });
     }
-    // If Beds24 stops syncing, messages stop arriving too, so say so (once a day).
+    // If Beds24 stops syncing, messages stop arriving too, so say so (once a day). Time the app was down doesn't count:
+    // a restart after an outage isn't a sync problem.
     const lastSync = at(getSetting(db, 'last_sync'));
     const day = new Date(now).toISOString().slice(0, 10);
-    if (getSetting(db, 'beds24_refresh_token') && lastSync && lastSync < now - 3600e3 && pending('sync', day)) {
+    if (getSetting(db, 'beds24_refresh_token') && lastSync && Math.max(lastSync, boot.at) < now - 3600e3 && pending('sync', day)) {
       out.push({ title: 'Beds24 hasn\'t synced for over an hour', message: `New messages and bookings may be missing. ${getSetting(db, 'last_sync_error') || 'Open Settings to check the connection.'}`,
         tags: ['warning'], priority: 4, click: link('/#/settings'), refs: [['sync', day]], time: now });
     }
@@ -192,14 +208,19 @@ function mark(db, n, ok, error, now) {
   for (const [kind, ref] of n.refs) stmt.run(kind, String(ref), new Date(now).toISOString(), n.title, ok ? 1 : 0, error);
 }
 
-/** Send everything pending. Failures are retried on later runs (up to MAX_ATTEMPTS), never thrown. */
+/** Send everything pending. Failures are retried on later runs (see `pending` in collect), never thrown. */
 export async function runNotifications(db, { now = Date.now(), fetchImpl = fetch } = {}) {
   const s = notifySettings(db);
-  const items = collect(db, now).slice(0, PER_RUN);
+  // ntfy asked for a pause (429 with Retry-After): nothing is tried until it's over.
+  const hold = at(getSetting(db, 'notify_hold_until'));
+  const items = hold > now ? [] : collect(db, now).slice(0, PER_RUN);
   let sent = 0, failed = 0;
   for (const n of items) {
     try { await publish(s, n, fetchImpl); mark(db, n, true, null, now); sent++; }
-    catch (e) { mark(db, n, false, e.message, now); failed++; setSetting(db, 'notify_error', e.message); }
+    catch (e) {
+      mark(db, n, false, e.message, now); failed++; setSetting(db, 'notify_error', e.message);
+      if (e.retryAfter > 0) { setSetting(db, 'notify_hold_until', new Date(now + e.retryAfter).toISOString()); break; }
+    }
   }
   if (sent && !failed) setSetting(db, 'notify_error', null);
   db.prepare('DELETE FROM notification_log WHERE at < ?').run(new Date(now - 180 * 86400e3).toISOString());

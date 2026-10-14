@@ -2,8 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { openDb, setSetting } from '../server/db.js';
 import { fakeAnthropic } from './fake-anthropic.js';
-import { MODEL, aiStatus, saveKey, saveAiSettings, cacheListing, draftReply, writeListing, reviewPricing, askData, dataTools } from '../server/ai.js';
+import { MODEL, aiStatus, saveKey, saveAiSettings, cacheListing, draftReply, writeListing, reviewPricing, askData, dataTools, ask, clientOptions } from '../server/ai.js';
 import { savePricingSettings } from '../server/pricing.js';
+import { saveReply } from '../server/messages.js';
+import { localToday } from '../server/doors.js';
+import { addDays } from '../server/sync.js';
 
 const KEY = 'sk-ant-api03-test-key-abcdefghijklmnop';
 
@@ -55,6 +58,9 @@ test('draft reply: request shape, stay details, access details only for confirme
   await saveKey(db, KEY);
   saveAiSettings(db, { notes: { 1: 'Parking: two spots in the driveway. No dogs. Sign off as Sam.' } });
   cacheListing(db, { id: 1, propertyText: { houseRules: 'Quiet hours 10pm to 7am', directions: 'Take exit 313' }, rooms: [] });
+  saveReply(db, { title: 'Wi-Fi', body: 'The Wi-Fi password is {wifi_password}.' });
+  const today = localToday('America/Denver');
+  db.prepare('UPDATE bookings SET arrival = ?, departure = ? WHERE id = 1').run(addDays(today, 2), addDays(today, 4));   // close enough for access details
 
   const r = await draftReply(db, 1, { instructions: 'Mention the garage too' });
   assert.match(r.text, /^Draft for:/);
@@ -208,4 +214,37 @@ test('running out of steps mid-lookup is an error, not a half-finished answer; t
   const before = messagesCalls(f).length;
   await assert.rejects(askData(db, 'And February?'), /AI limit/);
   assert.ok(messagesCalls(f).length - before < 10, 'stopped partway');
+});
+
+test('draft prompts carry only the property details the host hands out, and access details only close to arrival', async t => {
+  const f = await withFake(t);
+  const db = setup();
+  await saveKey(db, KEY);
+  const today = localToday('America/Denver');
+  setSetting(db, 'vars_1', JSON.stringify({ wifi_password: 'cowboys2026', alarm_code: '7781' }));
+  saveReply(db, { title: 'Wi-Fi', body: 'The Wi-Fi password is {wifi_password}.' });   // alarm_code is in no template
+  db.prepare('UPDATE bookings SET arrival = ?, departure = ? WHERE id = 1').run(addDays(today, 60), addDays(today, 62));
+  db.prepare("INSERT INTO messages(id,booking_id,source,body,time,read) VALUES(3,1,'internalNote','Left the place a mess last time','2026-10-10T16:00:00Z',1)").run();
+  await draftReply(db, 1);
+  const far = messagesCalls(f)[0].body.messages[0].content;
+  assert.ok(far.includes('wifi password: cowboys2026'));
+  for (const s of ['7781', 'alarm', 'Door code']) assert.ok(!far.includes(s), `two months out, the prompt leaves out ${s}`);
+  assert.match(far, /<host_notes>\n[^]*never quote[^]*Left the place a mess last time[^]*<\/host_notes>/);
+  assert.ok(!/<conversation>[^]*mess last time/.test(far), 'private notes are not part of the conversation');
+  db.prepare('UPDATE bookings SET arrival = ?, departure = ? WHERE id = 1').run(addDays(today, 2), addDays(today, 4));
+  await draftReply(db, 1);
+  const soon = messagesCalls(f)[1].body.messages[0].content;
+  assert.ok(soon.includes('Door code: 0142') && soon.includes('wifi password: cowboys2026'), 'two days out: door code and Wi-Fi');
+  assert.ok(!soon.includes('7781'), 'still no alarm code');
+});
+
+test('the scout gets a long timeout and no retry; a timed-out request is sent once and recorded as unknown spend', async t => {
+  assert.deepEqual(clientOptions('event scout'), { timeout: 600e3, maxRetries: 0 });
+  assert.deepEqual(clientOptions('draft'), { timeout: 240e3, maxRetries: 1 });
+  const f = await withFake(t, { delay: 400 });
+  const db = setup();
+  await saveKey(db, KEY);
+  await assert.rejects(ask(db, 'event scout', { system: 'x', messages: [{ role: 'user', content: 'hi' }], timeout: 100 }), e => e.status === 504 && /took too long/.test(e.message));
+  assert.equal(messagesCalls(f).length, 1, 'never re-sent: the first attempt may still be running and billed');
+  assert.equal(db.prepare("SELECT error FROM ai_usage WHERE task = 'event scout'").get().error, 'timed out: spend unknown');
 });

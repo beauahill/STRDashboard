@@ -25,7 +25,8 @@ export function recordSignals(db, now = new Date()) {
   const rows = db.prepare(`SELECT b.id, b.status, b.room_id, b.arrival, b.departure, b.channel, b.first_seen, b.booked_at FROM bookings b
     WHERE b.status IN ('inquiry','request') AND b.id > 0 AND NOT EXISTS (SELECT 1 FROM demand_signals s WHERE s.booking_id = b.id)`).all();
   const add = db.prepare('INSERT INTO demand_signals(booking_id,kind,room_id,arrival,departure,channel,seen_at) VALUES(?,?,?,?,?,?,?)');
-  for (const b of rows) add.run(b.id, b.status, b.room_id, b.arrival, b.departure, b.channel, b.first_seen || b.booked_at || now.toISOString());
+  // When the guest asked (Beds24's time), not when this app first saw it: the first sync pulls in months-old ones.
+  for (const b of rows) add.run(b.id, b.status, b.room_id, b.arrival, b.departure, b.channel, b.booked_at || b.first_seen || now.toISOString());
   return rows.length;
 }
 

@@ -124,3 +124,28 @@ test('a signed check-in can\'t be replaced through the link, and none is taken a
   assert.equal(checkinFor(db, 2).name, 'Dee Direct');
   assert.throws(() => saveCheckin(db, 1, { name: 'Sam Rivers', agree: true, idDataUrl: PNG }, {}, T('2026-10-23T12:00:00Z')), /stay is over/);
 });
+
+test('the check-in form links to the rental agreement even when the booking site was never set up', () => {
+  const db = setup();
+  saveGuide(db, 500, { requireDirect: true });
+  const page = renderGuide(guideFor(db, 2, T('2026-10-19T15:00:00Z')), { token: 'x' });
+  assert.match(page, /href="\/stay\/laramie-retreat\/terms"/, 'the default web address from the property name');
+});
+
+test('a cancelled or long-finished stay sees a bare page, and the Wi-Fi password only shows around the stay', () => {
+  const db = setup();
+  saveGuide(db, 500, { phone: '307-555-0100', sections: [{ title: 'Heating', body: 'Nest in the hall.' }] });
+  const page = (id, at) => renderGuide(guideFor(db, id, T(at)), { token: 'x' });
+  const cancelled = page(3, '2026-10-20T20:00:00Z');
+  assert.match(cancelled, /This booking was cancelled/);
+  for (const secret of ['cowboys2026', 'Retreat-5G', '307-555-0100', 'Nest in the hall', '1234 Grand']) assert.ok(!cancelled.includes(secret), `the cancelled page has no ${secret}`);
+  assert.ok(!page(1, '2026-10-10T15:00:00Z').includes('cowboys2026'), 'not before the window');
+  assert.match(page(1, '2026-10-20T20:00:00Z'), /cowboys2026/, 'during the stay');
+  assert.match(page(1, '2026-10-23T20:00:00Z'), /cowboys2026/, 'the day after checkout');
+  const later = page(1, '2026-11-26T20:00:00Z');   // five weeks after checkout
+  assert.ok(!later.includes('cowboys2026'), 'five weeks later');
+  assert.match(later, /Nest in the hall/, 'the house guide is still there for a while');
+  const gone = page(1, '2026-12-25T20:00:00Z');   // more than 60 days after checkout
+  assert.match(gone, /This stay is over/);
+  for (const secret of ['cowboys2026', 'Nest in the hall', '307-555-0100']) assert.ok(!gone.includes(secret), `the finished page has no ${secret}`);
+});

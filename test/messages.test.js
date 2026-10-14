@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { openDb, setSetting } from '../server/db.js';
 import { Beds24Client } from '../server/beds24.js';
 import { upsertProperties, upsertBookings, syncBeds24 } from '../server/sync.js';
+import { localToday } from '../server/doors.js';
 import {
   syncMessages, unreadCount, conversations, thread, sendMessage, markRead, attachment,
   savedReplies, saveReply, deleteReply, fillTemplate,
@@ -31,6 +32,7 @@ class FakeBeds24 {
     let r = this.msgs;
     if (q.bookingId) r = r.filter(m => q.bookingId.includes(m.bookingId));
     if (q.id) r = r.filter(m => q.id.includes(m.id));
+    if (q.maxAge) r = r.filter(m => Date.parse(m.time) >= Date.now() - q.maxAge * 86400e3);
     return r.map(m => ({ ...m }));
   }
   async post(path, body) {
@@ -150,6 +152,7 @@ test('saved replies: starters added once, edit, delete, and fill-ins', () => {
   assert.throws(() => saveReply(db, { id: 9999, title: 'x', body: 'y' }), /no longer exists/);
   assert.equal(fillTemplate('Hi {guest_first_name}, code {door_code}, {unknown}', { guest_first_name: 'Pat', door_code: '' }),
     'Hi Pat, code {door_code}, {unknown}', 'blank or unknown fill-ins stay visible');
+  assert.equal(fillTemplate('Hi {guest_name}', { guest_name: '{door_code} Smith' }), 'Hi door_code Smith', 'braces in a value never look like a fill-in');
 });
 
 test('Beds24 client PATCH sends query and JSON body; sync asks for inquiries too', async () => {
@@ -170,4 +173,28 @@ test('Beds24 client PATCH sends query and JSON body; sync asks for inquiries too
   await syncBeds24(db, c);
   const bookingsCall = seen.find(s => s.url.pathname.endsWith('/bookings'));
   assert.ok(bookingsCall.url.searchParams.getAll('status').includes('inquiry'));
+});
+
+test('after an outage, the sync looks back to the last successful pull', async () => {
+  const { db, client } = setup();
+  setSetting(db, 'messages_synced', new Date(Date.now() - 10 * 86400e3).toISOString());
+  client.msgs.push({ id: 6, bookingId: 11, source: 'guest', message: 'Could we check in early?', time: at(5 * 24), read: false });
+  await syncMessages(db, client);
+  assert.ok(client.calls.at(-1)[2].maxAge >= 11, `asked for ${client.calls.at(-1)[2].maxAge} days`);
+  assert.equal(db.prepare('SELECT body FROM messages WHERE id = 6').get()?.body, 'Could we check in early?');
+  await syncMessages(db, client);
+  assert.equal(client.calls.at(-1)[2].maxAge, 3, 'back to a few days once caught up');
+});
+
+test('the inbox "current/upcoming" filter uses the local date, not UTC', async () => {
+  const { db, client } = setup();
+  await syncMessages(db, client);
+  // 01:00 UTC is still the evening before in Mountain time: a guest checking out on that local day is current.
+  const now = Date.parse(day(0) + 'T01:00:00Z');
+  const local = localToday('America/Denver', now);
+  assert.equal(local, day(-1));
+  db.prepare('UPDATE bookings SET departure = ? WHERE id = 11').run(local);
+  assert.ok(conversations(db, { filter: 'upcoming', now }).some(c => c.booking_id === 11), 'checking out today (local) is still upcoming');
+  db.prepare('UPDATE bookings SET departure = ? WHERE id = 11').run(day(-2));
+  assert.ok(!conversations(db, { filter: 'upcoming', now }).some(c => c.booking_id === 11));
 });
