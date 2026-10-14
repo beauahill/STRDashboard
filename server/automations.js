@@ -136,10 +136,17 @@ export async function runAutomations(db, client, now = new Date(), send = (booki
   const putSend = db.prepare(`INSERT INTO automation_sends(automation_id,booking_id,key,status,scheduled_at,sent_at,error,body,updated_at) VALUES(?,?,?,?,?,?,?,?,?)
     ON CONFLICT(automation_id,booking_id,key) DO UPDATE SET status=excluded.status, scheduled_at=excluded.scheduled_at, sent_at=excluded.sent_at,
     error=excluded.error, body=excluded.body, updated_at=excluded.updated_at`);
-  const horizon = addDays(now.toISOString().slice(0, 10), 32), past = addDays(now.toISOString().slice(0, 10), -5);
+  // Stays near today (arrival/departure messages: offsets up to 30 days, plus up to 72 hours to send), and any stay
+  // booked, cancelled or changed in the last few days whatever its dates (those messages are due right after the
+  // event: within a day's delay, and stale 48 hours later). A confirmation for a stay months away must still go out.
+  const today = now.toISOString().slice(0, 10);
+  const horizon = addDays(today, 32), past = addDays(today, -35), recent = addDays(today, -4);
   const bookings = db.prepare(`SELECT b.*, p.name property_name FROM bookings b LEFT JOIN properties p ON p.id = b.property_id
-    WHERE b.source = 'beds24' AND b.id > 0 AND b.departure >= ? AND b.arrival <= ?`).all(past, horizon);
+    WHERE b.source = 'beds24' AND b.id > 0 AND ((b.departure >= ? AND b.arrival <= ?)
+      OR substr(COALESCE(b.booked_at, b.first_seen, ''), 1, 10) >= ? OR substr(COALESCE(b.cancelled_at, b.modified_at, ''), 1, 10) >= ?)`)
+    .all(past, horizon, recent, recent);
   const byId = new Map(bookings.map(b => [b.id, b]));
+  const oneBooking = db.prepare('SELECT b.*, p.name property_name FROM bookings b LEFT JOIN properties p ON p.id = b.property_id WHERE b.id = ?');
 
   for (const a of autos) {
     const enabledAt = new Date(a.enabled_at || 0);
@@ -156,7 +163,7 @@ export async function runAutomations(db, client, now = new Date(), send = (booki
       }
       jobs = [];
       for (const w of db.prepare("SELECT * FROM automation_sends WHERE automation_id = ? AND status IN ('pending','waiting')").all(a.id)) {
-        const b = byId.get(w.booking_id);
+        const b = byId.get(w.booking_id) || oneBooking.get(w.booking_id);
         if (!b) continue;
         if (w.key !== `${b.arrival}|${b.departure}`) { putSend.run(a.id, b.id, w.key, 'skipped', w.scheduled_at, null, 'Dates changed again', null, now.toISOString()); continue; }
         jobs.push({ b, key: w.key, eventAt: new Date(Date.parse(w.scheduled_at) - (a.delay_minutes || 0) * 60e3).toISOString() });
@@ -205,7 +212,7 @@ export function upcoming(db, now = new Date(), days = 14) {
   const end = new Date(now.getTime() + days * 24 * HOUR);
   const bookings = db.prepare(`SELECT b.*, p.name property_name FROM bookings b LEFT JOIN properties p ON p.id = b.property_id
     WHERE b.source = 'beds24' AND b.id > 0 AND b.status IN ('confirmed','new') AND b.departure >= ? AND b.arrival <= ?`)
-    .all(addDays(now.toISOString().slice(0, 10), -5), addDays(now.toISOString().slice(0, 10), days + 31));
+    .all(addDays(now.toISOString().slice(0, 10), -35), addDays(now.toISOString().slice(0, 10), days + 31));
   const out = [];
   for (const a of listAutomations(db).filter(x => x.enabled && ['arrival', 'departure'].includes(x.anchor))) {
     for (const b of bookings) {

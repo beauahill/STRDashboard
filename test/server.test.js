@@ -1,3 +1,4 @@
+import { request as httpRequest } from 'node:http';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -34,8 +35,10 @@ test('password-protected server: health, login, lockout, logout', async t => {
   assert.equal((await fetch(s.url('/healthz'))).status, 200);
   assert.equal((await fetch(s.url('/api/status'))).status, 401);
 
-  const login = (password, ip = '1.1.1.1') => fetch(s.url('/api/login'), {
-    method: 'POST', headers: { 'content-type': 'application/json', 'x-real-ip': ip }, body: JSON.stringify({ password }),
+  // Railway's proxy appends the visitor's address as the last X-Forwarded-For hop; whatever the visitor sent comes first.
+  const login = (password, ip = '1.1.1.1', forged = null) => fetch(s.url('/api/login'), {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': forged ? `${forged}, ${ip}` : ip, 'x-real-ip': forged || ip },
+    body: JSON.stringify({ password }),
   });
 
   const ok = await login('hunter2');
@@ -46,9 +49,11 @@ test('password-protected server: health, login, lockout, logout', async t => {
   assert.equal((await status.json()).auth, true);
   assert.equal((await fetch(s.url('/api/status'), { headers: { cookie: 'sid=123.forged' } })).status, 401);
 
-  for (let i = 0; i < 10; i++) assert.equal((await login('nope', '2.2.2.2')).status, 401);
-  assert.equal((await login('hunter2', '2.2.2.2')).status, 429, 'locked out after 10 failures');
+  for (let i = 0; i < 10; i++) assert.equal((await login('nope', '2.2.2.2', `9.9.9.${i}`)).status, 401);
+  assert.equal((await login('hunter2', '2.2.2.2', '8.8.8.8')).status, 429, 'locked out after 10 failures, whatever addresses the client claims');
   assert.equal((await login('hunter2', '3.3.3.3')).status, 200, 'other IPs unaffected');
+  assert.equal((await fetch(s.url('//a:b'))).status, 400, 'a malformed request target is a 400, not a crash');
+  assert.equal((await fetch(s.url('/healthz'))).status, 200, 'still running');
 
   const secure = await fetch(s.url('/api/login'), {
     method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-proto': 'https' }, body: '{"password":"hunter2"}',
@@ -827,4 +832,23 @@ test('Pricing over HTTP: demand numbers, event scout scan, adding and dismissing
   assert.deepEqual(after.events.filter(e => e.name === 'Border War').map(e => [e.pct, e.min_stay]), [[60, 2]]);
   assert.deepEqual(after.suggestions, []);
   assert.equal(after.scout.last.added, 2);
+});
+
+test('a request body is decoded whole: an accented letter split across two network chunks survives', async t => {
+  const s = start({ APP_PASSWORD: 'pw', DB_PATH: join(tmp(), 'db.sqlite') });
+  t.after(() => s.child.kill());
+  await s.ready;
+  const sid = (await fetch(s.url('/api/login'), { method: 'POST', body: '{"password":"pw"}' })).headers.get('set-cookie').split(';')[0];
+  const body = Buffer.from(JSON.stringify({ title: 'Café', body: 'Bienvenue au café, à bientôt' }));
+  const cut = body.indexOf(Buffer.from('é')) + 1;   // in the middle of the two bytes of "é"
+  await new Promise((ok, no) => {
+    const u = new URL(s.url('/api/replies'));
+    const req = httpRequest({ host: u.hostname, port: u.port, path: u.pathname, method: 'POST', headers: { cookie: sid, 'content-type': 'application/json', 'content-length': body.length } },
+      res => { res.resume(); res.on('end', ok); });
+    req.on('error', no);
+    req.write(body.subarray(0, cut));
+    setTimeout(() => req.end(body.subarray(cut)), 50);
+  });
+  const replies = await fetch(s.url('/api/replies'), { headers: { cookie: sid } }).then(r => r.json());
+  assert.ok(replies.some(r => r.title === 'Café' && r.body === 'Bienvenue au café, à bientôt'));
 });

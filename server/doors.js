@@ -116,20 +116,32 @@ export async function reconcileDoorCodes(db, seam, beds24, now = Date.now()) {
   const targets = db.prepare(`
     SELECT b.* FROM bookings b WHERE b.source = 'beds24' AND b.status IN ('confirmed','new')
       AND b.room_id IN (${rooms.map(() => '?').join(',')}) AND b.departure >= ?
-      AND (b.arrival <= ? OR b.id IN (SELECT booking_id FROM door_codes))`).all(...rooms, today, addDays(today, s.lookahead));
+      AND (b.arrival <= ? OR b.id IN (SELECT booking_id FROM door_codes)) ORDER BY b.arrival, b.id`).all(...rooms, today, addDays(today, s.lookahead));
   const targetIds = new Set(targets.map(b => b.id));
+  const order = new Map(targets.map((b, i) => [b.id, i]));
+  // Which guest each code on the locks belongs to: two guests' codes must never push each other around.
+  const owner = new Map(db.prepare('SELECT access_code_id, booking_id FROM door_code_devices WHERE access_code_id IS NOT NULL').all()
+    .map(r => [r.access_code_id, r.booking_id]));
+
+  // Delete one booking's code from one lock. A lock no longer assigned to a room isn't in lockCodes, so its code is
+  // deleted directly; Seam saying it's already gone counts as done. Returns false if it had to stay.
+  const removeFromLock = async dev => {
+    const known = lockCodes[dev.device_id];
+    const there = dev.access_code_id && (known ? known.managed.some(c => c.access_code_id === dev.access_code_id) : true);
+    if (there) {
+      try { await seam.deleteCode(dev.access_code_id); result.removed++; }
+      catch (e) {
+        if (!/not_found/.test(e.seamType || '') && !/not found/i.test(e.message)) { result.problems.push({ bookingId: dev.booking_id, message: e.message }); return false; }
+      }
+    }
+    db.prepare('DELETE FROM door_code_devices WHERE booking_id = ? AND device_id = ?').run(dev.booking_id, dev.device_id);
+    return true;
+  };
 
   // 1. Remove codes for stays that were cancelled, moved to a room without locks, or have ended.
   for (const row of db.prepare('SELECT * FROM door_codes').all()) {
     if (targetIds.has(row.booking_id)) continue;
-    for (const dev of db.prepare('SELECT * FROM door_code_devices WHERE booking_id = ?').all(row.booking_id)) {
-      const stillThere = dev.access_code_id && lockCodes[dev.device_id]?.managed.some(c => c.access_code_id === dev.access_code_id);
-      if (stillThere) {
-        try { await seam.deleteCode(dev.access_code_id); result.removed++; }
-        catch (e) { result.problems.push({ bookingId: row.booking_id, message: e.message }); continue; }
-      }
-      db.prepare('DELETE FROM door_code_devices WHERE booking_id = ? AND device_id = ?').run(row.booking_id, dev.device_id);
-    }
+    for (const dev of db.prepare('SELECT * FROM door_code_devices WHERE booking_id = ?').all(row.booking_id)) await removeFromLock(dev);
     if (!db.prepare('SELECT 1 FROM door_code_devices WHERE booking_id = ?').get(row.booking_id)) {
       db.prepare('DELETE FROM door_codes WHERE booking_id = ?').run(row.booking_id);
     }
@@ -138,9 +150,19 @@ export async function reconcileDoorCodes(db, seam, beds24, now = Date.now()) {
   // 2. Create or update codes for each upcoming stay.
   for (const b of targets) {
     const roomLocks = locks.filter(l => l.room_id === b.room_id);
+    // The stay moved to another room (or a lock was reassigned): its code comes off locks that no longer serve it.
+    for (const dev of db.prepare('SELECT * FROM door_code_devices WHERE booking_id = ?').all(b.id)) {
+      if (!roomLocks.some(l => l.device_id === dev.device_id)) await removeFromLock(dev);
+    }
     const ours = new Set(db.prepare('SELECT access_code_id FROM door_code_devices WHERE booking_id = ?').all(b.id).map(r => r.access_code_id));
-    const inUse = new Set(roomLocks.flatMap(l => [...lockCodes[l.device_id].managed.filter(c => !ours.has(c.access_code_id)), ...lockCodes[l.device_id].unmanaged])
-      .map(c => c.code).filter(Boolean));
+    // Codes this stay must avoid: everything on its locks except other guests' codes, plus the codes of guests
+    // handled before it (earlier arrivals keep theirs; only the later stay moves when two clash).
+    const inUse = new Set([
+      ...roomLocks.flatMap(l => [...lockCodes[l.device_id].managed.filter(c => !ours.has(c.access_code_id) && !owner.has(c.access_code_id)), ...lockCodes[l.device_id].unmanaged])
+        .map(c => c.code),
+      ...db.prepare('SELECT d.booking_id, d.code FROM door_codes d JOIN bookings x ON x.id = d.booking_id WHERE x.room_id = ? AND d.booking_id != ?')
+        .all(b.room_id, b.id).filter(r => !order.has(r.booking_id) || order.get(r.booking_id) < order.get(b.id)).map(r => r.code),
+    ].filter(Boolean));
     let row = db.prepare('SELECT * FROM door_codes WHERE booking_id = ?').get(b.id);
 
     // A lock refusing the code as a duplicate (e.g. the same code exists on the lock but isn't visible to
@@ -212,6 +234,8 @@ export function codeState(dev, startsAt, now = Date.now()) {
   if (dev.error || errors.length) return { state: 'error', label: dev.error || errors.map(e => e.message || e.error_code).join('; ') };
   if (dev.status === 'set') return { state: 'set', label: 'On the lock' };
   if (startsAt && Date.parse(startsAt) > now) return { state: 'scheduled', label: dev.scheduled ? 'Scheduled on the lock' : 'Goes on the lock at check-in' };
+  // Right at check-in the stored status is still the one read before it; give the lock time to report "set".
+  if (startsAt && Date.parse(startsAt) + 45 * 60e3 > now) return { state: 'scheduled', label: 'Going on the lock now' };
   return { state: 'pending', label: 'Being set on the lock' };
 }
 
@@ -296,6 +320,9 @@ export async function deleteOtherCode(seam, entries) {
 
 /** Add a code (permanent, or between two times) to one or more locks. */
 export async function addCode(db, seam, { name, code, deviceIds, startsAt, endsAt }) {
+  // A date and time without a zone (from a datetime-local field) is the property's local time, not the server's UTC.
+  const local = v => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(v) ? zonedTimeToUtc(v.slice(0, 10), v.slice(11, 16), doorSettings(db).tz) : v);
+  startsAt = local(startsAt); endsAt = local(endsAt);
   if (!name?.trim()) throw userError('Give the code a name, e.g. "Cleaner".');
   if (!/^\d{4,8}$/.test(code || '')) throw userError('Door codes must be 4 to 8 digits.');
   if (!Array.isArray(deviceIds) || !deviceIds.length) throw userError('Choose at least one lock.');

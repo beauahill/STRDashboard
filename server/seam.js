@@ -13,7 +13,7 @@ export class SeamClient {
     const res = await this.fetch(BASE + path, {
       method: 'POST',
       headers: { authorization: `Bearer ${this.apiKey}`, 'content-type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify(body), signal: AbortSignal.timeout(20000),   // a hung request mustn't stall every lock
     });
     const json = await res.json().catch(() => ({}));
     if (res.status === 401) throw Object.assign(new Error('Seam rejected the API key. Check it in Settings.'), { status: 400 });

@@ -2,6 +2,7 @@
 // Only the fields the dashboard needs are kept: guest addresses, IDs and door key codes are discarded.
 import { createHash } from 'node:crypto';
 import { diffDays } from './sync.js';
+import { getSetting, setSetting } from './db.js';
 
 /** RFC 4180 CSV parser with delimiter detection (comma, semicolon or tab) and BOM stripping. */
 export function parseCsv(text) {
@@ -163,6 +164,8 @@ export function importGuesty(db, bookings, mapping = {}) {
         const pid = nextId('properties'), rid = nextId('rooms');
         db.prepare('INSERT INTO properties(id,name) VALUES(?,?)').run(pid, listing);
         db.prepare('INSERT INTO rooms(id,property_id,name,qty) VALUES(?,?,?,1)').run(rid, pid, listing);
+        // Chosen as a separate property: never merged into a Beds24 room later (see adoptLocalRooms).
+        if (choice === 'new') setSetting(db, 'guesty_separate_rooms', JSON.stringify([...separateRooms(db), rid]));
         target[listing] = { room: rid, property: pid };
         rooms.set(rid, pid);
       } else if (rooms.size === 1) {
@@ -186,12 +189,32 @@ export function importGuesty(db, bookings, mapping = {}) {
  * Beds24 is the source of truth, so drop the Guesty copy of any stay Beds24 also has.
  */
 export function dedupeImported(db) {
-  return Number(db.prepare(`
+  adoptLocalRooms(db);
+  // Only a real stay counts: Beds24 often holds a block (or an inquiry) on exactly a reservation's dates.
+  const n = Number(db.prepare(`
     DELETE FROM bookings WHERE source = 'guesty' AND EXISTS (
-      SELECT 1 FROM bookings b WHERE b.source = 'beds24' AND b.status != 'cancelled' AND (
+      SELECT 1 FROM bookings b WHERE b.source = 'beds24' AND b.status IN ('confirmed','new') AND (
         (b.channel_ref IS NOT NULL AND b.channel_ref = bookings.channel_ref) OR
         (b.room_id = bookings.room_id AND b.arrival = bookings.arrival AND b.departure = bookings.departure)))`).run().changes);
+  removeEmptyLocalProperties(db);
+  return n;
 }
+
+/**
+ * History imported before Beds24 was connected sits in a local (negative id) room. Once Beds24 has exactly one
+ * room, that's the same place: move the history onto it, so occupancy isn't counted over two rooms and stays in
+ * both systems are recognised as duplicates. (With several Beds24 rooms the owner maps them on import instead.)
+ */
+function adoptLocalRooms(db) {
+  const real = db.prepare('SELECT id, property_id FROM rooms WHERE id > 0').all();
+  const keep = new Set(separateRooms(db));
+  const local = db.prepare('SELECT id FROM rooms WHERE id < 0').all().map(r => r.id).filter(id => !keep.has(id));
+  if (real.length !== 1 || !local.length) return;
+  const [{ id: room, property_id: property }] = real;
+  const move = db.prepare('UPDATE bookings SET room_id = ?, property_id = ? WHERE room_id = ?');
+  for (const id of local) move.run(room, property, id);
+}
+const separateRooms = db => { try { return JSON.parse(getSetting(db, 'guesty_separate_rooms') || '[]'); } catch { return []; } };
 
 /** Local (negative id) properties exist only to hold imported history; drop them once nothing points at them. */
 function removeEmptyLocalProperties(db) {

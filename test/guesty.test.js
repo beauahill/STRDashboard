@@ -169,3 +169,37 @@ test('databases from before this release gain the new columns', () => {
   const db = openDb(path);
   assert.deepEqual({ ...db.prepare('SELECT source, payout FROM bookings').get() }, { source: 'beds24', payout: null });
 });
+
+const gStay = (id, arrival, departure, over = {}) => ({ id, listing: 'Laramie House', status: 'confirmed', channel: 'Airbnb', arrival, departure,
+  nights: (Date.parse(departure) - Date.parse(arrival)) / 864e5, guest_name: 'Gus Guest', price: 1200, payout: 1100, channel_ref: null, booked_at: null, ...over });
+
+test('a Beds24 block (or inquiry) on the same dates is not the same stay', () => {
+  const db = openDb(':memory:');
+  upsertProperties(db, [{ id: 500, name: 'Laramie Retreat', roomTypes: [{ id: 600, name: 'Whole house', qty: 1 }] }]);
+  importGuesty(db, [gStay(-1, '2026-07-03', '2026-07-06')]);
+  upsertBookings(db, [{ id: 9001, propertyId: 500, roomId: 600, status: 'black', arrival: '2026-07-03', departure: '2026-07-06' },
+    { id: 9002, propertyId: 500, roomId: 600, status: 'inquiry', arrival: '2026-07-03', departure: '2026-07-06' }]);
+  assert.equal(dedupeImported(db), 0);
+  assert.equal(periodStats(db, '2026-07-01', '2026-08-01').revenue, 1200, "July's revenue survives");
+});
+
+test('history imported before Beds24 was connected moves onto the Beds24 room once there is exactly one', () => {
+  const db = openDb(':memory:');
+  importGuesty(db, [gStay(-1, '2026-03-01', '2026-03-31'), gStay(-2, '2026-11-10', '2026-11-12', { channel_ref: 'HM123' })]);
+  assert.equal(db.prepare('SELECT room_id FROM bookings WHERE id = -1').get().room_id < 0, true, 'a local room until Beds24 is connected');
+  upsertProperties(db, [{ id: 500, name: 'Laramie Retreat', roomTypes: [{ id: 600, name: 'Whole house', qty: 1 }] }]);
+  upsertBookings(db, [{ id: 9003, propertyId: 500, roomId: 600, status: 'confirmed', arrival: '2026-11-10', departure: '2026-11-12', price: 600, apiReference: 'HM123' }]);
+  assert.equal(dedupeImported(db), 1, 'the stay in both systems is recognised');
+  assert.deepEqual({ ...db.prepare('SELECT room_id, property_id FROM bookings WHERE id = -1').get() }, { room_id: 600, property_id: 500 });
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM rooms WHERE id < 0').get().n, 0, 'the local room is gone');
+  const march = periodStats(db, '2026-03-01', '2026-04-01');
+  assert.equal(Math.round(march.occupancy * 100), 97, '30 of 31 nights, not half');
+});
+
+test('history imported as a separate property stays separate', () => {
+  const db = openDb(':memory:');
+  upsertProperties(db, [{ id: 500, name: 'Laramie Retreat', roomTypes: [{ id: 600, name: 'Whole house', qty: 1 }] }]);
+  importGuesty(db, [gStay(-1, '2025-06-01', '2025-06-05', { listing: 'Old cabin (sold)' })], { 'Old cabin (sold)': 'new' });
+  dedupeImported(db);
+  assert.ok(db.prepare('SELECT room_id FROM bookings WHERE id = -1').get().room_id < 0);
+});

@@ -225,6 +225,11 @@ export function storeStates(db, s, states, now) {
       const v = sampling ? sampleValue(m, st, s.unit) : null;
       if (v != null) sample.run(st.entity_id, iso(now), v);
     }
+    // A followed device Home Assistant no longer lists (re-paired, renamed, integration broken) is offline, not
+    // frozen at its last reading: otherwise a dead freeze sensor would show 66°F forever and never alert.
+    const seen = new Set(states.map(st => st.entity_id));
+    const gone = db.prepare("UPDATE ha_states SET state = 'unavailable', updated_at = ? WHERE entity_id = ? AND state != 'unavailable'");
+    for (const id of Object.keys(s.entities)) if (!seen.has(id)) gone.run(iso(now), id);
     db.exec('COMMIT');
   } catch (e) { db.exec('ROLLBACK'); throw e; }
   if (sampling) setSetting(db, 'ha_last_sample', now);
@@ -435,8 +440,13 @@ export async function freezeProtect(db, c, now = Date.now(), skip = new Set()) {
       if (cur == null || cur >= cfg.freezeFloor + 2 || (row.state !== 'off' && row.state !== 'cool' && set != null && set >= cfg.freezeFloor)) continue;
       recent[id] = now;
       try {
-        if (row.state !== 'heat' && row.state !== 'heat_cool' && row.state !== 'auto') await c.call('climate', 'set_hvac_mode', { entity_id: id, hvac_mode: 'heat' });
-        await c.call('climate', 'set_temperature', { entity_id: id, temperature: fromF(cfg.freezeFloor, s.unit) });
+        const range = row.state === 'heat_cool' || row.state === 'auto';
+        if (row.state !== 'heat' && !range) await c.call('climate', 'set_hvac_mode', { entity_id: id, hvac_mode: 'heat' });
+        // Range modes take a low and high setpoint, not a single temperature.
+        if (range) {
+          const high = Math.max(toF(num(row.attributes.target_temp_high), s.unit) ?? 0, cfg.freezeFloor + 10);
+          await c.call('climate', 'set_temperature', { entity_id: id, target_temp_low: fromF(cfg.freezeFloor, s.unit), target_temp_high: fromF(high, s.unit) });
+        } else await c.call('climate', 'set_temperature', { entity_id: id, temperature: fromF(cfg.freezeFloor, s.unit) });
         logAction(db, now, id, 'freeze', `Freeze protection: the house was at ${cur}°F, so the heat was set to ${cfg.freezeFloor}°F`, true, true);
       } catch (e) { logAction(db, now, id, 'freeze', `Freeze protection couldn't turn the heat on (${e.message})`, false, true); }
     }
@@ -452,9 +462,13 @@ export async function runCheckoutLocks(db, c, now = Date.now()) {
   for (const pid of Object.keys(s.checkoutLock).map(Number)) {
     const cfg = lockFor(s, pid);
     if (!cfg.enabled) continue;
-    for (const b of occupancy(db, pid, now).stays) {
+    const occ = occupancy(db, pid, now);
+    for (const b of occ.stays) {
       const due = b.checkOutAt + cfg.minutes * 60e3;
       if (now < due || now > due + 6 * 3600e3) continue;
+      // Running late (the app or Home Assistant was down) must never lock the next guest out: once someone else's
+      // stay has begun, this checkout's lock-up is skipped.
+      if (occ.current && occ.current.id !== b.id) continue;
       const who = `${b.guest_name || 'the guest'}'s checkout`;
       for (const id of cfg.locks) {
         const key = `checkout:${b.id}:${id}`;
@@ -502,6 +516,10 @@ export async function pollHA(db, { now = Date.now(), fetchImpl } = {}) {
     db.prepare('DELETE FROM ha_events WHERE at < ?').run(cutoff);
     db.prepare('DELETE FROM ha_alert_log WHERE since < ?').run(cutoff);
     db.prepare('DELETE FROM ha_actions WHERE at < ?').run(iso(now - 90 * 86400e3));
+    db.prepare('DELETE FROM ha_done WHERE at < ?').run(iso(now - 90 * 86400e3));
+    const tries = JSON.parse(getSetting(db, 'ha_lock_tries') || '{}'), done = db.prepare('SELECT 1 FROM ha_done WHERE key = ?');
+    for (const k of Object.keys(tries)) if (done.get(k)) delete tries[k];
+    setSetting(db, 'ha_lock_tries', JSON.stringify(tries));
     setSetting(db, 'ha_pruned', iso(now).slice(0, 10));
   }
   return { ok: true };

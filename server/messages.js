@@ -57,7 +57,7 @@ export function thread(db, bookingId) {
   if (!booking && !messages.length) throw Object.assign(new Error('Conversation not found.'), { status: 404 });
   const door = doorCodesFor(db, [bookingId])[bookingId] || null;
   const vars = templateVars(db, booking, door);
-  return { booking: booking && { ...booking, phone: undefined, email: undefined }, messages, door, vars, canReply: !!booking && booking.id > 0 && booking.source === 'beds24' };
+  return { bookingId, booking: booking && { ...booking, phone: undefined, email: undefined }, messages, door, vars, canReply: !!booking && booking.id > 0 && booking.source === 'beds24' };
 }
 
 const fmtLong = d => d ? new Date(d + 'T00:00:00Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', timeZone: 'UTC' }) : '';
@@ -113,7 +113,10 @@ export async function sendMessage(db, client, bookingId, text) {
   if (errors.length || (Array.isArray(res) && res.some(r => r?.success === false))) {
     throw new Error('Beds24 didn\'t send the message: ' + (errors.join('; ') || 'unknown error'));
   }
-  await refreshThread(db, client, bookingId);
+  // The message has gone out; failing to re-read the thread afterwards mustn't look like a failed send (an
+  // automation would send it again on its next run, and the owner would press Send again).
+  try { await refreshThread(db, client, bookingId); }
+  catch { return { ...thread(db, bookingId), refreshFailed: true }; }
   return thread(db, bookingId);
 }
 

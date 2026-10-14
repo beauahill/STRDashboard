@@ -8,20 +8,26 @@ const fmtDate = s => new Date(s + 'T00:00:00Z').toLocaleDateString(undefined, {
 const tag = t => `<span class="tag ${esc(t)}">${esc(t)}</span>`;
 let status = {};
 
+// Each page render gets a number. A page load (GET) that finishes after the owner has moved to another page is
+// dropped ("stale") instead of drawing the old page over the new one.
+let renderSeq = 0;
 async function api(path, opts = {}) {
+  const seq = renderSeq, load = !opts.method || opts.method === 'GET';
   const res = await fetch('/api' + path, { ...opts, body: opts.body && JSON.stringify(opts.body), headers: { 'content-type': 'application/json' } });
   const data = await res.json().catch(() => ({}));
   if (res.status === 401 && data.error === 'Login required') { showLogin(); throw new Error('login'); }
-  if (!res.ok) throw new Error(data.error || res.statusText);
+  if (load && seq !== renderSeq) throw new Error('stale');
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status}${res.statusText ? ' ' + res.statusText : ''})`);
   return data;
 }
 const prop = () => $('#prop').value;
 const q = (extra = {}) => new URLSearchParams({ ...(prop() && { property: prop() }), ...extra }).toString();
 
 // kind: true/'err' = problem, 'ok' = success, otherwise a neutral notice.
-function banner(msg, kind) { const b = $('#banner'); b.hidden = !msg; b.textContent = msg || ''; b.className = kind === true || kind === 'err' ? 'err' : kind === 'ok' ? 'ok' : ''; }
+function banner(msg, kind) { if (msg === 'stale') return; const b = $('#banner'); b.hidden = !msg; b.textContent = msg || ''; b.className = kind === true || kind === 'err' ? 'err' : kind === 'ok' ? 'ok' : ''; }
 
 function showLogin() {
+  clearInterval(pageTimer); pageTimer = null;   // a poll would redraw the form under a half-typed password
   document.body.classList.add('signed-out');
   view.innerHTML = `<form class="card stack login"><h3>Sign in</h3><input type="password" name="password" placeholder="Password" autofocus><button class="primary">Sign in</button><div class="sub" id="lerr"></div></form>`;
   view.querySelector('form').onsubmit = async e => {
@@ -328,7 +334,8 @@ function renderGuestyPreview(csv, { summary: s, rooms }) {
 
 // ---------- Rates: view and change nightly price, minimum stay and blocked dates ----------
 const ratesState = { start: null, room: null, from: null, to: null };
-const todayISO = () => new Date().toISOString().slice(0, 10);
+// The property's date (its time zone), not UTC: in a Wyoming evening UTC is already tomorrow.
+const todayISO = () => { try { return new Intl.DateTimeFormat('en-CA', { timeZone: status.tz || undefined }).format(new Date()); } catch { return new Date().toLocaleDateString('en-CA'); } };
 const addMonths = (m, n) => { const d = new Date(m + 'T00:00:00Z'); d.setUTCMonth(d.getUTCMonth() + n); return d.toISOString().slice(0, 10); };
 
 async function ratesView() {
@@ -602,8 +609,17 @@ async function openThread(id) {
   inbox.booking = id;
   document.querySelector('.inbox')?.classList.add('has-thread');
   document.querySelectorAll('.conv').forEach(el => el.classList.toggle('on', +el.dataset.conv === id));
-  const th = await api('/inbox/thread?booking=' + id);
-  inbox.replies ||= await api('/replies');
+  let th;
+  try {
+    th = await api('/inbox/thread?booking=' + id);
+    inbox.replies ||= await api('/replies');
+  } catch (err) {
+    if (['login', 'stale'].includes(err.message) || inbox.booking !== id) return;
+    const pane = $('#ithread');   // never leave another guest's thread on screen under this one's name
+    if (pane) pane.innerHTML = `<div class="empty" style="padding:30px"><span class="bad">${esc(err.message)}</span></div>`;
+    return;
+  }
+  if (inbox.booking !== id) return;   // another conversation was opened meanwhile
   renderThread(th);
   if (th.messages.some(m => m.source === 'guest' && !m.read)) {
     api('/inbox/read', { method: 'POST', body: { bookingId: id } }).then(loadList).catch(() => {});
@@ -624,14 +640,16 @@ const messagesHtml = th => th.messages.map(m => {
 }).join('') || '<div class="empty" style="text-align:center;padding:20px">No messages in this conversation yet.</div>';
 
 function renderThread(th) {
-  const b = th.booking, pane = $('#ithread');
+  // The booking this pane shows. Send, reload, drafts and AI drafts use it, never whichever conversation is
+  // selected by the time a button is pressed: a reply must reach the guest whose thread is on screen.
+  const b = th.booking, pane = $('#ithread'), id = th.bookingId ?? b?.id ?? inbox.booking;
   if (!pane) return;
   const channelNote = !b ? '' : b.channel === 'Booking.com' ? 'Booking.com doesn\'t allow links in messages.'
     : b.channel === 'Direct' ? 'Direct bookings: Beds24 may not notify the guest of this message. Email or text them if it\'s urgent.'
     : `Sent to the guest's ${esc(b.channel)} message thread.`;
   pane.innerHTML = `
     <div class="thead"><button class="back" id="iback">‹</button>
-      <div><b>${esc(b?.guest_name || `Booking ${inbox.booking}`)}</b> ${b ? tag(b.channel) + ' ' + tag(b.status) : ''}
+      <div><b>${esc(b?.guest_name || `Booking ${id}`)}</b> ${b ? tag(b.channel) + ' ' + tag(b.status) : ''}
       <div class="sub">${b ? `${fmtDate(b.arrival)} → ${fmtDate(b.departure)} · ${b.nights} night${b.nights === 1 ? '' : 's'}${(b.adults || 0) + (b.children || 0) ? ` · ${(b.adults || 0) + (b.children || 0)} guests` : ''}${b.property_name ? ' · ' + esc(b.property_name) : ''}` : ''}
         ${th.door ? ` · 🔑 <b class="code">${esc(th.door.code)}</b>` : ''}</div></div>
       <button id="ireload" title="Check for new messages" style="margin-left:auto">↻</button></div>
@@ -641,17 +659,20 @@ function renderThread(th) {
         <a href="#" id="imanage" class="sub">${inbox.manage ? 'Hide saved replies' : 'Edit saved replies'}</a></div>
       ${status.ai ? `<div class="toolbar" style="margin:0 0 6px"><input id="iaihint" placeholder="Anything the draft should say? (optional)" style="flex:1;min-width:0" maxlength="2000">
         <button type="button" id="iai">✨ Draft reply</button></div>` : ''}
-      <textarea id="itext" rows="4" maxlength="5000" placeholder="Write a reply…">${esc(inbox.drafts[inbox.booking] || '')}</textarea>
+      <textarea id="itext" rows="4" maxlength="5000" placeholder="Write a reply…">${esc(inbox.drafts[id] || '')}</textarea>
       <div class="toolbar" style="margin:6px 0 0"><span class="sub" id="inote">${channelNote}</span>
         <span class="sub" id="icount" style="margin-left:auto"></span><button class="primary" id="isend">Send</button></div>
       <div id="imgr"></div></div>`
     : `<div class="sub" style="padding:10px">${b ? 'Replies can only be sent on Beds24 bookings (this one was imported from Guesty).' : 'This booking isn\'t in the app yet; press Sync.'}</div>`}`;
   scrollThread();
   $('#iback').onclick = () => { inbox.booking = null; document.querySelector('.inbox')?.classList.remove('has-thread'); };
-  $('#ireload').onclick = async () => { const t2 = await api('/inbox/reload', { method: 'POST', body: { bookingId: inbox.booking } }); $('#imsgs').innerHTML = messagesHtml(t2); scrollThread(); };
+  $('#ireload').onclick = async () => {
+    try { const t2 = await api('/inbox/reload', { method: 'POST', body: { bookingId: id } }); if (inbox.booking === id && $('#imsgs')) { $('#imsgs').innerHTML = messagesHtml(t2); scrollThread(); } }
+    catch (err) { if (err.message !== 'login') banner(err.message, true); }
+  };
   if (!th.canReply) return;
   const ta = $('#itext');
-  const count = () => { $('#icount').textContent = ta.value.length > 4000 ? `${ta.value.length}/5000` : ''; inbox.drafts[inbox.booking] = ta.value; };
+  const count = () => { $('#icount').textContent = ta.value.length > 4000 ? `${ta.value.length}/5000` : ''; inbox.drafts[id] = ta.value; };
   ta.oninput = count; count();
   // Unfilled {placeholders} are left visible so they get noticed before sending.
   $('#ireply').onchange = e => {
@@ -662,7 +683,7 @@ function renderThread(th) {
   ta.onkeydown = e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('#isend').click(); };
   // AI draft: replaces the reply box (with undo); nothing is sent until Send is pressed.
   if ($('#iai')) $('#iai').onclick = async () => {
-    const btn = $('#iai'), booking = inbox.booking, before = ta.value;
+    const btn = $('#iai'), booking = id, before = ta.value;
     btn.disabled = true; btn.textContent = 'Drafting…';
     try {
       const r = await api('/ai/draft', { method: 'POST', body: { bookingId: booking, instructions: $('#iaihint').value } });
@@ -678,15 +699,20 @@ function renderThread(th) {
     if (!text) return;
     if (/\{\w+\}/.test(text) && !confirm('The message still has a {placeholder} in it. Send anyway?')) return;
     if (/\[(confirm|check|add|insert)\b[^\]]*\]/i.test(text) && !confirm('The message still has a [bracketed] note to fill in. Send anyway?')) return;
-    $('#isend').disabled = true; $('#isend').textContent = 'Sending…';
+    const sendBtn = $('#isend');
+    sendBtn.disabled = true; sendBtn.textContent = 'Sending…';
     try {
-      const t2 = await api('/inbox/send', { method: 'POST', body: { bookingId: inbox.booking, message: text } });
-      inbox.drafts[inbox.booking] = '';
-      renderThread(t2); loadList();
+      const t2 = await api('/inbox/send', { method: 'POST', body: { bookingId: id, message: text } });
+      inbox.drafts[id] = '';
+      if (inbox.booking === id) {
+        renderThread(t2);
+        if (t2.refreshFailed) $('#inote').textContent = 'Sent. It will show here after the next sync.';
+      }
+      loadList().catch(() => {});
     } catch (err) {
-      if (err.message === 'login') return;
+      if (err.message === 'login' || inbox.booking !== id) return;
       $('#inote').innerHTML = `<span class="bad">${esc(err.message)}</span>`;
-      $('#isend').disabled = false; $('#isend').textContent = 'Try again';
+      sendBtn.disabled = false; sendBtn.textContent = 'Try again';
     }
   };
   $('#imanage').onclick = e => { e.preventDefault(); inbox.manage = !inbox.manage; renderThread(th); };
@@ -1899,7 +1925,16 @@ async function moneyView() {
 
   view.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { mn.tab = b.dataset.tab; mn.edit = null; moneyView(); });
   if ($('#myear')) $('#myear').onchange = e => { mn.year = +e.target.value; moneyView(); };
-  const done = async (fn, msg) => { try { await fn(); await moneyView(); if (msg) banner(msg, 'ok'); } catch (err) { if (err.message !== 'login') banner(err.message, true); } };
+  let busy = false;
+  const done = async (fn, msg, after) => {
+    if (busy) return;
+    busy = true;
+    const buttons = [...view.querySelectorAll('button:not(:disabled)')];
+    buttons.forEach(b => { b.disabled = true; });
+    try { await fn(); after?.(); await moneyView(); if (msg) banner(msg, 'ok'); }
+    catch (err) { if (err.message !== 'login') banner(err.message, true); buttons.forEach(b => { b.disabled = false; }); }
+    finally { busy = false; }
+  };
   if (mn.tab === 'pnl') {
     $('#mcsv').onclick = () => downloadCsv(`profit-and-loss-${M.year}.csv`, [['', ...P.months.map(m => mlabel(m.month)), 'Total'],
       ['Booked', ...P.months.map(m => m.gross), P.total.gross], ['Channel fees', ...P.months.map(m => -m.fees), -P.total.fees], ['Income', ...P.months.map(m => m.net), P.total.net],
@@ -1913,9 +1948,8 @@ async function moneyView() {
       const body = { id: mn.edit?.id, date: f.date.value, category: f.category.value, amount: f.amount.value, vendor: f.vendor.value, description: f.description.value,
         repeat: f.repeat.checked ? 'monthly' : null, until: f.until.value, propertyId: f.propertyId?.value ?? null };
       try { if (file) body.receipt = await fileToDataUrl(file); } catch { return banner('Couldn\'t read that receipt.', true); }
-      const editing = !!mn.edit;
-      mn.edit = null;
-      done(() => api('/money/expense', { method: 'POST', body }), editing ? 'Expense updated.' : 'Expense added.');
+      // The edit is only cleared once it's saved: a failed save retried must update, not add a second expense.
+      done(() => api('/money/expense', { method: 'POST', body }), mn.edit ? 'Expense updated.' : 'Expense added.', () => { mn.edit = null; });
     };
     if ($('#mcancel')) $('#mcancel').onclick = () => { mn.edit = null; moneyView(); };
     view.querySelectorAll('[data-edit]').forEach(a => a.onclick = ev => { ev.preventDefault(); mn.edit = M.expenses.find(x => x.id === +a.dataset.edit); moneyView(); });
@@ -1942,10 +1976,16 @@ async function moneyView() {
   }
 }
 
+// Runs a change, then reloads. While it runs the page's buttons are disabled, so a double tap can't submit twice.
+let acting = false;
 async function act(fn) {
-  const btn = $('#sync'); btn.disabled = true; banner('Working…');
-  try { await fn(); banner(''); await boot(true); } catch (e) { if (e.message !== 'login') banner(e.message, true); }
-  btn.disabled = false;
+  if (acting) return;
+  acting = true;
+  const btn = $('#sync'), buttons = [...view.querySelectorAll('button:not(:disabled)')];
+  btn.disabled = true; buttons.forEach(b => { b.disabled = true; }); banner('Working…');
+  try { await fn(); banner(''); await boot(true); }
+  catch (e) { if (e.message !== 'login') banner(e.message, true); buttons.forEach(b => { b.disabled = false; }); }
+  finally { btn.disabled = false; acting = false; }
 }
 
 const routes = { '': dashboard, calendar: calendarView, inbox: inboxView, automations: automationsView, bookings: bookingsView, analytics: analyticsView, home: homeView, site: siteView, guide: guideView, money: moneyView, listing: listingView, rates: ratesView, pricing: pricingView, cleaning: cleaningView, locks: locksView, settings: settingsView };
@@ -1954,6 +1994,7 @@ async function render() {
   const [r, arg] = location.hash.replace(/^#\/?/, '').split('/');
   if (r === 'inbox' && /^\d+$/.test(arg || '')) inbox.booking = +arg;
   clearInterval(pageTimer); pageTimer = null;
+  renderSeq++;
   document.querySelectorAll('a[data-r]').forEach(a => a.classList.toggle('on', a.dataset.r === r));
   setMenu(false);
   try {

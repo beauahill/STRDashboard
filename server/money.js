@@ -109,9 +109,10 @@ function expensesByMonth(db, year, propertyId) {
 /** Commission for a booking: Beds24's figure, or (for imported history) total minus payout. */
 const commissionOf = b => b.commission != null ? b.commission : b.payout != null ? Math.max(0, b.price - b.payout) : 0;
 
+// departure >= from: a stay checking out on Jan 1 has no nights in the new year but its cleaning belongs there.
 function stays(db, from, to, propertyId) {
   return db.prepare(`SELECT id, channel, arrival, departure, nights, price, commission, tax, payout, source FROM bookings
-      WHERE status IN ('confirmed','new') AND arrival < ? AND departure > ? ${propertyId ? 'AND property_id = ?' : ''}`).all(to, from, ...(propertyId ? [propertyId] : []));
+      WHERE status IN ('confirmed','new') AND arrival < ? AND departure >= ? ${propertyId ? 'AND property_id = ?' : ''}`).all(to, from, ...(propertyId ? [propertyId] : []));
 }
 
 /** Income, channel fees and taxes per month of a year, spread over the nights of each stay. */

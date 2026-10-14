@@ -2,6 +2,7 @@
 // Every write is planned first (so the person sees exactly what will change), then sent, then
 // re-read from Beds24 to confirm it took effect.
 import { addDays, diffDays, iso } from './sync.js';
+import { doorSettings, localToday } from './doors.js';
 
 const userError = msg => Object.assign(new Error(msg), { status: 400 });
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -57,7 +58,9 @@ export function readDays(db, roomId, start, days) {
 }
 
 /** Validate a change request and work out exactly which nights change and how. Throws 400s for bad input. */
-export function planChanges(db, req, today = iso(Date.now())) {
+// "Today" is the property's date: in the evening in Wyoming the UTC date is already tomorrow, and tonight must
+// still be editable.
+export function planChanges(db, req, today = localToday(doorSettings(db).tz)) {
   const roomId = Number(req.roomId);
   if (!db.prepare('SELECT 1 FROM rooms WHERE id = ? AND id > 0').get(roomId)) throw userError('Choose a room that exists in Beds24.');
   const isDate = s => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && iso(Date.parse(s)) === s;

@@ -148,9 +148,11 @@ export function demandSignals(db, roomId, today, settings) {
  */
 export function forwardStats(db, roomId, today, windows = [30, 60, 90]) {
   const blocked = new Set(db.prepare(`SELECT date FROM calendar_days WHERE room_id = ? AND override = 'blackout' AND date >= ?`).all(roomId, today).map(r => r.date));
-  const stays = (from, to, bookedBy) => db.prepare(`SELECT arrival, departure, nights, price FROM bookings WHERE room_id = ?
-      AND status IN ('confirmed','new') AND arrival < ? AND departure > ? ${bookedBy ? 'AND booked_at IS NOT NULL AND substr(booked_at,1,10) <= ?' : ''}`)
-    .all(roomId, to, from, ...(bookedBy ? [bookedBy] : []));
+  // "At this point last year" counts what was on the books then, including stays cancelled since.
+  const stays = (from, to, bookedBy) => db.prepare(`SELECT arrival, departure, nights, price FROM bookings WHERE room_id = ? AND arrival < ? AND departure > ?
+      ${bookedBy ? `AND booked_at IS NOT NULL AND substr(booked_at,1,10) <= ? AND (status IN ('confirmed','new') OR (status = 'cancelled' AND substr(cancelled_at,1,10) > ?))`
+        : "AND status IN ('confirmed','new')"}`)
+    .all(roomId, to, from, ...(bookedBy ? [bookedBy, bookedBy] : []));
   const measure = (from, to, bookedBy, skipBlocked) => {
     let nights = 0, revenue = 0;
     for (const b of stays(from, to, bookedBy)) {

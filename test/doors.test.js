@@ -271,3 +271,53 @@ test('Locks page: other codes grouped across locks; change, delete and add work 
   assert.equal(plumber.length, 2);
   assert.equal(plumber[0].ends_at, '2026-11-01T17:00:00.000Z');
 });
+
+test('two stays with the same phone number get different codes that stay put, run after run', async () => {
+  const { db, seam, beds24 } = await setup();
+  book(db, { id: 81, arrival: day(2), departure: day(4), phone: '307-555-4242' });
+  book(db, { id: 82, arrival: day(4), departure: day(6), phone: '307-555-4242' });
+  const codes = () => Object.fromEntries(db.prepare('SELECT booking_id, code FROM door_codes').all().map(r => [r.booking_id, r.code]));
+  await reconcileDoorCodes(db, seam, beds24);
+  const first = codes();
+  assert.equal(first[81], '4242', 'the earlier stay keeps the phone code');
+  assert.notEqual(first[82], '4242');
+  for (let i = 0; i < 3; i++) await reconcileDoorCodes(db, seam, beds24);
+  assert.deepEqual(codes(), first, 'no flip-flopping between the two stays');
+  assert.equal(beds24.posts.length, 2, 'each code written to Beds24 once');
+});
+
+test('a code comes off locks that no longer serve the stay (room change, lock unassigned)', async () => {
+  const { db, seam, beds24 } = await setup();
+  upsertProperties(db, [{ id: 500, name: 'Laramie Retreat', roomTypes: [{ id: 600, name: 'Unit 1', qty: 1 }, { id: 601, name: 'Unit 2', qty: 1 }] }]);
+  assignLock(db, 'back', 601);
+  book(db, { id: 83, arrival: day(1), departure: day(3) });
+  await reconcileDoorCodes(db, seam, beds24);
+  assert.deepEqual(devRows(db, 83).map(d => d.device_id), ['front']);
+  const frontCode = devRows(db, 83)[0].access_code_id;
+  book(db, { id: 83, roomId: 601, arrival: day(1), departure: day(3) });   // moved to Unit 2
+  await reconcileDoorCodes(db, seam, beds24);
+  assert.ok(seam.calls.some(c => c[0] === 'delete' && c[1] === frontCode), "Unit 1's lock no longer opens for this guest");
+  assert.deepEqual(devRows(db, 83).map(d => d.device_id), ['back']);
+
+  // The lock is unassigned, then the stay is cancelled: its code must still be deleted from that lock.
+  const backCode = devRows(db, 83)[0].access_code_id;
+  assignLock(db, 'back', null); assignLock(db, 'front', 601);
+  book(db, { id: 83, roomId: 601, status: 'cancelled', arrival: day(1), departure: day(3) });
+  await reconcileDoorCodes(db, seam, beds24);
+  assert.ok(seam.calls.some(c => c[0] === 'delete' && c[1] === backCode));
+  assert.deepEqual(devRows(db, 83), []);
+});
+
+test('right at check-in a code waiting for the lock is not reported as a problem yet', () => {
+  const startsAt = new Date(Date.now() - 10 * 60e3).toISOString();
+  assert.equal(codeState({ status: 'unset', errors: '[]' }, startsAt).state, 'scheduled');
+  assert.equal(codeState({ status: 'unset', errors: '[]' }, new Date(Date.now() - 60 * 60e3).toISOString()).state, 'pending');
+});
+
+test('a timed code typed in local time is set for that time at the property, not UTC', async () => {
+  const { db, seam } = await setup();
+  await addCode(db, seam, { name: 'Cleaner Tuesday', code: '7531', deviceIds: ['front'], startsAt: '2026-12-01T10:00', endsAt: '2026-12-01T15:00' });
+  const p = seam.calls.find(c => c[0] === 'create')[1];
+  assert.equal(p.starts_at, '2026-12-01T17:00:00.000Z', '10:00 in Laramie (MST)');
+  assert.equal(p.ends_at, '2026-12-01T22:00:00.000Z');
+});

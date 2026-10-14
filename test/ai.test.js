@@ -197,3 +197,15 @@ test('draft reply reads the listing from Beds24 when there is no recent copy, an
   assert.equal(gets, 2);
   assert.match(messagesCalls(f)[2].body.messages[0].content, /No parties after 10pm/);
 });
+
+test('running out of steps mid-lookup is an error, not a half-finished answer; the monthly limit stops a long loop', async t => {
+  const f = await withFake(t, { alwaysTool: true, toolCall: () => ({ name: 'period_stats', input: { from: '2026-01-01', to: '2026-02-01' } }) });   // never stops looking things up
+  const db = setup();
+  await saveKey(db, KEY);
+  await assert.rejects(askData(db, 'How was January?'), /needed more steps/);
+  assert.equal(messagesCalls(f).length, 10);
+  saveAiSettings(db, { budget: 0.1 });   // each fake call costs about $0.008
+  const before = messagesCalls(f).length;
+  await assert.rejects(askData(db, 'And February?'), /AI limit/);
+  assert.ok(messagesCalls(f).length - before < 10, 'stopped partway');
+});

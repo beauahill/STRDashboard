@@ -139,12 +139,14 @@ export async function scanEvents(db, { today, propertyId = null } = {}) {
 // Same event? Compare names by their meaningful words (so "UW Football vs. Air Force" matches "UW football vs Air Force").
 const STOP = new Set(['the', 'vs', 'v', 'at', 'and', 'of', 'a', 'weekend', 'game', 'night', 'nights', 'day', 'days', 'annual', 'event']);
 const words = s => new Set(String(s).toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').split(/\s+/).filter(w => w && !STOP.has(w)));
+// Shared words over all the words in both names: "UW football vs Hawaii" and "UW football vs UNLV" share "uw football"
+// but are different games, and a one-word name ("Thanksgiving") mustn't match everything that mentions it.
 export function sameEvent(a, b) {
   const wa = words(a), wb = words(b);
   if (!wa.size || !wb.size) return false;
   let both = 0;
   for (const w of wa) if (wb.has(w)) both++;
-  return both / Math.min(wa.size, wb.size) >= 0.6;
+  return both / (wa.size + wb.size - both) >= 0.6;
 }
 const overlaps = (a1, a2, b1, b2) => a1 <= b2 && b1 <= a2;
 // The same event on other dates (a corrected or estimated date) is usually within a few weeks; a year apart it's next year's.
@@ -164,17 +166,19 @@ export function store(db, events, { today, end, existing = listEvents(db), found
     const start = e.first_night, last = e.last_night;
     // Nights must be real, upcoming, in order, within the window (plus a little), and no longer than three weeks.
     if (!name || !isDate(start) || !isDate(last) || last < start || last < today || start > addDays(end, 31) || diffDays(start, last) > 21) { skipped++; continue; }
-    const first = start < today ? today : start;
+    const first = start < today ? today : start;   // an event already under way: only its remaining nights
     const pct = Math.round(Math.max(-30, Math.min(200, Number(e.suggested_pct) || 0)));
     const minStay = Number.isInteger(e.suggested_min_stay) && e.suggested_min_stay >= 1 && e.suggested_min_stay <= 14 ? e.suggested_min_stay : null;
     const url = /^https?:\/\/\S+$/i.test(String(e.source_url || '').trim()) ? String(e.source_url).trim().slice(0, 500) : null;
     const fields = [name, first, last, String(e.city || '').slice(0, 80) || null, CATEGORIES.includes(e.category) ? e.category : 'other',
       IMPACTS.includes(e.impact) ? e.impact : 'medium', pct, minStay, CONFIDENCE.includes(e.confidence) ? e.confidence : 'likely',
       String(e.evidence || '').trim().slice(0, 400) || null, url];
-    // An existing event: skip it if the nights already match; otherwise this is a date correction.
-    const match = existing.find(x => x.id === e.matches_event_id && e.matches_event_id > 0)
-      || existing.find(x => near(x.start_date, x.end_date, first, last) && sameEvent(x.name, name));
-    if (match && match.start_date === first && match.end_date === last) { skipped++; continue; }
+    // An existing event: skip it if the nights already match; otherwise this is a date correction. When Claude
+    // names the event it means, that's used; otherwise names are compared. Nights are compared as reported, before
+    // an event under way is trimmed to start today.
+    const named = e.matches_event_id > 0 ? existing.find(x => x.id === e.matches_event_id) : null;
+    const match = named || (e.matches_event_id > 0 ? null : existing.find(x => near(x.start_date, x.end_date, start, last) && sameEvent(x.name, name)));
+    if (match && (match.start_date === start || (start < today && match.start_date <= today)) && match.end_date === last) { skipped++; continue; }
     const replaces = match ? match.id : null;
     // Already suggested (or dismissed, or added) before: refresh an open suggestion, leave the others alone.
     const prior = all.find(x => (x.replaces_event_id && x.replaces_event_id === replaces)
@@ -184,7 +188,8 @@ export function store(db, events, { today, end, existing = listEvents(db), found
       upd.run(...fields, replaces, foundAt, prior.id); updated++;
       continue;
     }
-    ins.run(...fields, replaces, foundAt, foundAt); added++;
+    const id = Number(ins.run(...fields, replaces, foundAt, foundAt).lastInsertRowid); added++;
+    all.push({ id, name, start_date: first, end_date: last, status: 'new', replaces_event_id: replaces });   // reported twice in one scan
   }
   return { found: events.length, added, updated, skipped };
 }

@@ -84,9 +84,13 @@ export const guideUrl = (db, bookingId) => { const o = publicOrigin(db); return 
 // ---------- Direct-guest check-in (agreement + ID) ----------
 export const checkinFor = (db, bookingId) => db.prepare('SELECT booking_id, name, signed_at, id_mime IS NOT NULL AS has_id, id_deleted_at FROM guide_checkins WHERE booking_id = ?').get(bookingId) || null;
 
-export function saveCheckin(db, bookingId, { name, agree, idDataUrl }, meta = {}) {
-  const b = db.prepare('SELECT id, channel, status FROM bookings WHERE id = ?').get(bookingId);
+export function saveCheckin(db, bookingId, { name, agree, idDataUrl }, meta = {}, now = Date.now()) {
+  const b = db.prepare('SELECT id, channel, status, departure FROM bookings WHERE id = ?').get(bookingId);
   if (!b || !['confirmed', 'new'].includes(b.status)) throw err('This booking can\'t be checked in.');
+  // A signed check-in is a record: the link can't replace it (or bring back a deleted ID photo after the stay).
+  if (checkinFor(db, bookingId)?.signed_at) throw err('You\'ve already checked in. Contact your host if anything needs changing.');
+  const ds = doorSettings(db);
+  if (now >= Date.parse(zonedTimeToUtc(b.departure, ds.checkout, ds.tz))) throw err('This stay is over.');
   const full = String(name || '').trim();
   if (full.length < 3 || full.length > 120) throw err('Type your full name as your signature.');
   if (!agree) throw err('Please agree to the rental agreement.');
@@ -121,11 +125,13 @@ export function guideFor(db, bookingId, now = Date.now()) {
   const g = guideSettings(db, b.property_id), ds = doorSettings(db);
   const today = localToday(ds.tz, now);
   const checkOutAt = Date.parse(zonedTimeToUtc(b.departure, ds.checkout, ds.tz));
-  const phase = b.status === 'cancelled' ? 'cancelled' : now >= checkOutAt ? 'after' : today >= addDays(b.arrival, -g.codeDaysBefore) ? 'access' : 'before';
+  // Inquiries, pending requests and blocks never reach "access": no address or door code until the stay is booked.
+  const confirmed = ['confirmed', 'new'].includes(b.status);
+  const phase = b.status === 'cancelled' ? 'cancelled' : now >= checkOutAt ? 'after' : confirmed && today >= addDays(b.arrival, -g.codeDaysBefore) ? 'access' : 'before';
   const listing = jsonSetting(db, `listing_cache_${b.property_id}`, null), vars = jsonSetting(db, `vars_${b.property_id}`, {});
   const lp = listing?.property || {};
   const address = vars.address || [lp.address, lp.city, lp.state, lp.postcode].filter(Boolean).join(', ');
-  const needsCheckin = g.requireDirect && b.channel === 'Direct' && b.source === 'beds24' && !checkinFor(db, bookingId)?.signed_at;
+  const needsCheckin = confirmed && g.requireDirect && b.channel === 'Direct' && b.source === 'beds24' && !checkinFor(db, bookingId)?.signed_at;
   const access = phase === 'access' && !needsCheckin;
   const site = jsonSetting(db, 'site', {})[b.property_id];
   return {

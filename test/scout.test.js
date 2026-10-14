@@ -144,3 +144,30 @@ test('scout settings and the weekly run', async t => {
   assert.equal(await autoScan(db, TODAY, Date.now() + 30 * 86400e3), null, 'never on demo data');
   assert.equal(getSetting(db, 'scout') && JSON.parse(getSetting(db, 'scout')).defaultArea, undefined, 'the default area is computed, not saved');
 });
+
+test('different games and one-word names are not mistaken for the same event', () => {
+  assert.ok(!sameEvent('UW football vs Hawaii', 'UW football vs Northern Illinois'));
+  assert.ok(!sameEvent('UW football vs Hawaii', 'UW football vs Air Force'));
+  assert.ok(!sameEvent('Thanksgiving', 'UW football vs UConn (Thanksgiving weekend)'));
+  assert.ok(!sameEvent('Christmas & New Year', "New Year's Eve concert"));
+  const db = setup();   // owner has "UW football vs Air Force" on Oct 23-24
+  const r = store(db, [
+    ev({ name: 'UW football vs Hawaii', first_night: '2026-11-06', last_night: '2026-11-07' }),
+    ev({ name: 'UW football vs UNLV', first_night: '2026-11-13', last_night: '2026-11-14' }),
+    ev({ name: 'Laramie Brewfest', first_night: '2026-11-20', last_night: '2026-11-21' }),
+    ev({ name: 'Laramie Brewfest 2026', first_night: '2026-11-20', last_night: '2026-11-21' }),   // the same find twice in one scan
+  ], { today: TODAY, end: '2027-04-14' });
+  assert.deepEqual(r, { found: 4, added: 3, updated: 1, skipped: 0 });
+  assert.ok(listSuggestions(db).every(s => s.replaces_event_id == null), 'new games, not corrections of the Air Force game');
+});
+
+test('the event Claude names is used, and an event already under way is not a "correction"', () => {
+  const db = setup();
+  db.prepare("INSERT INTO pricing_events(id,name,start_date,end_date,pct,source) VALUES(7,'Fall Festival','2026-10-12','2026-10-16',20,'added')").run();
+  const r = store(db, [
+    ev({ name: 'Fall Festival', first_night: '2026-10-12', last_night: '2026-10-16', matches_event_id: 7 }),
+    ev({ name: 'UW Graduation', first_night: '2027-05-14', last_night: '2027-05-15', matches_event_id: 5 }),
+  ], { today: TODAY, end: '2027-05-30' });
+  assert.deepEqual(r, { found: 2, added: 1, updated: 0, skipped: 1 });
+  assert.equal(listSuggestions(db)[0].replaces_event_id, 5, 'corrects the commencement event Claude pointed at, despite the different name');
+});

@@ -336,3 +336,49 @@ test('the schedule and freeze protection don\'t fight in the same minute', async
   await poll(db, ha, NOW + 60e3);
   assert.equal(ha.calls.length, 2, 'heat at 58°F is above the floor: nothing more to do');
 });
+
+test('a followed sensor that disappears from Home Assistant goes offline instead of freezing at its last reading', async () => {
+  const { db, ha } = await connected();
+  await poll(db, ha, NOW);
+  ha.states.delete('sensor.bedroom_temperature');
+  await poll(db, ha, NOW + 60e3);
+  await poll(db, ha, NOW + 32 * 60e3);
+  assert.ok(activeAlerts(db, NOW + 32 * 60e3).some(a => a.title === 'bedroom temperature is offline'));
+});
+
+test('lock-up after checkout never runs once the next guest has arrived', async () => {
+  const { db, ha } = await connected();
+  db.prepare(`INSERT INTO bookings(id,property_id,room_id,status,channel,arrival,departure,nights,guest_name,source) VALUES(2,1,10,'confirmed','VRBO','2026-10-16','2026-10-18',2,'Next Guest','beds24')`).run();
+  saveHASettings(db, { checkoutLock: { propertyId: 1, enabled: true, locks: ['lock.front_door'], minutes: 15 } });
+  ha.set('lock.front_door', 'unlocked');
+  const late = T('2026-10-16T22:30:00Z');   // 4:30 PM: the app was down all day, and the next guest checked in at 4
+  storeStates(db, haSettings(db), [...ha.states.values()], late);
+  await runCheckoutLocks(db, new HAClient('https://ha.example.com', 'good-token', ha.fetchImpl), late);
+  assert.ok(!ha.calls.some(c => c[0] === 'lock.lock'), 'the new guest is not locked out');
+});
+
+test('freeze protection sets a low/high range on a thermostat in heat/cool mode', async () => {
+  const { db, ha } = await connected();
+  saveHASettings(db, { climate: { propertyId: 1, enabled: true, thermostats: ['climate.living_room'], freezeFloor: 50 } });
+  ha.set('climate.living_room', 'heat_cool', { current_temperature: 49, temperature: null, target_temp_low: 45, target_temp_high: 75 });
+  storeStates(db, haSettings(db), [...ha.states.values()], NOW);
+  await freezeProtect(db, new HAClient('https://ha.example.com', 'good-token', ha.fetchImpl), NOW, new Set());
+  const call = ha.calls.find(c => c[0] === 'climate.set_temperature');
+  assert.deepEqual([call[1].target_temp_low, call[1].target_temp_high, call[1].temperature], [50, 75, undefined]);
+});
+
+test('a leak alert keeps trying to reach the phone through an ntfy outage', async () => {
+  const { db, ha } = await connected();
+  saveNotifySettings(db, { enabled: true }, NOW - 3600e3);
+  ha.set('binary_sensor.kitchen_leak', 'on');
+  await poll(db, ha, NOW);
+  let ok = false;
+  const pushes = [];
+  const fetchImpl = async (url, o) => { if (!ok) throw new Error('ntfy unreachable'); pushes.push(JSON.parse(o.body)); return { ok: true, status: 200, text: async () => '' }; };
+  for (let i = 0; i < 6; i++) await runNotifications(db, { now: NOW + i * 60e3, fetchImpl });   // five failures in five minutes
+  ok = true;
+  await runNotifications(db, { now: NOW + 7 * 60e3, fetchImpl });
+  assert.equal(pushes.length, 0, 'waits five minutes between tries after the first few');
+  await runNotifications(db, { now: NOW + 11 * 60e3, fetchImpl });
+  assert.equal(pushes.filter(p => /Leak detected/.test(p.title)).length, 1, 'still delivered once ntfy is back');
+});

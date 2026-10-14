@@ -146,9 +146,12 @@ export function monthlyPace(db, roomId, today, months = 12) {
     const first = d.toISOString().slice(0, 10); d.setUTCMonth(d.getUTCMonth() + 1);
     const next = d.toISOString().slice(0, 10);
     const lyFirst = addDays(first, -364), lyNext = addDays(next, -364);  // same weekdays, one year back
-    const nights = (from, to, bookedBy) => db.prepare(`SELECT arrival, departure FROM bookings WHERE room_id = ?
-        AND status IN ('confirmed','new') AND arrival < ? AND departure > ? ${bookedBy ? 'AND booked_at IS NOT NULL AND booked_at <= ?' : ''}`)
-      .all(roomId, to, from, ...(bookedBy ? [bookedBy + 'T23:59:59'] : []))
+    // A year ago, the books also held stays that were cancelled later; leaving them out would make this year look
+    // ahead of pace and push prices up.
+    const nights = (from, to, bookedBy) => db.prepare(`SELECT arrival, departure FROM bookings WHERE room_id = ? AND arrival < ? AND departure > ?
+        ${bookedBy ? `AND booked_at IS NOT NULL AND booked_at <= ? AND (status IN ('confirmed','new') OR (status = 'cancelled' AND cancelled_at > ?))`
+          : "AND status IN ('confirmed','new')"}`)
+      .all(roomId, to, from, ...(bookedBy ? [bookedBy + 'T23:59:59', bookedBy + 'T23:59:59'] : []))
       .reduce((n, b) => n + diffDays(b.arrival > from ? b.arrival : from, b.departure < to ? b.departure : to), 0);
     const anyLastYear = db.prepare(`SELECT 1 FROM bookings WHERE room_id = ? AND status IN ('confirmed','new','cancelled') AND arrival < ? AND departure > ?`).get(roomId, lyNext, lyFirst);
     const days = diffDays(first, next);
@@ -162,6 +165,18 @@ export function monthlyPace(db, roomId, today, months = 12) {
 
 // ---------- Recommendations ----------
 const roundTo = (v, step) => Math.round(v / step) * step;
+/** Round to the owner's step, then keep within the floor and ceiling (rounding towards them, never past). */
+export function limitPrice(raw, s, notes = []) {
+  const step = s.rounding || 1;
+  let price = roundTo(raw, step);
+  if (s.min != null && price < s.min) { price = Math.ceil(s.min / step) * step; notes.push(`Raised to your minimum of $${s.min}`); }
+  if (s.max != null && price > s.max) {
+    price = Math.floor(s.max / step) * step;
+    if (s.min != null && price < s.min) price = s.max;   // a floor and ceiling closer than one step: the ceiling wins
+    notes.push(`Capped at your maximum of $${s.max}`);
+  }
+  return Math.max(1, price);
+}
 
 /** Recommended price and minimum stay per night, with the reasons, plus the current Beds24 values. */
 export function recommend(db, roomId, { start, days = 365, today } = {}) {
@@ -222,11 +237,8 @@ export function recommend(db, roomId, { start, days = 365, today } = {}) {
     const gap = gapLen.get(d);
     if (gap) pct(`Gap night (${gap}-night gap between stays)`, s.gapPct);
 
-    let price = factors.slice(1).reduce((v, f) => v * (1 + f.pct / 100), s.base);
     const notes = [];
-    if (s.min != null && price < s.min) { price = s.min; notes.push(`Raised to your minimum of $${s.min}`); }
-    if (s.max != null && price > s.max) { price = s.max; notes.push(`Capped at your maximum of $${s.max}`); }
-    price = Math.max(1, roundTo(price, s.rounding || 1));
+    const price = limitPrice(factors.slice(1).reduce((v, f) => v * (1 + f.pct / 100), s.base), s, notes);
     const minStay = gap ? gap : Math.max(s.minStay, ev?.min_stay || 0);
     nights.push({ date: d, price, minStay, factors, notes, event: ev?.name || null, gap: gap || null,
       current: cur?.price ?? null, currentMinStay: cur?.minStay ?? null, demand: demandOf(d) });
@@ -244,9 +256,15 @@ export function pendingChanges(rec, { threshold = 0, includeMinStay = true, maxC
     if (!priceDiff && !minDiff) return [];
     let price = n.price;
     // Auto-pricing never moves a night more than maxChangePct in one go, so a bad setting can't swing prices wildly.
+    // The partial step is rounded and kept within the floor and ceiling like any other price.
     if (maxChangePct != null && n.current) {
       const lo = n.current * (1 - maxChangePct / 100), hi = n.current * (1 + maxChangePct / 100);
-      price = Math.round(Math.min(hi, Math.max(lo, price)));
+      if (price < lo || price > hi) {
+        const step = rec.settings?.rounding || 1;
+        price = Math.min(hi, Math.max(lo, price));
+        price = price > n.current ? Math.floor(price / step) * step : Math.ceil(price / step) * step;
+        price = limitPrice(price, rec.settings || {});
+      }
       if (price === n.current && !minDiff) return [];
     }
     return [{ date: n.date, price, minStay: includeMinStay ? n.minStay : undefined, before: n.current, beforeMinStay: n.currentMinStay }];
@@ -292,18 +310,31 @@ export async function applyNightly(db, client, roomId, changes, { label = 'Prici
   return { applied: changes.length, ranges: ranges.length, warnings };
 }
 
-/** Once a day, if auto-pricing is on, push recommendations that differ by more than the threshold. */
-export async function autoPrice(db, client, today) {
-  const results = [];
-  for (const { id } of db.prepare('SELECT id FROM rooms WHERE id > 0').all()) {
+/**
+ * Once a day, if auto-pricing is on, push recommendations that differ by more than the threshold. Each room is
+ * separate (one room's failure doesn't stop the others), and a failed room waits three hours before trying again
+ * rather than retrying on every sync. Throws a summary of the failures after trying every room.
+ */
+export async function autoPrice(db, client, today, now = Date.now()) {
+  const results = [], errors = [];
+  if (client?.canWriteInventory === false) return results;   // a read-only invite code can't change prices
+  for (const { id, name } of db.prepare('SELECT id, name FROM rooms WHERE id > 0').all()) {
     const s = pricingSettings(db, id);
     if (!s.auto || !s.base || getSetting(db, `pricing_auto_${id}`) === today) continue;
-    const rec = recommend(db, id, { days: s.autoHorizon, today });
-    const changes = pendingChanges(rec, { threshold: s.autoThreshold, maxChangePct: s.autoMaxChangePct });
-    const r = await applyNightly(db, client, id, changes, { label: 'Auto-pricing', today });
-    setSetting(db, `pricing_auto_${id}`, today);
-    results.push({ roomId: id, ...r });
+    if (Number(getSetting(db, `pricing_auto_retry_${id}`) || 0) > now) continue;
+    try {
+      const rec = recommend(db, id, { days: s.autoHorizon, today });
+      const changes = pendingChanges(rec, { threshold: s.autoThreshold, maxChangePct: s.autoMaxChangePct });
+      const r = await applyNightly(db, client, id, changes, { label: 'Auto-pricing', today });
+      setSetting(db, `pricing_auto_${id}`, today);
+      setSetting(db, `pricing_auto_retry_${id}`, null);
+      results.push({ roomId: id, ...r });
+    } catch (e) {
+      setSetting(db, `pricing_auto_retry_${id}`, now + 3 * 3600e3);
+      errors.push(`${name}: ${e.message}`);
+    }
   }
+  if (errors.length) throw new Error(`Auto-pricing failed (will retry in 3 hours) for ${errors.join('; ')}`);
   return results;
 }
 

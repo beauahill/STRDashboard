@@ -73,9 +73,10 @@ function friendly(e) {
   return e;
 }
 
+const costOf = u => (u.input * PRICE.input + u.output * PRICE.output + u.cacheWrite * PRICE.cacheWrite + u.cacheRead * PRICE.cacheRead) / 1e6
+  + (u.searches || 0) * PRICE.search;
 function record(db, task, u, error) {
-  const cost = (u.input * PRICE.input + u.output * PRICE.output + u.cacheWrite * PRICE.cacheWrite + u.cacheRead * PRICE.cacheRead) / 1e6
-    + (u.searches || 0) * PRICE.search;
+  const cost = costOf(u);
   db.prepare(`INSERT INTO ai_usage(at,task,calls,input_tokens,output_tokens,cache_write_tokens,cache_read_tokens,cost,error)
     VALUES(?,?,?,?,?,?,?,?,?)`).run(new Date().toISOString(), task, u.calls, u.input, u.output, u.cacheWrite, u.cacheRead, cost, error);
   return cost;
@@ -90,7 +91,8 @@ export async function ask(db, task, { system, messages, tools = null, effort = '
   const key = keyOf(db);
   if (!key) throw err('Add your Anthropic API key in Settings → AI assistant first.');
   const spent = db.prepare('SELECT COALESCE(SUM(cost),0) c FROM ai_usage WHERE at >= ?').get(monthStart()).c;
-  if (spent >= budget(db)) throw err(`This month's AI limit ($${budget(db)}) is used up. Raise it in Settings → AI assistant.`);
+  const limit = budget(db);
+  if (spent >= limit) throw err(`This month's AI limit ($${limit}) is used up. Raise it in Settings → AI assistant.`);
   const client = makeClient(key);
   const params = {
     model: MODEL, max_tokens: maxTokens, betas: BETAS, fallbacks: 'default',
@@ -107,11 +109,15 @@ export async function ask(db, task, { system, messages, tools = null, effort = '
   let msg;
   try {
     if (tools) {
+      // The runner resumes paused server-tool turns itself. The monthly limit is checked after every step, so a long
+      // tool loop (the event scout's web searches) can't run far past it.
       const runner = client.beta.messages.toolRunner({ ...params, tools, max_iterations: maxIterations });
       for await (const m of runner) {
         add(m);
-        // A long web-search turn can pause; the runner doesn't resume those on its own.
-        if (m.stop_reason === 'pause_turn') runner.pushMessages({ role: 'assistant', content: m.content });
+        if (spent + costOf(used) >= limit) {
+          record(db, task, used, 'monthly limit reached');
+          throw err(`This month's AI limit ($${limit}) was reached partway through, so Claude stopped. Raise it in Settings → AI assistant.`);
+        }
       }
       msg = await runner.done();
     } else {
@@ -119,6 +125,7 @@ export async function ask(db, task, { system, messages, tools = null, effort = '
       add(msg);
     }
   } catch (e) {
+    if (e.status && !(e instanceof Anthropic.APIError)) throw e;   // our own error (already recorded)
     record(db, task, used, e.message);
     throw friendly(e);
   }
@@ -126,6 +133,8 @@ export async function ask(db, task, { system, messages, tools = null, effort = '
   if (msg.stop_reason === 'refusal') throw err('Claude declined to help with this one. Try rewording it.', 422);
   const text = msg.content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
   if (!requireText) return { text, stopReason: msg.stop_reason, cost: Math.round(cost * 1000) / 1000, searches: used.searches, model: msg.model };
+  // The step limit ran out while Claude was still looking things up: what it said so far isn't an answer.
+  if (msg.stop_reason === 'tool_use') throw err('Claude needed more steps than allowed to answer that. Try a narrower question.', 502);
   if (!text) throw err(msg.stop_reason === 'max_tokens' ? 'The answer got too long and was cut off. Try asking for something narrower.' : 'Claude didn\'t finish an answer. Try again or ask something narrower.', 502);
   return { text, truncated: msg.stop_reason === 'max_tokens', cost: Math.round(cost * 1000) / 1000, model: msg.model };
 }
