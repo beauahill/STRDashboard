@@ -25,6 +25,8 @@ import {
   notifySettings, saveNotifySettings, publicNotify, regenerateTopic, runNotifications, sendTest, recentNotifications, fillMissingBookings, appOrigin,
 } from './notify.js';
 import { startTailnet, tailnetStatus, routesViaTailnet } from './tailnet.js';
+import { recordSignals, forwardStats, LEVELS } from './demand.js';
+import { scoutStatus, saveScoutSettings, scanEvents, listSuggestions, addSuggestion, dismissSuggestion, autoScan } from './scout.js';
 import { aiStatus, saveKey, saveAiSettings, cacheListing, draftReply, writeListing, reviewPricing, askData } from './ai.js';
 import {
   seedAutomations, listAutomations, saveAutomation, setEnabled, deleteAutomation, describe, runAutomations, upcoming,
@@ -92,6 +94,7 @@ async function runSync() {
   try {
     const r = await syncBeds24(db, beds24);
     dedupeImported(db);
+    try { recordSignals(db); } catch (e) { console.error('demand signals failed:', e.message); }
     if (beds24.scopes === null) await beds24.refreshScopes().catch(() => {});
     // Prices are a separate permission in Beds24; a read-only or bookings-only code shouldn't fail the whole sync.
     try { await syncCalendar(db, beds24); setSetting(db, 'calendar_error', null); }
@@ -136,6 +139,9 @@ async function runNotificationsSafely({ pollMessages = false } = {}) {
   } catch (e) { setSetting(db, 'notify_error', e.message); return { error: e.message }; }
   finally { notifying = false; }
 }
+
+// Event scout runs (manual or weekly) one at a time.
+let scouting = false;
 
 // Home Assistant: every minute, read the devices, update alerts and run the thermostat / lock automations,
 // then send any notifications. Never throws.
@@ -269,17 +275,21 @@ async function api(req, res, url) {
       if (!room) return send(res, 200, { rooms, room: null });
       const today = localToday(doorSettings(db).tz);
       const rec = recommend(db, room.id, { start: q.start, days: Math.min(Number(q.days) || 62, 400), today });
+      const year = rec.needsBase ? null : recommend(db, room.id, { days: 365, today });
       const ahead = days => {
-        const r = recommend(db, room.id, { days, today });
-        const p = pendingChanges(r, { includeMinStay: q.minStay !== '0' });
+        const p = pendingChanges({ ...year, nights: year.nights.slice(0, days) }, { includeMinStay: q.minStay !== '0' });
         const set = p.filter(c => c.before != null);
         return { nights: p.length, priceChanges: p.filter(c => c.price !== c.before).length,
           avgNow: set.length ? Math.round(set.reduce((a, c) => a + c.before, 0) / set.length) : null,
           avgNew: p.length ? Math.round(p.reduce((a, c) => a + c.price, 0) / p.length) : null };
       };
+      const slim = n => ({ date: n.date, price: n.price ?? null, current: n.current ?? null, booked: !!n.booked, blocked: !!n.blocked,
+        score: n.demand?.score ?? null, level: n.demand?.level ?? null, event: n.event || null });
       return send(res, 200, {
         rooms, room, today, settings: rec.settings, needsBase: !!rec.needsBase, nights: rec.nights, pace: rec.pace || {},
         events: listEvents(db), pending: rec.needsBase ? null : { d30: ahead(30), d90: ahead(90), d365: ahead(365) },
+        next90: year ? year.nights.slice(0, 90).map(slim) : [], forward: forwardStats(db, room.id, today), signals: rec.signals || null, levels: LEVELS,
+        suggestions: listSuggestions(db, { today }), scout: scoutStatus(db),
         canWrite: beds24.connected && beds24.canWriteInventory !== false, connected: beds24.connected,
         lastAuto: getSetting(db, `pricing_auto_${room.id}`), error: getSetting(db, 'pricing_error'),
       });
@@ -293,6 +303,18 @@ async function api(req, res, url) {
       return send(res, 200, suggestFromHistory(db, Number(roomId), localToday(doorSettings(db).tz)));
     }
     case 'POST /api/pricing/events': return send(res, 200, { id: saveEvent(db, await readJson(req)) });
+    case 'POST /api/pricing/scout': {
+      if (scouting) return send(res, 409, { error: 'The event scout is already running. Try again in a few minutes.' });
+      scouting = true;
+      try { return send(res, 200, await scanEvents(db, { today: localToday(doorSettings(db).tz), propertyId: prop })); }
+      finally { scouting = false; runNotificationsSafely(); }
+    }
+    case 'POST /api/pricing/scout/settings': return send(res, 200, saveScoutSettings(db, await readJson(req)));
+    case 'POST /api/pricing/suggestions/add': {
+      const { id, pct, min_stay } = await readJson(req);
+      return send(res, 200, addSuggestion(db, id, { ...(pct !== undefined && pct !== '' && { pct }), ...(min_stay !== undefined && { min_stay }) }));
+    }
+    case 'POST /api/pricing/suggestions/dismiss': { const { id } = await readJson(req); dismissSuggestion(db, id); return send(res, 200, { ok: true }); }
     case 'POST /api/pricing/events/delete': { const { id } = await readJson(req); deleteEvent(db, Number(id)); return send(res, 200, { ok: true }); }
     case 'POST /api/pricing/apply': {
       if (!beds24.connected) return send(res, 400, { error: 'Connect Beds24 first.' });
@@ -712,6 +734,14 @@ setInterval(() => runSync().catch(e => console.error('sync failed:', e.message))
 setInterval(() => runAutomationsSafely(), 5 * 60000).unref();
 setInterval(() => { if (notifySettings(db).enabled) runNotificationsSafely({ pollMessages: true }); }, 60000).unref();
 setInterval(() => runHASafely(), 60000).unref();
+// Event scout: weekly when switched on (checked hourly; a failed run is retried the next day).
+setInterval(async () => {
+  if (scouting) return;
+  scouting = true;
+  try { if (await autoScan(db, localToday(doorSettings(db).tz))) runNotificationsSafely(); }
+  catch (e) { console.error('event scout failed:', e.message); }
+  finally { scouting = false; }
+}, 3600e3).unref();
 // Tailscale (only with TS_AUTHKEY): a private route to Home Assistant. Its identity lives next to the database.
 const tailnet = startTailnet({ dataDir: dirname(DB_PATH) });
 

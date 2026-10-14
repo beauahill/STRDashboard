@@ -118,6 +118,17 @@ CREATE TABLE IF NOT EXISTS expenses (
 );
 CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
 CREATE TABLE IF NOT EXISTS payouts_received (booking_id INTEGER PRIMARY KEY, amount REAL, received_on TEXT, note TEXT, updated_at TEXT);
+-- Demand signals: every inquiry and booking request seen, kept after it lapses (the dates were still wanted).
+CREATE TABLE IF NOT EXISTS demand_signals (
+  booking_id INTEGER PRIMARY KEY, kind TEXT NOT NULL, room_id INTEGER, arrival TEXT NOT NULL, departure TEXT NOT NULL, channel TEXT, seen_at TEXT NOT NULL
+);
+-- Events found by the event scout (Claude with web search), waiting for the owner to add or dismiss them.
+CREATE TABLE IF NOT EXISTS event_suggestions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL, city TEXT,
+  category TEXT, impact TEXT, pct REAL, min_stay INTEGER, confidence TEXT, evidence TEXT, url TEXT,
+  status TEXT NOT NULL DEFAULT 'new',   -- new | added | dismissed
+  event_id INTEGER, replaces_event_id INTEGER, found_at TEXT NOT NULL, updated_at TEXT
+);
 -- Every change sent to Beds24 from this app, successful or not.
 CREATE TABLE IF NOT EXISTS change_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, room_id INTEGER NOT NULL,

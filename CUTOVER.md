@@ -27,6 +27,10 @@ Nothing here touches your live listings yet.
       prices**. Match what's live on Airbnb today. Quickest: on the dashboard's **Pricing** page, click
       "Suggest from my history", review the rules, then **Apply → Next 12 months**. (Or set ranges by hand on
       the **Rates** page.) Then check a few nights in Beds24.
+- [ ] **AirDNA**: its pricing connects through Guesty (or straight to Airbnb), not Beds24, so it stops setting
+      your prices when Guesty goes. Don't reconnect it straight to Airbnb: it would fight Beds24 over Airbnb
+      prices and leave VRBO and Booking.com out. The dashboard's **Pricing** page takes over (run the **event
+      scout** once so upcoming events are in), and you can keep AirDNA's market data as a reference.
 - [ ] **Blocked dates** from your screenshots (Rates page → select the nights → "block").
 - [ ] **Automated messages (dashboard → Automations)**: edit the starter messages to match your Guesty ones
       (wording and timing), and add any others. Put your Wi-Fi, address, parking etc. under **Property

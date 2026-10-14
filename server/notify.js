@@ -10,12 +10,12 @@ import { homeNotifications } from './ha.js';
 const userError = msg => Object.assign(new Error(msg), { status: 400 });
 export const NOTIFY_DEFAULTS = {
   enabled: false, server: 'https://ntfy.sh', topic: '', token: '', preview: true,
-  messages: true, bookings: true, cancellations: true, problems: true, home: true, enabledAt: null,
+  messages: true, bookings: true, cancellations: true, problems: true, home: true, pricing: true, enabledAt: null,
 };
 const MAX_AGE = 24 * 3600e3;   // never send about anything older than this (e.g. after the app was down)
 const MAX_ATTEMPTS = 5;        // a notification that fails this often is given up on
 const PER_RUN = 10;            // the rest wait for the next minute
-const EVENTS = ['messages', 'bookings', 'cancellations', 'problems', 'home'];
+const EVENTS = ['messages', 'bookings', 'cancellations', 'problems', 'home', 'pricing'];
 
 // The topic is the only thing protecting a ntfy.sh topic, so it's long and random.
 export const newTopic = () => 'str-' + randomBytes(15).toString('base64url');
@@ -162,6 +162,16 @@ export function collect(db, now = Date.now()) {
     for (const h of homeNotifications(db, now, at(s.enabledAt) || now)) {
       if (!pending('home', h.ref)) continue;
       out.push({ title: h.title, message: h.message, tags: h.tags, priority: h.priority, click: link('/#/home'), refs: [['home', h.ref]], time: h.time });
+    }
+  }
+  // The event scout's new finds, as one notification per scan.
+  if (s.pricing) {
+    const found = db.prepare("SELECT id, name, start_date, found_at FROM event_suggestions WHERE status = 'new' ORDER BY start_date").all()
+      .filter(e => at(e.found_at) >= since && pending('scout', e.id));
+    if (found.length) {
+      out.push({ title: `Event scout found ${plural(found.length, 'event')} that may raise prices`,
+        message: found.slice(0, 5).map(e => `${short(e.start_date)}: ${e.name}`).join('\n') + (found.length > 5 ? `\n…and ${found.length - 5} more` : ''),
+        tags: ['calendar'], priority: 3, click: link('/#/pricing'), refs: found.map(e => ['scout', e.id]), time: Math.max(...found.map(e => at(e.found_at))) });
     }
   }
   return out.sort((a, b) => a.time - b.time);
